@@ -1,0 +1,4 @@
+🟡 ALERT · SETUP_TEST
+
+What happened: Setup test of Tourbillon Alerts. Nothing is wrong.
+Who acts: nobody

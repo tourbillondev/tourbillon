@@ -1,0 +1,54 @@
+Tourbillon Alerts: what each post means
+
+Icons: 🔴 most serious · 🟡 needs attention · 🟢 back to normal · ✅ shipped
+Sells and withdrawals are never paused by any of these.
+Information posts have no "Who acts" line: worth seeing, nothing to do.
+
+PRICES AND DATA
+🟡 MARK_STALE: the mark or the board vol is stale; opens on that market close until fresh. Who: signer operators.
+🟡 SAMPLE_STALE: no price sample recorded for too long. Who: keeper (poker) operator.
+🟡 SETTLEMENT_STALE: the pool has not settled a round for too long; deposits and withdrawals wait. Who: keeper operator.
+🟡 EQUITY_NOT_READY: capital is outside Elysium and EQUITY is not ready; NAV leaves it out. Who: signer operators.
+🔴 EQUITY_MISMATCH: the board's EQUITY differs from Hyperliquid's account beyond tolerance. Who: signer operators and admin.
+🟡 RECEIPTS_STALE: no hourly receipt root posted for 3 hours. Who: receipts operator.
+🟡 KEY_BALANCE_LOW: a service key is low on gas. Who: that key's operator.
+
+POOL RISK
+🔴 COVERAGE_BREACHED: Elysium USDC no longer covers the stressed liability; new opens are refused. Who: admin (add or bring back capital).
+🟡 COVERAGE_LOW: headroom above the stressed liability is low. Who: admin (watch).
+🟡 CAP_HIGH: a cap is nearly used up on a market. Who: admin (changes go through the timelock).
+🔴 DRAWDOWN_PAUSED: NAV per share fell more than 15% below its 30-day high; all opens paused. Who: the Safe resumes after review.
+
+VENUE AND HEDGING
+🔴 VENUE_DOWN_PAUSED: the venue was down 15 minutes on a market; the automated key paused opens there. Who: the Safe unpauses after recovery.
+🟢 VENUE_RECOVERED: the venue is healthy again. Who: the Safe unpauses when satisfied.
+🔴 PAUSE_FAILED: the venue was down but the automatic pause failed. Who: the guardian, now.
+🔴 HEDGER_SILENT: the hedger has not reported for too long. Who: hedger operator.
+🟡 TREASURY_SENT / TREASURY_RETURNED: USDC moved to or from the treasury. Who: treasury owners confirm.
+
+OPEN BOOK AND AUCTION
+🔴 BUYBACK_FAILED: a buyback from a maker failed; the pool paid the seller and now carries that raw. Who: admin.
+🔴 MATCHED_UNCOVERED: a matched source was flagged and its raw now counts in the pool's stress. Who: admin.
+🟡 BUYBACK_SHORTFALL: a buyback fell short beyond rounding; slashed from the source, then absorbed by the pool. Who: admin.
+🟡 VAULT_SLASHED (information): a maker's vault was slashed (a shortfall or a forfeited bond).
+🟡 AUCTION_STARTED / AUCTION_FORFEIT: a weekly risk auction lot opened, or a bond went to the pool. Who: makers bid.
+🟡 AUCTION_SETTLED (information): a lot settled, with or without a winner.
+🟡 AUCTION_SETTLE_DUE: a lot's reveal ended an hour ago, unsettled. Who: keeper operator (anyone can settle).
+
+GOVERNANCE
+🟡 TIMELOCK_QUEUED: an admin action was queued, with the contract, the call and when it can run. Who: everyone reviews; the Safe can cancel it.
+🟡 TIMELOCK_EXECUTED / TIMELOCK_CANCELLED (information): a queued action ran, or was cancelled.
+🔴 ROLE_CHANGED: a role was granted or revoked on a governed contract. Who: admin confirms it was announced.
+🟡 PAUSED: opens, a market or deposits were paused, and by whom. Who: the Safe reviews and unpauses when safe.
+🟢 UNPAUSED (information): a pause was lifted, and by whom.
+🟡 MONITOR_ERROR: the risk-monitor's own check failed. Who: risk-monitor operator.
+
+RELEASES (hourly updates; staff group, copy here)
+✅ SHIPPED AND RELEASED · Update NN: deployed, checks passed, public copy and GitHub release out.
+🟡 RELEASE DELAYED · Update NN: live; the public copy and GitHub release are retrying, then SHIPPED AND RELEASED.
+🟡 HELD · Update NN: a pre-release check failed; nothing deployed; the next update stays on time. Who: release owner.
+🔴 ROLLED BACK · Update NN: deployed, a post-deploy check failed, the previous version is back. Who: release owner.
+
+DAILY
+🟡 Buyback rounding (information): once a day, when the pool absorbed rounding (at most 1 micro-USDC per source).
+Shipped today: once a day in the staff group, each update released that day with its proof link.

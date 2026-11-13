@@ -1,0 +1,7 @@
+# Paths never published to the public repo (tourbillondev/tourbillon). One per line; a trailing / means the whole folder.
+# Everything else tracked in the private repo (tourbillondev/tourbillon-private) is mirrored. docs/backend/ IS public.
+# Anything under ~/.tourbillon is outside the repo and never tracked.
+docs/spec/
+docs/notes/
+queue/
+CLAUDE.md

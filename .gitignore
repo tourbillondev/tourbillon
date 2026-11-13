@@ -1,0 +1,14 @@
+.env
+.env.*
+!.env.example
+node_modules/
+out/
+cache/
+broadcast/
+.DS_Store
+contracts/deployments/31337.json
+contracts/deployments/31337-m2.json
+contracts/deployments/31337-m3.json
+contracts/deployments/31337-m4.json
+contracts/deployments/31337-m6.json
+contracts/deployments/31337-m7.json

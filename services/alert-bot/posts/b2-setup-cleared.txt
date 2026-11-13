@@ -1,0 +1,3 @@
+🟢 CLEARED · SETUP_TEST
+
+What happened: Setup test finished.

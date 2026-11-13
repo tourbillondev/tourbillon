@@ -1,0 +1,26 @@
+{
+  "name": "tourbillon-services",
+  "private": true,
+  "license": "MIT",
+  "workspaces": [
+    "common",
+    "quorum-signer",
+    "poker",
+    "hedger",
+    "risk-monitor",
+    "maker-gateway",
+    "receipts",
+    "mcp",
+    "alert-bot",
+    "indexer",
+    "api"
+  ],
+  "scripts": {
+    "test": "bun test",
+    "typecheck": "cd common && tsc --noEmit && cd ../quorum-signer && tsc --noEmit && cd ../poker && tsc --noEmit && cd ../hedger && tsc --noEmit && cd ../risk-monitor && tsc --noEmit && cd ../maker-gateway && tsc --noEmit && cd ../receipts && tsc --noEmit && cd ../mcp && tsc --noEmit && cd ../alert-bot && tsc --noEmit && cd ../indexer && tsc --noEmit && cd ../api && tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/bun": "1.4.4",
+    "typescript": "7.0.2"
+  }
+}

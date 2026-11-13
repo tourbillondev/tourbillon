@@ -1,0 +1,30 @@
+[profile.default]
+src = "src"
+test = "test"
+out = "out"
+libs = ["lib"]
+solc_version = "0.8.28"
+evm_version = "cancun"
+via_ir = true
+optimizer = true
+optimizer_runs = 200
+fs_permissions = [{ access = "read-write", path = "./deployments" }, { access = "read", path = "./out" }]
+auto_detect_remappings = false
+remappings = [
+    "forge-std/=lib/forge-std/src/",
+    "@prb/math/=lib/prb-math/",
+    "@openzeppelin/contracts/=lib/openzeppelin-contracts/contracts/",
+    "@safe/=lib/safe-smart-account/contracts/",
+]
+
+# Safe v1.4.1 (lib/safe-smart-account) does not compile with via-IR (stack too deep in execTransaction); its sources
+# compile with the legacy pipeline, same solc, everything else unchanged.
+additional_compiler_profiles = [{ name = "safe", via_ir = false, optimizer = true, optimizer_runs = 200 }]
+compilation_restrictions = [{ paths = "lib/safe-smart-account/**", via_ir = false }]
+
+[fuzz]
+runs = 1000
+seed = "0x7462"
+
+[fmt]
+line_length = 120

@@ -1,0 +1,13 @@
+Tourbillon Alerts
+
+This is the team's alert bot. It is team-only: it posts in this group and the shared alert test group, nowhere public.
+
+What it posts:
+• Risk alarms from the risk-monitor: one post when something starts (🟡 ALERT, 🔴 for the most serious) and one when it ends (🟢 CLEARED). Never repeats.
+• Release alerts for the hourly tech updates: ✅ RELEASED, 🟡 HELD, 🔴 ROLLED BACK, each with what happened, who acts and the next step.
+• A daily "Shipped today" list with a proof link for each released update.
+
+Set up: the bot, its alert format, the risk-monitor's alarms, and a test-group default (this group only on purpose).
+Not yet: the live system is not deployed, so no real alarms flow yet; the release pipeline and its launch board, staff commands, server-only pause/resume and UTC/Moscow/New York times come with the pipeline.
+
+The alert guide is pinned below.

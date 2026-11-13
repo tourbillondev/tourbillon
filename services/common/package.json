@@ -1,0 +1,13 @@
+{
+  "name": "@tourbillon/common",
+  "version": "0.1.0",
+  "private": true,
+  "license": "MIT",
+  "type": "module",
+  "exports": {
+    "./*": "./src/*"
+  },
+  "dependencies": {
+    "viem": "2.57.12"
+  }
+}

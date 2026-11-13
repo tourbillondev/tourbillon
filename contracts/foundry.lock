@@ -1,0 +1,26 @@
+{
+  "lib/forge-std": {
+    "tag": {
+      "name": "v1.10.0",
+      "rev": "8bbcf6e3f8f62f419e5429a0bd89331c85c37824"
+    }
+  },
+  "lib/openzeppelin-contracts": {
+    "tag": {
+      "name": "v5.4.0",
+      "rev": "c64a1edb67b6e3f4a15cca8909c9482ad33a02b0"
+    }
+  },
+  "lib/prb-math": {
+    "tag": {
+      "name": "v4.1.0",
+      "rev": "280fc5f77e1b21b9c54013aac51966be33f4a410"
+    }
+  },
+  "lib/safe-smart-account": {
+    "tag": {
+      "name": "v1.4.1",
+      "rev": "bf943f80fec5ac647159d26161446ac5d716a294"
+    }
+  }
+}

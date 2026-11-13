@@ -1,0 +1,62 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Tourbillon API",
+    "version": "v1",
+    "description": "Read-only. Open, no keys, rate-limited per IP (429 when over). Amounts in USDC are decimal strings with 6 decimals; strikes, units and marks are decimal strings. Values from /v1/chains are indicative; /v1/quote/buy gives the exact cost at the current block."
+  },
+  "paths": {
+    "/v1/status": {
+      "get": {
+        "summary": "Opens and pauses, the pool's NAV and coverage, mark and vol freshness per market, the last receipt root",
+        "responses": { "200": { "description": "{ chainId, block, blockTime, opens: { buysPaused, drawdownPaused, depositsPaused }, pool: { nav, navPerShare, lastSettlement, available, stressedLiability, covered }, markets: [{ market, markFresh, volFresh, opensPaused }], receipts: { lastEpoch } }" } }
+      }
+    },
+    "/v1/markets": {
+      "get": {
+        "summary": "Every market: listing, spread, strike step, mark, vol, caps and their use, pauses",
+        "responses": { "200": { "description": "{ markets: [{ market, listed, spreadBps, strikeStep, mark, volBps, opensPaused, caps: { notional, notionalUsed, directional, directionalUsed } }] }" } }
+      }
+    },
+    "/v1/chains/{market}": {
+      "get": {
+        "summary": "Indicative call and put values per unit around the mark, for each tempo, at the board's vol",
+        "parameters": [
+          { "name": "market", "in": "path", "required": true, "schema": { "type": "string", "enum": ["BTC", "ETH", "HYPE"] } },
+          { "name": "tempos", "in": "query", "schema": { "type": "string", "example": "3600,86400,604800,2592000" } },
+          { "name": "strikes", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": 10 } }
+        ],
+        "responses": { "200": { "description": "{ market, mark, volBps, indicative: true, chains: [{ tempo, rows: [{ strike, call, put }] }] }" } }
+      }
+    },
+    "/v1/quote/buy": {
+      "get": {
+        "summary": "The exact cost (premium plus fee) of a buy at the current block, from the cheapest of the pool and the maker quotes",
+        "parameters": [
+          { "name": "market", "in": "query", "required": true, "schema": { "type": "string" } },
+          { "name": "legs", "in": "query", "required": true, "schema": { "type": "string", "example": "call:74000:1,call:76000:-1" } },
+          { "name": "tempo", "in": "query", "schema": { "type": "integer", "minimum": 3600, "maximum": 2592000, "default": 86400 } },
+          { "name": "units", "in": "query", "required": true, "schema": { "type": "string", "example": "2" } }
+        ],
+        "responses": { "200": { "description": "{ market, quoted: true, cost, source: pool | maker | offer, makerQuotesConsidered } or { quoted: false, reason }" } }
+      }
+    },
+    "/v1/positions/{owner}": {
+      "get": {
+        "summary": "An owner's positions, held directly or in the AgentRouter sub-account, with units at the current norm",
+        "parameters": [{ "name": "owner", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": { "200": { "description": "{ owner, positions: [{ id, held, market, legs, movement, raw, units, unitsDecimal }] }" } }
+      }
+    },
+    "/v1/receipts/proof": {
+      "get": {
+        "summary": "The Merkle proof of a receipt (a trade, a vol final or a NAV snapshot), checkable with ReceiptRoots.verify",
+        "parameters": [
+          { "name": "tx", "in": "query", "required": true, "schema": { "type": "string" } },
+          { "name": "logIndex", "in": "query", "required": true, "schema": { "type": "integer" } }
+        ],
+        "responses": { "200": { "description": "{ epoch, kind, encoded, leaf, proof, root, posted }" }, "404": { "description": "no receipt for that log (yet)" } }
+      }
+    }
+  }
+}
