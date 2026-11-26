@@ -147,7 +147,7 @@ contract VolQuoteBook is EIP712 {
         );
     }
 
-    /// @notice Filler only: checks and records a fill; returns the maker's σ to price it with.
+    /// @notice Filler only: checks and records a fill; gives the maker's σ to price it with.
     function fill(
         VolQuote.Quote memory q,
         bytes memory sig,

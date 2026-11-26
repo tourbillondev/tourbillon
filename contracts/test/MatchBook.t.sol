@@ -12,13 +12,15 @@ import {MakerVault} from "../src/MakerVault.sol";
 import {MatchBook, IMatchPool} from "../src/MatchBook.sol";
 import {IEngineConfig} from "../src/WriterBook.sol";
 import {MockUSDC} from "./mocks/MockUSDC.sol";
-import {MockWHYPE} from "./mocks/MockWHYPE.sol";
+import {MockStockToken} from "./mocks/MockStockToken.sol";
+import {CoverFixture} from "./mocks/CoverFixture.sol";
+import {CoveringAssets} from "../src/CoveringAssets.sol";
 import {MockMarks, MockVols} from "./Engine.t.sol";
 
 contract MockEngineConfig is IEngineConfig {
     function markets(bytes32 m) external pure returns (bool, uint16, uint128) {
         if (m == "BTC") return (true, 200, 100e18);
-        if (m == "HYPE") return (true, 200, 1e18);
+        if (m == "STK1") return (true, 200, 1e18);
         return (false, 0, 0);
     }
 
@@ -44,6 +46,12 @@ contract MockPool is IMatchPool {
         refuse = r;
     }
 
+    bytes32 public stuckMarket; // the last market whose covering token could not move (RH5)
+
+    function onCoverStuck(bytes32 market) external {
+        stuckMarket = market;
+    }
+
     function buyback(uint256 sid, uint256 rawSold, uint256 gross, uint256 s)
         external
         returns (uint256, uint256, uint256)
@@ -64,12 +72,12 @@ contract MockPool is IMatchPool {
 contract MatchBookTest is Test {
     uint256 constant T0 = 1_794_182_400;
     bytes32 constant BTC = "BTC";
-    bytes32 constant HYPE = "HYPE";
+    bytes32 constant STK1 = "STK1";
     address constant ADMIN = address(0xAD);
     address constant WRITER = address(0x3317);
 
-    MockUSDC usdc;
-    MockWHYPE whype;
+    MockUSDC settlement;
+    MockStockToken stock;
     MockMarks marks;
     MockVols vols;
     PathFundingBook book;
@@ -86,19 +94,19 @@ contract MatchBookTest is Test {
 
     function setUp() public {
         _set(T0);
-        usdc = new MockUSDC();
-        whype = new MockWHYPE();
+        settlement = new MockUSDC();
+        stock = new MockStockToken("Mock Stock One", "STK1", 18);
         marks = new MockMarks();
         vols = new MockVols();
         marks.set(BTC, 70_000e18);
-        marks.set(HYPE, 40e18);
+        marks.set(STK1, 40e18);
         vols.set(BTC, 4500);
-        vols.set(HYPE, 8000);
+        vols.set(STK1, 8000);
         // the test plays the Engine (it opens series) and the recorder
         book = new PathFundingBook(address(this), address(this), marks, vols);
         book.record(BTC, 70_000e18, 4500);
-        book.record(HYPE, 40e18, 8000);
-        vault = new MakerVault(ADMIN, IERC20(address(usdc)), IERC20(address(whype)));
+        book.record(STK1, 40e18, 8000);
+        vault = new MakerVault(ADMIN, IERC20(address(settlement)), CoverFixture.listed(address(this), address(marks), IERC20(address(stock))));
         pool = new MockPool();
         mb = new MatchBook(ADMIN, book, new MockEngineConfig(), vault, marks, vols);
         pool.setBook(mb);
@@ -109,31 +117,31 @@ contract MatchBookTest is Test {
         vm.stopPrank();
         for (uint256 i; i < 9; ++i) {
             makers[i] = address(uint160(0x4D00 + i));
-            usdc.mint(makers[i], 10_000_000e6);
-            whype.mint(makers[i], 100_000e18);
+            settlement.mint(makers[i], 10_000_000e6);
+            stock.mint(makers[i], 100_000e18);
             vm.startPrank(makers[i]);
-            usdc.approve(address(vault), type(uint256).max);
-            whype.approve(address(vault), type(uint256).max);
-            vault.deposit(IERC20(address(usdc)), 1_000_000e6);
-            vault.deposit(IERC20(address(whype)), 10_000e18);
+            settlement.approve(address(vault), type(uint256).max);
+            stock.approve(address(vault), type(uint256).max);
+            vault.deposit(IERC20(address(settlement)), 1_000_000e6);
+            vault.deposit(IERC20(address(stock)), 10_000e18);
             vm.stopPrank();
         }
-        usdc.mint(WRITER, 10_000_000e6);
-        whype.mint(WRITER, 100_000e18);
+        settlement.mint(WRITER, 10_000_000e6);
+        stock.mint(WRITER, 100_000e18);
         vm.startPrank(WRITER);
-        usdc.approve(address(mb), type(uint256).max);
-        whype.approve(address(mb), type(uint256).max);
+        settlement.approve(address(mb), type(uint256).max);
+        stock.approve(address(mb), type(uint256).max);
         vm.stopPrank();
     }
 
     // ---------------------------------------------------------------- helpers
 
     function _u() internal view returns (IERC20) {
-        return IERC20(address(usdc));
+        return IERC20(address(settlement));
     }
 
     function _h() internal view returns (IERC20) {
-        return IERC20(address(whype));
+        return IERC20(address(stock));
     }
 
     function _leg(bool isCall, uint256 k, int256 q) internal pure returns (StrategyMath.Leg memory) {
@@ -188,8 +196,8 @@ contract MatchBookTest is Test {
         uint256 put = book.open(BTC, false, 70_000e18, _day());
         mb.matchMaker(makers[2], put, 0.5e18, 0.5e18);
         assertEq(_locked(makers[2]), 35_000e6, "a written put locks its strike");
-        // a HYPE call: covered by the maker's WHYPE, no USDC
-        uint256 hc = book.open(HYPE, true, 44e18, _day());
+        // a STK1 call: covered by the maker's STK1 stock, no USDC
+        uint256 hc = book.open(STK1, true, 44e18, _day());
         mb.matchMaker(makers[3], hc, 10e18, 10e18);
         assertEq(_locked(makers[3]), 0);
         assertEq(vault.lockedOf(makers[3], _h()), 10e18);
@@ -197,7 +205,7 @@ contract MatchBookTest is Test {
         uint256 bc = book.open(BTC, true, 70_000e18, _day());
         vm.expectRevert(StrategyMath.Unbounded.selector);
         mb.matchMaker(makers[4], bc, 1e18, 1e18);
-        // not enough free funds in the vault: refused
+        // not enough free balance in the vault: refused
         vm.expectRevert(
             abi.encodeWithSelector(MakerVault.InsufficientFree.selector, 1_000_005e6, 1_000_000e6 - 10_000e6)
         );
@@ -207,6 +215,53 @@ contract MatchBookTest is Test {
         vm.expectRevert(MatchBook.NotRouter.selector);
         mb.matchMaker(makers[0], sp, 1e18, 1e18);
         assertEq(mb.matchedRaw(sp), 2e18);
+    }
+
+    // ---------------------------------------------------------------- RH5: a frozen covering token at a buyback (D3)
+
+    /// The buyer's sell goes on: the maker's cover owed to the pool stays in the vault, the maker is not flagged (it
+    /// paid; the token did not move), opens on STK1 pause, and anyone settles the cover once the token moves.
+    function test_aFrozenCoverAtABuybackIsOwedPausesOpensAndSettlesLater() public {
+        uint256 hc = book.open(STK1, true, 44e18, _day());
+        mb.matchMaker(makers[3], hc, 10e18, 10e18);
+        stock.setFrozen(true);
+        // the buyer sells 10 raw at a mark of 50: the pool paid 70 USDC and asks the source for it
+        (uint256 pu, uint256 ph, uint256 sf) = pool.buyback(hc, 10e18, 70e6, 50e18);
+        uint256 expectH = Math.mulDiv(70e6 * 1e12, 1e18, 50e18, Math.Rounding.Ceil); // 1.4 shares at the mark
+        assertEq(pu, 0);
+        assertEq(ph, expectH, "paid in cover at the mark, owed while frozen");
+        assertEq(sf, 0, "no shortfall: the maker is not flagged");
+        assertEq(vault.owedCover(_h(), address(pool)), expectH);
+        assertEq(stock.balanceOf(address(pool)), 0);
+        assertEq(pool.stuckMarket(), STK1, "opens on STK1 pause");
+        assertEq(vault.lockedOf(makers[3], _h()), 0, "the lock is spent; the rest is free again");
+        assertEq(vault.freeOf(makers[3], _h()), 10_000e18 - expectH);
+        assertEq(mb.matchedRaw(hc), 0);
+        stock.setFrozen(false);
+        vault.settleCover(_h(), address(pool));
+        assertEq(stock.balanceOf(address(pool)), expectH);
+    }
+
+    /// The same for a writer offer: the cover held here for the offer is owed to the pool, and the rest to the writer.
+    function test_aFrozenCoverOnAnOfferIsOwedHere() public {
+        StrategyMath.Leg[] memory call = new StrategyMath.Leg[](1);
+        call[0] = StrategyMath.Leg(true, 44e18, -1e18);
+        vm.prank(WRITER);
+        uint256 oid = mb.postOffer(STK1, call, _day(), 8000, 10e18, uint64(nowT + 1 days), true);
+        (,, uint256 sid,,,,,,,,,,,) = mb.offers(oid);
+        StrategyMath.Leg[] memory poolSide = new StrategyMath.Leg[](1);
+        poolSide[0] = StrategyMath.Leg(true, 44e18, 1e18);
+        book.openShape(STK1, poolSide, _day());
+        mb.fillOffer(oid, sid, 10e18, 10e18);
+        stock.setFrozen(true);
+        (, uint256 ph,) = pool.buyback(sid, 10e18, 70e6, 50e18);
+        assertEq(mb.owedCover(_h(), address(pool)), ph);
+        assertEq(mb.owedCover(_h(), WRITER), 10e18 - ph, "the rest owed to the writer");
+        assertEq(pool.stuckMarket(), STK1);
+        stock.setFrozen(false);
+        mb.settleCover(_h(), address(pool));
+        mb.settleCover(_h(), WRITER);
+        assertEq(mb.owedCoverTotal(_h()), 0);
     }
 
     // ---------------------------------------------------------------- 2. buyback across sources; 8 at most
@@ -238,7 +293,7 @@ contract MatchBookTest is Test {
         }
         (uint256 paid,, uint256 shortfall) = pool.buyback(sid, rawSold, gross, 70_000e18);
         assertEq(shortfall, 0);
-        assertEq(usdc.balanceOf(address(pool)), paid);
+        assertEq(settlement.balanceOf(address(pool)), paid);
         assertGe(paid, gross - 8, "every source paid its share (rounded up for the pool)");
         assertLe(paid, gross + 8);
         for (uint256 i; i < 8; ++i) {
@@ -267,7 +322,7 @@ contract MatchBookTest is Test {
     // ---------------------------------------------------------------- 3. shortfall: vault, then pool; flagged
 
     /// Forced with a gross above the worst case (impossible in real trading, where a value never exceeds the payoff's
-    /// maximum): the vault's free funds are slashed, then the pool absorbs; the source is flagged and its remaining raw
+    /// maximum): the vault's free balance is slashed, then the pool absorbs; the source is flagged and its remaining raw
     /// counts as uncovered.
     function test_shortfallSlashesTheVaultThenThePoolAndFlags() public {
         uint256 sid = _spreadSeries();
@@ -363,8 +418,8 @@ contract MatchBookTest is Test {
         (,, uint256 sid,,,,,,,,,, uint256 escrowU,) = mb.offers(id);
         assertEq(sid, book.idOfShape(BTC, _spread(), _day()), "the pool's side is the buyer's spread");
         assertEq(escrowU, 50_000e6 + 64, "10 x 5,000 plus the rounding slack");
-        assertEq(usdc.balanceOf(address(mb)), escrowU);
-        assertEq(mb.heldUsdc(), escrowU);
+        assertEq(settlement.balanceOf(address(mb)), escrowU);
+        assertEq(mb.heldSettlement(), escrowU);
 
         book.openShape(BTC, _spread(), _day());
         (bytes32 key, uint64 sigma) = mb.fillOffer(id, sid, 3e18, 3e18);
@@ -377,20 +432,20 @@ contract MatchBookTest is Test {
         mb.fillOffer(id, sid, 8e18, 8e18);
         vm.expectRevert(abi.encodeWithSelector(MatchBook.OfferSeries.selector, id, 123));
         mb.fillOffer(id, 123, 1e18, 1e18);
-        // a buyback pays the pool from the offer's collateral here and returns the rest to the writer
-        uint256 writerBefore = usdc.balanceOf(WRITER);
+        // a buyback pays the pool from the offer's collateral here and sends the rest back to the writer
+        uint256 writerBefore = settlement.balanceOf(WRITER);
         pool.buyback(sid, 1e18, 3_000e6, 70_000e18);
-        assertEq(usdc.balanceOf(address(pool)), 3_000e6);
-        assertEq(usdc.balanceOf(WRITER) - writerBefore, 2_000e6, "the 5,000 released less the 3,000 paid");
+        assertEq(settlement.balanceOf(address(pool)), 3_000e6);
+        assertEq(settlement.balanceOf(WRITER) - writerBefore, 2_000e6, "the 5,000 released less the 3,000 paid");
         // the writer cancels: the unfilled escrow comes back; the filled part stays matched
-        writerBefore = usdc.balanceOf(WRITER);
+        writerBefore = settlement.balanceOf(WRITER);
         vm.prank(WRITER);
         mb.cancelOffer(id);
-        assertEq(usdc.balanceOf(WRITER) - writerBefore, 35_000e6 + 64);
+        assertEq(settlement.balanceOf(WRITER) - writerBefore, 35_000e6 + 64);
         (raw, lockedU,,) = _entry(key, sid);
         assertEq(raw, 2e18);
         assertEq(lockedU, 10_000e6);
-        assertEq(usdc.balanceOf(address(mb)), mb.heldUsdc(), "the book holds exactly what it accounts for");
+        assertEq(settlement.balanceOf(address(mb)), mb.heldSettlement(), "the book holds exactly what it accounts for");
         vm.expectRevert(abi.encodeWithSelector(MatchBook.OfferClosed.selector, id));
         mb.fillOffer(id, sid, 1e18, 1e18);
         // offers: a naked call, a bad σ, an unlisted market, an expiry in the past
@@ -433,7 +488,7 @@ contract MatchBookTest is Test {
         assertEq(units, 2e18);
         assertEq(cost, ask);
         assertEq(pool.lastCost(), ask);
-        assertEq(usdc.balanceOf(address(pool)), uint256(ask));
+        assertEq(settlement.balanceOf(address(pool)), uint256(ask));
         assertEq(vault.freeOf(makers[0], _u()) - freeBefore, 10_000e6 - uint256(ask));
         assertEq(mb.matchedRaw(sid), 0);
         // far above the upper strike the ask would exceed the width: capped at the collateral
@@ -498,7 +553,7 @@ contract MatchBookTest is Test {
             for (uint256 i; i < 9; ++i) {
                 vaultSum += vault.freeOf(makers[i], _u()) + vault.lockedOf(makers[i], _u());
             }
-            assertEq(usdc.balanceOf(address(vault)), vaultSum, "the vault holds free + locked");
+            assertEq(settlement.balanceOf(address(vault)), vaultSum, "the vault holds free + locked");
         }
     }
 

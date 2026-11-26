@@ -13,7 +13,7 @@ import {PathFunding} from "./PathFunding.sol";
 ///           fill; pool fills are at the board's σ already and are not recorded.
 ///         - A fill's bucket is the one nearest (on a log scale) to its weighted-average tempo; for a single tempo, its
 ///           own. Boundaries: √(1 h·1 d) ≈ 4.9 h, √(1 d·7 d) ≈ 2.6 d, √(7 d·30 d) ≈ 14.5 d.
-///         - Weights are USDC notional; both sums decay by exp(−ln 2 · Δt / 1 day) before a fill is added, so the average
+///         - Weights are settlement token notional; both sums decay by exp(−ln 2 · Δt / 1 day) before a fill is added, so the average
 ///           is unchanged between fills (a uniform decay does not move a ratio).
 contract VolFeed {
     uint256 public constant BUCKETS = 4;
@@ -62,7 +62,7 @@ contract VolFeed {
         emit RecorderSet(recorder_);
     }
 
-    /// @notice Recorder only: a fill on `market` with `movement` at `sigmaBps`, weighing `weight` (USDC notional).
+    /// @notice Recorder only: a fill on `market` with `movement` at `sigmaBps`, weighing `weight` (settlement token notional).
     function record(
         bytes32 market,
         TempoBlend.Part[] calldata movement,

@@ -51,7 +51,7 @@ contract PathFundingTest is Test {
         return TempoBlend.rateE36(terms.isCall, s, terms.strike, sig, terms.movement, terms.bounds);
     }
 
-    /// Walks a constant path of `n` equal samples spanning `span` seconds from T0; returns X.
+    /// Walks a constant path of `n` equal samples spanning `span` seconds from T0; gives X.
     function _constantPath(bytes32 m, PathFunding.Terms memory terms, uint256 s, uint256 sig, uint256 span, uint256 n)
         internal
         returns (uint256)

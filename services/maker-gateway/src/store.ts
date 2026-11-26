@@ -3,7 +3,7 @@ import { blendValue } from "@tourbillon/common/tempo.ts";
 import { collateralUsdc, fits, MAX_QUOTES_PER_ORDER, type Order, type Quote } from "./quote.ts";
 
 /// The gateway's book of signed quotes, in memory. One entry per (maker, nonce): a re-signed quote with the same nonce
-/// replaces the old one. Expired quotes are dropped on every read. The gateway holds no keys and no funds; it only
+/// replaces the old one. Expired quotes are dropped on every read. The gateway holds no keys and no money; it only
 /// keeps what makers signed and passes it on. The OpenBook re-checks every quote on-chain at fill time.
 
 export type Signed = { quote: Quote; sig: Hex; receivedAt: number };

@@ -13,9 +13,9 @@ import {ICounterparty} from "./ICounterparty.sol";
 ///         any mainnet deployment: it does not hedge, and a sell it cannot pay reverts with `Insolvent`, which
 ///         would break law 3.
 /// @dev    - Every trade fee goes on to `feeRecipient` in full (the M2 behaviour).
-///         - Admin-funded USDC. The admin may withdraw only the balance above a reserve of 2× the open entry
-///           notional (a call is worth at most S per unit, a put at most K ≤ 2× the mark at buy; not a guarantee).
-///         - Per-market cap on open entry notional, in USDC (6 decimals); 0 means no buys. Entry notional is
+///         - settlement token deposited by the admin. The admin may withdraw only the balance above a reserve of 2× the open entry
+///           notional (a call is worth at most S per unit, a put at most K ≤ 2× the mark at buy; an upper bound only).
+///         - Per-market cap on open entry notional, in settlement token (6 decimals); 0 means no buys. Entry notional is
 ///           units × the S used for the price, rounded up, recorded on buy and released in proportion to the raw
 ///           sold, so a fully closed series releases exactly what it added. Units shrink with funding, so this
 ///           overstates live exposure (cautious).
@@ -24,17 +24,17 @@ contract HousePool is ICounterparty, AccessControl {
     using SafeERC20 for IERC20;
 
     uint256 internal constant WAD = 1e18;
-    uint256 internal constant WAD_PER_USDC_UNIT = 1e12;
+    uint256 internal constant WAD_PER_SETTLEMENT_UNIT = 1e12;
     uint256 public constant RESERVE_MULTIPLE = 2;
 
-    IERC20 internal immutable _usdc;
+    IERC20 internal immutable _settlement;
     address public engine;
     address public feeRecipient;
 
-    mapping(bytes32 => uint256) public cap; // USDC
-    mapping(bytes32 => uint256) public openNotional; // USDC, per market
-    uint256 public totalOpenNotional; // USDC
-    mapping(uint256 => uint256) public seriesNotional; // USDC, per series
+    mapping(bytes32 => uint256) public cap; // settlement token
+    mapping(bytes32 => uint256) public openNotional; // settlement token, per market
+    uint256 public totalOpenNotional; // settlement token
+    mapping(uint256 => uint256) public seriesNotional; // settlement token, per series
     mapping(uint256 => uint256) public seriesRaw; // book raw held against this pool, per series
 
     event EngineSet(address engine);
@@ -56,11 +56,11 @@ contract HousePool is ICounterparty, AccessControl {
     error Insolvent(uint256 needed, uint256 balance);
     error AboveFree(uint256 amount, uint256 free);
 
-    constructor(address admin, IERC20 usdc_, address feeRecipient_) {
-        if (admin == address(0) || address(usdc_) == address(0) || feeRecipient_ == address(0)) revert ZeroAddress();
-        uint8 d = IERC20Metadata(address(usdc_)).decimals();
+    constructor(address admin, IERC20 settlement_, address feeRecipient_) {
+        if (admin == address(0) || address(settlement_) == address(0) || feeRecipient_ == address(0)) revert ZeroAddress();
+        uint8 d = IERC20Metadata(address(settlement_)).decimals();
         if (d != 6) revert NotSixDecimals(d);
-        _usdc = usdc_;
+        _settlement = settlement_;
         feeRecipient = feeRecipient_;
         _grantRole(DEFAULT_ADMIN_ROLE, admin);
     }
@@ -73,7 +73,7 @@ contract HousePool is ICounterparty, AccessControl {
     // ---------------------------------------------------------------- engine
 
     function asset() external view returns (IERC20) {
-        return _usdc;
+        return _settlement;
     }
 
     /// @inheritdoc ICounterparty
@@ -88,7 +88,7 @@ contract HousePool is ICounterparty, AccessControl {
         uint256 fee
     ) external onlyEngine {
         if (raw == 0) revert ZeroRaw();
-        uint256 notional = Math.ceilDiv(Math.mulDiv(units, sWad, WAD, Math.Rounding.Ceil), WAD_PER_USDC_UNIT);
+        uint256 notional = Math.ceilDiv(Math.mulDiv(units, sWad, WAD, Math.Rounding.Ceil), WAD_PER_SETTLEMENT_UNIT);
         uint256 wouldBe = openNotional[market] + notional;
         if (wouldBe > cap[market]) revert CapExceeded(market, wouldBe, cap[market]);
         openNotional[market] = wouldBe;
@@ -96,7 +96,7 @@ contract HousePool is ICounterparty, AccessControl {
         seriesNotional[id] += notional;
         seriesRaw[id] += raw;
         emit Bought(market, id, units, raw, notional, premium);
-        if (fee > 0) _usdc.safeTransfer(feeRecipient, fee);
+        if (fee > 0) _settlement.safeTransfer(feeRecipient, fee);
     }
 
     /// @inheritdoc ICounterparty
@@ -120,11 +120,11 @@ contract HousePool is ICounterparty, AccessControl {
         openNotional[market] -= released;
         totalOpenNotional -= released;
 
-        uint256 bal = _usdc.balanceOf(address(this));
+        uint256 bal = _settlement.balanceOf(address(this));
         if (bal < net + fee) revert Insolvent(net + fee, bal);
         emit Sold(market, id, raw, released, net, fee);
-        if (net > 0) _usdc.safeTransfer(to, net);
-        if (fee > 0) _usdc.safeTransfer(feeRecipient, fee);
+        if (net > 0) _settlement.safeTransfer(to, net);
+        if (fee > 0) _settlement.safeTransfer(feeRecipient, fee);
     }
 
     // ---------------------------------------------------------------- admin
@@ -148,7 +148,7 @@ contract HousePool is ICounterparty, AccessControl {
     }
 
     function deposit(uint256 amount) external onlyRole(DEFAULT_ADMIN_ROLE) {
-        _usdc.safeTransferFrom(msg.sender, address(this), amount);
+        _settlement.safeTransferFrom(msg.sender, address(this), amount);
         emit Deposited(msg.sender, amount);
     }
 
@@ -156,7 +156,7 @@ contract HousePool is ICounterparty, AccessControl {
     function withdraw(address to, uint256 amount) external onlyRole(DEFAULT_ADMIN_ROLE) {
         uint256 f = free();
         if (amount > f) revert AboveFree(amount, f);
-        _usdc.safeTransfer(to, amount);
+        _settlement.safeTransfer(to, amount);
         emit Withdrawn(to, amount);
     }
 
@@ -167,7 +167,7 @@ contract HousePool is ICounterparty, AccessControl {
     }
 
     function free() public view returns (uint256) {
-        uint256 bal = _usdc.balanceOf(address(this));
+        uint256 bal = _settlement.balanceOf(address(this));
         uint256 r = reserve();
         return bal > r ? bal - r : 0;
     }

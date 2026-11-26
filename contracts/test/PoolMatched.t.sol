@@ -13,7 +13,10 @@ import {EnginePricing} from "../src/EnginePricing.sol";
 import {MakerVault} from "../src/MakerVault.sol";
 import {MatchBook} from "../src/MatchBook.sol";
 import {MockUSDC} from "./mocks/MockUSDC.sol";
-import {MockWHYPE} from "./mocks/MockWHYPE.sol";
+import {MockSessionCalendar} from "./mocks/MockSessionCalendar.sol";
+import {MockStockToken} from "./mocks/MockStockToken.sol";
+import {CoverFixture} from "./mocks/CoverFixture.sol";
+import {CoveringAssets} from "../src/CoveringAssets.sol";
 import {MockMarks, MockVols} from "./Engine.t.sol";
 import {MockEngineConfig} from "./MatchBook.t.sol";
 
@@ -60,8 +63,8 @@ abstract contract PoolMatchedBase is Test {
     address constant LP = address(0x1A);
     address constant BUYER = address(0xB1);
 
-    MockUSDC usdc;
-    MockWHYPE whype;
+    MockUSDC settlement;
+    MockStockToken stock;
     MockMarks marks;
     MockVols vols;
     PathFundingBook book;
@@ -75,8 +78,8 @@ abstract contract PoolMatchedBase is Test {
 
     function _base(uint256 seed) internal {
         _set(T0);
-        usdc = new MockUSDC();
-        whype = new MockWHYPE();
+        settlement = new MockUSDC();
+        stock = new MockStockToken("Mock Stock One", "STK1", 18);
         marks = new MockMarks();
         vols = new MockVols();
         marks.set(BTC, S);
@@ -86,17 +89,17 @@ abstract contract PoolMatchedBase is Test {
         QuorumBoard board = new QuorumBoard(address(this), sg, 2, 30);
         book = new PathFundingBook(address(this), address(this), marks, vols);
         book.record(BTC, S, SIG);
-        pool = new MainspringPool(address(this), usdc, book, marks, vols, IEquityFeed(address(board)), PROTO);
+        pool = new MainspringPool(address(this), settlement, book, marks, vols, IEquityFeed(address(board)), PROTO);
         pool.setEngine(address(this));
         pool.listMarket(BTC, 2000);
         pool.setHedgerDeltaCap(BTC, 1e16);
         pool.setCaps(BTC, 1e15, 1e15);
         pool.setOpenBookCap(BTC, 1e15);
         pool.grantRole(pool.RISK_PAUSER_ROLE(), address(this));
-        usdc.mint(address(this), 1e15);
-        usdc.mint(LP, seed);
+        settlement.mint(address(this), 1e15);
+        settlement.mint(LP, seed);
         vm.startPrank(LP);
-        usdc.approve(address(pool), type(uint256).max);
+        settlement.approve(address(pool), type(uint256).max);
         pool.deposit(seed);
         vm.stopPrank();
         pool.startEpoch();
@@ -125,7 +128,7 @@ abstract contract PoolMatchedBase is Test {
         int256 v = EnginePricing.shapeValue(_spread(), S, SIG, _day(), true);
         (uint256 premium, uint256 fee) = EnginePricing.shapeBuyQuote(v, units, _spread(), S, 200);
         book.mint(sid, BUYER, raw);
-        usdc.transfer(address(pool), premium + fee);
+        settlement.transfer(address(pool), premium + fee);
         pool.onBuy(BTC, sid, units, raw, S, SIG, premium, fee);
     }
 
@@ -139,7 +142,7 @@ abstract contract PoolMatchedBase is Test {
         (premium, fee) = EnginePricing.shapeBuyQuote(vUp, units, _spread(), S, 200);
         credit = Math.mulDiv(units, uint256(vDown), 1e18) / 1e12;
         book.mint(sid, BUYER, raw);
-        usdc.transfer(address(pool), premium + fee);
+        settlement.transfer(address(pool), premium + fee);
         pool.onMatchedOpen(BTC, sid, units, raw, S, premium, fee, credit, payee);
     }
 
@@ -173,7 +176,7 @@ contract PoolMatchedTest is PoolMatchedBase {
 
     function setUp() public {
         _base(5_000_000e6);
-        vault = new MakerVault(ADMIN, IERC20(address(usdc)), IERC20(address(whype)));
+        vault = new MakerVault(ADMIN, IERC20(address(settlement)), CoverFixture.listed(address(this), address(marks), IERC20(address(stock))));
         mb = new MatchBook(ADMIN, book, new MockEngineConfig(), vault, marks, vols);
         vm.startPrank(ADMIN);
         vault.setMatchBook(address(mb));
@@ -183,10 +186,10 @@ contract PoolMatchedTest is PoolMatchedBase {
         pool.setMatchBook(address(mb));
         address[2] memory ms = [M1, M2];
         for (uint256 i; i < 2; ++i) {
-            usdc.mint(ms[i], 10_000_000e6);
+            settlement.mint(ms[i], 10_000_000e6);
             vm.startPrank(ms[i]);
-            usdc.approve(address(vault), type(uint256).max);
-            vault.deposit(IERC20(address(usdc)), 1_000_000e6);
+            settlement.approve(address(vault), type(uint256).max);
+            vault.deposit(IERC20(address(settlement)), 1_000_000e6);
             vm.stopPrank();
         }
     }
@@ -212,10 +215,10 @@ contract PoolMatchedTest is PoolMatchedBase {
         uint256 nav0 = pool.navNow();
         uint256 stressed0 = pool.stressedLiability();
         uint256 dir0 = pool.directional(BTC);
-        uint256 makerBefore = usdc.balanceOf(M1);
+        uint256 makerBefore = settlement.balanceOf(M1);
         (uint256 premium, uint256 fee, uint256 credit) = _matched(M1, sid, 2e18);
         uint256 cut = fee * pool.protocolFeeBps() / 10_000;
-        assertEq(usdc.balanceOf(M1) - makerBefore, credit, "the source gets its value at its sigma");
+        assertEq(settlement.balanceOf(M1) - makerBefore, credit, "the source gets its value at its sigma");
         assertEq(pool.navNow() - nav0, premium - credit + fee - cut, "NAV moves by the fee share (and the rounding)");
         assertLe(premium - credit, 1, "value up vs down: at most a unit");
         assertEq(pool.stressedLiability(), stressed0, "no stress");
@@ -240,6 +243,30 @@ contract PoolMatchedTest is PoolMatchedBase {
         pool.onMatchedOpen(BTC, sid, 1e18, 1e18, S, 0, 0, 0, M2);
     }
 
+    /// RH4 (G3): the open-book cap and the pool's notional cap on an early close get the calendar's share.
+    function test_weekendShareAppliesToTheOpenBookCapAndToEarlyCloses() public {
+        uint256 sid = _series();
+        _matched(M1, sid, 2e18); // 140,000 on the open-book cap
+        MockSessionCalendar mc = new MockSessionCalendar();
+        pool.setSessionCalendar(mc);
+        pool.setOpenBookCap(BTC, 600_000e6);
+        mc.setCapBps(BTC, 2_500); // 150,000 on a closed day
+        mb.matchMaker(M2, sid, 1e18, 1e18);
+        book.mint(sid, BUYER, 1e18);
+        vm.expectRevert(abi.encodeWithSelector(MainspringPool.OpenBookCapExceeded.selector, BTC, 210_000e6, 150_000e6));
+        pool.onMatchedOpen(BTC, sid, 1e18, 1e18, S, 0, 0, 0, M2);
+        pool.setOpenBookCap(BTC, 1e15);
+        // an early close is a pool open: its notional cap is scaled too
+        pool.setCaps(BTC, 400_000e6, 1e15); // 100,000 on a closed day
+        bytes32 key = _key(M1);
+        vm.prank(M1);
+        vm.expectRevert(abi.encodeWithSelector(MainspringPool.NotionalCapExceeded.selector, BTC, 140_000e6, 100_000e6));
+        mb.earlyClose(key, sid, type(uint256).max, type(int256).max, nowT);
+        mc.setCapBps(BTC, 10_000); // a trading day: the full 400,000
+        vm.prank(M1);
+        mb.earlyClose(key, sid, type(uint256).max, type(int256).max, nowT);
+    }
+
     /// Matched opens are not limited by the pool's coverage: a thin pool refuses a pool fill but takes a matched one.
     function test_aThinPoolTakesMatchedFillsItCouldNotTakeItself() public {
         // the fixture's pool holds 5,000,000; a pool fill of 5,000 spreads (stressed value ~3,000 each) breaches coverage
@@ -248,14 +275,14 @@ contract PoolMatchedTest is PoolMatchedBase {
         int256 v = EnginePricing.shapeValue(_spread(), S, SIG, _day(), true);
         (uint256 premium, uint256 fee) = EnginePricing.shapeBuyQuote(v, units, _spread(), S, 200);
         book.mint(sid, BUYER, units);
-        usdc.transfer(address(pool), premium + fee);
+        settlement.transfer(address(pool), premium + fee);
         vm.expectPartialRevert(MainspringPool.CoverageBreached.selector);
         pool.onBuy(BTC, sid, units, units, S, SIG, premium, fee);
         book.burn(sid, BUYER, units);
         // matched: the makers carry it; the pool's stress does not move
-        usdc.mint(M1, 100_000_000e6);
+        settlement.mint(M1, 100_000_000e6);
         vm.startPrank(M1);
-        vault.deposit(IERC20(address(usdc)), 100_000_000e6);
+        vault.deposit(IERC20(address(settlement)), 100_000_000e6);
         vm.stopPrank();
         uint256 stressed0 = pool.stressedLiability();
         _matched(M1, sid, units);
@@ -270,9 +297,9 @@ contract PoolMatchedTest is PoolMatchedBase {
         _matched(M2, sid, 1e18);
         uint256 nav0 = pool.navNow();
         uint256 stressed0 = pool.stressedLiability();
-        uint256 buyerBefore = usdc.balanceOf(BUYER);
+        uint256 buyerBefore = settlement.balanceOf(BUYER);
         (uint256 net, uint256 gross, uint256 fee) = _sell(sid, 2e18);
-        assertEq(usdc.balanceOf(BUYER) - buyerBefore, net, "the seller gets exactly the quote");
+        assertEq(settlement.balanceOf(BUYER) - buyerBefore, net, "the seller gets exactly the quote");
         assertEq(mb.matchedRaw(sid), 0);
         assertEq(pool.matchedRawOf(sid), 0);
         assertEq(pool.seriesRaw(sid), 0);
@@ -343,9 +370,9 @@ contract PoolMatchedTest is PoolMatchedBase {
     function test_earlyCloseRefusedWhenCoverageWouldBreach() public {
         // a thin pool: the makers carry a large matched book; taking it back would breach coverage
         uint256 sid = _series();
-        usdc.mint(M1, 100_000_000e6);
+        settlement.mint(M1, 100_000_000e6);
         vm.startPrank(M1);
-        vault.deposit(IERC20(address(usdc)), 100_000_000e6);
+        vault.deposit(IERC20(address(settlement)), 100_000_000e6);
         vm.stopPrank();
         _matched(M1, sid, 5_000e18);
         vm.prank(M1);
@@ -391,9 +418,9 @@ contract PoolMatchedBackstopTest is PoolMatchedBase {
         _matchedOnly(sid, 4e18);
         uint256 stressed0 = pool.stressedLiability();
         mb.setMode(1, 1e18); // the sell closes 2 and leaves 1 more uncovered
-        uint256 buyerBefore = usdc.balanceOf(BUYER);
+        uint256 buyerBefore = settlement.balanceOf(BUYER);
         (uint256 net,,) = _sell(sid, 2e18);
-        assertEq(usdc.balanceOf(BUYER) - buyerBefore, net, "the seller is paid in full (law 3)");
+        assertEq(settlement.balanceOf(BUYER) - buyerBefore, net, "the seller is paid in full (law 3)");
         assertEq(pool.matchedRawOf(sid), 1e18);
         assertEq(pool.seriesRaw(sid), 2e18);
         assertEq(pool.stressedLiability() - stressed0, Math.ceilDiv(_stressedOf(1e18), 1e12), "counted at once");
@@ -407,9 +434,9 @@ contract PoolMatchedBackstopTest is PoolMatchedBase {
         _matchedOnly(sid, 4e18);
         assertEq(pool.seriesRaw(sid), 6e18);
         mb.setMode(2, 0); // the buyback reverts
-        uint256 buyerBefore = usdc.balanceOf(BUYER);
+        uint256 buyerBefore = settlement.balanceOf(BUYER);
         (uint256 net,,) = _sell(sid, 5e18);
-        assertEq(usdc.balanceOf(BUYER) - buyerBefore, net, "the seller is paid in full anyway (law 3)");
+        assertEq(settlement.balanceOf(BUYER) - buyerBefore, net, "the seller is paid in full anyway (law 3)");
         uint256 raw = pool.seriesRaw(sid);
         uint256 m = pool.matchedRawOf(sid);
         assertEq(raw, 1e18);

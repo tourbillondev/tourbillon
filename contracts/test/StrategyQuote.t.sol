@@ -21,7 +21,7 @@ contract TempoBlendHarness {
 /// External wrapper so StrategyMath reverts happen one call deep.
 contract StrategyHarness {
     function collateral(bytes32 market, StrategyMath.Leg[] memory l, int256 c) external pure returns (uint256) {
-        return StrategyMath.writerCollateral(market, l, c);
+        return StrategyMath.writerCollateral(market == "STK1", l, c); // STK1 has a covering asset (as listed in CoveringAssets)
     }
 }
 
@@ -137,16 +137,16 @@ contract StrategyQuoteTest is Test {
         assertGt(v, 0);
     }
 
-    /// WHYPE covers only on the HYPE market; covers are never negative; at most four legs.
-    /// A covered HYPE collar (long Fall, short Rise above, covered by WHYPE) locks only the covering units,
+    /// STK1 stock covers only on the STK1 market; covers are never negative; at most four legs.
+    /// A covered STK1 collar (long Fall, short Rise above, covered by STK1 stock) locks only the covering units,
     /// and its payoff stays between the two strikes at every price.
     function test_coverRulesAndCoveredCollar() public {
         StrategyMath.Leg[] memory collar = new StrategyMath.Leg[](2);
         collar[0] = StrategyMath.Leg(false, 90e18, 1e18); // long Fall 90
         collar[1] = StrategyMath.Leg(true, 110e18, -1e18); // short Rise 110
 
-        // Covered collar on HYPE: no cash, only the WHYPE unit
-        assertEq(strat.collateral("HYPE", collar, 1e18), 0);
+        // Covered collar on STK1: no cash, only the STK1 stock unit
+        assertEq(strat.collateral("STK1", collar, 1e18), 0);
         (int256 mn, int256 mx, bool mnU, bool mxU) = StrategyMath.bounds(collar, 1e18);
         assertEq(mn, 90e18);
         assertEq(mx, 110e18);
@@ -157,16 +157,16 @@ contract StrategyQuoteTest is Test {
         }
 
         // The same cover anywhere else is refused; without cover the short Rise is naked
-        vm.expectRevert(abi.encodeWithSelector(StrategyMath.CoverNotAllowed.selector, bytes32("BTC")));
+        vm.expectRevert(StrategyMath.CoverNotAllowed.selector);
         strat.collateral("BTC", collar, 1e18);
         vm.expectRevert(StrategyMath.Unbounded.selector);
-        strat.collateral("HYPE", collar, 0);
+        strat.collateral("STK1", collar, 0);
         vm.expectRevert(StrategyMath.NegativeCover.selector);
-        strat.collateral("HYPE", collar, -1e18);
+        strat.collateral("STK1", collar, -1e18);
 
         // Half a unit of cover leaves half the short Rise naked
         vm.expectRevert(StrategyMath.Unbounded.selector);
-        strat.collateral("HYPE", collar, 0.5e18);
+        strat.collateral("STK1", collar, 0.5e18);
 
         // Five legs are refused, four are fine
         StrategyMath.Leg[] memory five = new StrategyMath.Leg[](5);
@@ -190,13 +190,13 @@ contract StrategyQuoteTest is Test {
         uint256 s,
         uint256 sig,
         uint256 tau,
-        bool hype,
+        bool stockMarket,
         uint256 cover
     ) public view {
         s = bound(s, 1e18, 1000e18);
         sig = bound(sig, 500, 30_000);
         tau = bound(tau, 1 hours, 30 days);
-        cover = hype ? bound(cover, 0, 3) * 1e18 : 0;
+        cover = stockMarket ? bound(cover, 0, 3) * 1e18 : 0;
         StrategyMath.Leg[] memory l = new StrategyMath.Leg[](4);
         for (uint256 i; i < 4; i++) {
             uint256 r = uint256(keccak256(abi.encode(seed, i)));
@@ -204,7 +204,7 @@ contract StrategyQuoteTest is Test {
                 r % 2 == 0, uint128(10e18 + (r >> 8) % 490e18), int128(int256((r >> 128) % 5e18)) - 2.5e18
             );
         }
-        bytes32 market = hype ? bytes32("HYPE") : bytes32("BTC");
+        bytes32 market = stockMarket ? bytes32("STK1") : bytes32("BTC");
         try strat.collateral(market, l, int256(cover)) returns (uint256 coll) {
             // −payoff at the fuzzed price, and the marked liability
             int256 p = StrategyMath.payoffAt(l, int256(cover), s);

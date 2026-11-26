@@ -9,7 +9,7 @@ import {StrategyMath} from "./StrategyMath.sol";
 
 /// @title EnginePricing
 /// @notice Every amount the Engine charges or pays on a single-leg trade. Pure: no storage, no tokens.
-/// @dev    Amounts are computed in WAD (18 decimals) and converted to USDC (6 decimals) once, at the end.
+/// @dev    Amounts are computed in WAD (18 decimals) and converted to settlement token (6 decimals) once, at the end.
 ///         Every rounding favours the counterparty:
 ///         - a buyer pays the premium and the fee rounded up;
 ///         - a seller's gross is rounded down and the fee rounded up, the fee capped at the gross, so a sell of
@@ -31,8 +31,8 @@ library EnginePricing {
     uint256 internal constant DEFAULT_SPREAD_BPS = 200;
     uint256 internal constant NOTIONAL_FEE_BPS = 3;
     uint256 internal constant MIN_FEE = 1e16; // $0.01 in WAD
-    uint8 internal constant USDC_DECIMALS = 6;
-    uint256 internal constant WAD_PER_USDC_UNIT = 1e12; // 10^(18 − 6)
+    uint8 internal constant SETTLEMENT_DECIMALS = 6;
+    uint256 internal constant WAD_PER_SETTLEMENT_UNIT = 1e12; // 10^(18 − 6)
 
     error SpreadOutOfRange(uint256 spreadBps);
     error ZeroUnits();
@@ -59,7 +59,7 @@ library EnginePricing {
         return spread + Math.mulDiv(notional, NOTIONAL_FEE_BPS, BPS, Math.Rounding.Ceil);
     }
 
-    /// @notice What a buyer of `units` pays, in USDC (6 decimals): `premium` to the counterparty and `feeAmt` to the
+    /// @notice What a buyer of `units` pays, in settlement token (6 decimals): `premium` to the counterparty and `feeAmt` to the
     ///         fee recipient, both rounded up.
     function buyQuote(uint256 unitValueWad, uint256 units, uint256 sWad, uint256 spreadBps)
         internal
@@ -68,11 +68,11 @@ library EnginePricing {
     {
         if (units == 0) revert ZeroUnits();
         uint256 p = Math.mulDiv(units, unitValueWad, WAD, Math.Rounding.Ceil);
-        premium = Math.ceilDiv(p, WAD_PER_USDC_UNIT);
-        feeAmt = Math.ceilDiv(fee(p, units, sWad, spreadBps), WAD_PER_USDC_UNIT);
+        premium = Math.ceilDiv(p, WAD_PER_SETTLEMENT_UNIT);
+        feeAmt = Math.ceilDiv(fee(p, units, sWad, spreadBps), WAD_PER_SETTLEMENT_UNIT);
     }
 
-    /// @notice What a seller of `units` receives, in USDC (6 decimals). The counterparty pays `gross` (rounded
+    /// @notice What a seller of `units` receives, in settlement token (6 decimals). The counterparty pays `gross` (rounded
     ///         down): `gross − feeAmt` to the seller and `feeAmt` (rounded up, at most `gross`) to the fee recipient.
     function sellQuote(uint256 unitValueWad, uint256 units, uint256 sWad, uint256 spreadBps)
         internal
@@ -81,8 +81,8 @@ library EnginePricing {
     {
         if (units == 0) revert ZeroUnits();
         uint256 g = Math.mulDiv(units, unitValueWad, WAD);
-        gross = g / WAD_PER_USDC_UNIT;
-        feeAmt = Math.ceilDiv(fee(g, units, sWad, spreadBps), WAD_PER_USDC_UNIT);
+        gross = g / WAD_PER_SETTLEMENT_UNIT;
+        feeAmt = Math.ceilDiv(fee(g, units, sWad, spreadBps), WAD_PER_SETTLEMENT_UNIT);
         if (feeAmt > gross) feeAmt = gross;
     }
 
@@ -161,7 +161,7 @@ library EnginePricing {
         return fee(_abs(priceWad), notionalUnits, sWad, spreadBps);
     }
 
-    /// @notice What a buyer of `units` shape units pays, in USDC, both rounded up. `valueUpWad` is shapeValue(up). A
+    /// @notice What a buyer of `units` shape units pays, in settlement token, both rounded up. `valueUpWad` is shapeValue(up). A
     ///         buyer shape's payoff never goes below 0 (checkBuyerShape), so its true value is at least 0; a computed
     ///         value a few wei below 0 (TempoMath's rounding on deep out-of-the-money legs) counts as 0.
     function shapeBuyQuote(int256 valueUpWad, uint256 units, StrategyMath.Leg[] memory legs, uint256 sWad, uint256 spreadBps)
@@ -172,11 +172,11 @@ library EnginePricing {
         if (units == 0) revert ZeroUnits();
         uint256 v = valueUpWad > 0 ? uint256(valueUpWad) : 0;
         uint256 p = Math.mulDiv(units, v, WAD, Math.Rounding.Ceil);
-        premium = Math.ceilDiv(p, WAD_PER_USDC_UNIT);
-        feeAmt = Math.ceilDiv(shapeFee(int256(p), units, legs, sWad, spreadBps), WAD_PER_USDC_UNIT);
+        premium = Math.ceilDiv(p, WAD_PER_SETTLEMENT_UNIT);
+        feeAmt = Math.ceilDiv(shapeFee(int256(p), units, legs, sWad, spreadBps), WAD_PER_SETTLEMENT_UNIT);
     }
 
-    /// @notice What a seller of `units` shape units receives, in USDC: `gross` rounded down (a value below 0 counts as
+    /// @notice What a seller of `units` shape units receives, in settlement token: `gross` rounded down (a value below 0 counts as
     ///         0), the fee rounded up and capped at the gross, so a worthless shape sells for 0 and never reverts.
     function shapeSellQuote(
         int256 valueDownWad,
@@ -188,13 +188,13 @@ library EnginePricing {
         if (units == 0) revert ZeroUnits();
         uint256 v = valueDownWad > 0 ? uint256(valueDownWad) : 0;
         uint256 g = Math.mulDiv(units, v, WAD);
-        gross = g / WAD_PER_USDC_UNIT;
-        feeAmt = Math.ceilDiv(shapeFee(int256(g), units, legs, sWad, spreadBps), WAD_PER_USDC_UNIT);
+        gross = g / WAD_PER_SETTLEMENT_UNIT;
+        feeAmt = Math.ceilDiv(shapeFee(int256(g), units, legs, sWad, spreadBps), WAD_PER_SETTLEMENT_UNIT);
         if (feeAmt > gross) feeAmt = gross;
     }
 
     /// @notice A write of `units` shape units (legs from the pool's side, the holder): the writer's signed credit in
-    ///         USDC, value × units rounded towards −∞, less the fee (rounded up). Negative: the writer pays (a Guard
+    ///         settlement token, value × units rounded towards −∞, less the fee (rounded up). Negative: the writer pays (a Guard
     ///         can be a net debit).
     function shapeWriteQuote(
         int256 valueDownWad,
@@ -205,11 +205,11 @@ library EnginePricing {
     ) internal pure returns (int256 credit, uint256 feeAmt) {
         if (units == 0) revert ZeroUnits();
         int256 g = _mulWad(valueDownWad, units, false);
-        feeAmt = Math.ceilDiv(shapeFee(g, units, legs, sWad, spreadBps), WAD_PER_USDC_UNIT);
-        credit = _div(g, int256(WAD_PER_USDC_UNIT), false) - int256(feeAmt);
+        feeAmt = Math.ceilDiv(shapeFee(g, units, legs, sWad, spreadBps), WAD_PER_SETTLEMENT_UNIT);
+        credit = _div(g, int256(WAD_PER_SETTLEMENT_UNIT), false) - int256(feeAmt);
     }
 
-    /// @notice An unwrite of `units` shape units: the writer's signed buyback cost in USDC, value × units rounded
+    /// @notice An unwrite of `units` shape units: the writer's signed buyback cost in settlement token, value × units rounded
     ///         towards +∞, plus the fee (rounded up). The cap at the locked collateral is the WriterBook's (D8).
     function shapeUnwriteQuote(
         int256 valueUpWad,
@@ -220,8 +220,8 @@ library EnginePricing {
     ) internal pure returns (int256 cost, uint256 feeAmt) {
         if (units == 0) revert ZeroUnits();
         int256 g = _mulWad(valueUpWad, units, true);
-        feeAmt = Math.ceilDiv(shapeFee(g, units, legs, sWad, spreadBps), WAD_PER_USDC_UNIT);
-        cost = _div(g, int256(WAD_PER_USDC_UNIT), true) + int256(feeAmt);
+        feeAmt = Math.ceilDiv(shapeFee(g, units, legs, sWad, spreadBps), WAD_PER_SETTLEMENT_UNIT);
+        cost = _div(g, int256(WAD_PER_SETTLEMENT_UNIT), true) + int256(feeAmt);
     }
 
     /// @notice Buys only: a buyer may hold a shape only if its payoff can never go below 0 (law 1), checked with

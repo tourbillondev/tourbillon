@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.28;
 
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {Test} from "forge-std/Test.sol";
 import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 import {Engine} from "../../src/Engine.sol";
@@ -12,23 +13,25 @@ import {TempoBlend} from "../../src/TempoBlend.sol";
 import {StrategyMath} from "../../src/StrategyMath.sol";
 import {WriterBook, IEngineConfig} from "../../src/WriterBook.sol";
 import {MockUSDC} from "../mocks/MockUSDC.sol";
-import {MockWHYPE} from "../mocks/MockWHYPE.sol";
+import {MockStockToken} from "../mocks/MockStockToken.sol";
+import {CoverFixture} from "../mocks/CoverFixture.sol";
+import {CoveringAssets} from "../../src/CoveringAssets.sol";
 import {MockMarks, MockVols} from "../Engine.t.sol";
 
-/// M4 step 8b, the T1 gate on the real contracts. Random sequences of writes (eight shapes on BTC and HYPE, USDC and
-/// WHYPE cover), claims, partial and full unwrites, buyer shape buys and sells, price moves with samples, hourly epochs
+/// M4 step 8b, the T1 gate on the real contracts. Random sequences of writes (eight shapes on BTC and STK1, USDC and
+/// STK1 stock cover), claims, partial and full unwrites, buyer shape buys and sells, price moves with samples, hourly epochs
 /// and settlement, pauses. Every failed action is caught and classified; ghost counters feed the invariants.
 contract WriterHandler is Test {
     bytes32 public constant BTC = "BTC";
-    bytes32 public constant HYPE = "HYPE";
+    bytes32 public constant STK1 = "STK1";
     address public constant PROTO = address(0x9907);
     uint256 public constant START_USDC = 50_000_000e6;
-    uint256 public constant START_WHYPE = 1_000_000e18;
+    uint256 public constant START_STOCK = 1_000_000e18;
     uint256 public constant MAX_OPEN_WRITES = 20;
     int256 public constant WEI_TOLERANCE = 1_000; // TempoMath few-wei rounding (M4 step 6 finding), per shape unit
 
-    MockUSDC public usdc;
-    MockWHYPE public whype;
+    MockUSDC public settlement;
+    MockStockToken public stock;
     MockMarks public marks;
     MockVols public vols;
     MainspringPool public pool;
@@ -47,9 +50,11 @@ contract WriterHandler is Test {
     uint256[] public writeIds;
     mapping(uint256 => uint256) public shapeOf; // writeId → shape index
     mapping(uint256 => uint256) public lastRequired; // writeId → USDC required after the last walk
-    mapping(uint256 => uint256) public lastRequiredWhype;
+    mapping(uint256 => uint256) public lastRequiredCover;
 
     // ghosts
+    uint256 public freezes;
+    uint256 public settles;
     uint256 public writesOk;
     uint256 public claimsOk;
     uint256 public unwritesOk;
@@ -65,47 +70,49 @@ contract WriterHandler is Test {
 
     constructor() {
         vm.warp(nowT);
-        usdc = new MockUSDC();
-        whype = new MockWHYPE();
+        settlement = new MockUSDC();
+        stock = new MockStockToken("Mock Stock One", "STK1", 18);
         marks = new MockMarks();
         vols = new MockVols();
         address[] memory sg = new address[](3);
         (sg[0], sg[1], sg[2]) = (address(0x51), address(0x52), address(0x53));
         QuorumBoard board = new QuorumBoard(address(this), sg, 2, 30);
+        // before the address predictions below: the covering-asset table with STK1's token listed
+        CoveringAssets covers = CoverFixture.listed(address(this), address(marks), IERC20(address(stock)));
         uint256 n = vm.getNonce(address(this));
         address bookAt = vm.computeCreateAddress(address(this), n + 1);
         address engineAt = vm.computeCreateAddress(address(this), n + 2);
         pool = new MainspringPool(
-            address(this), usdc, PathFundingBook(bookAt), marks, vols, IEquityFeed(address(board)), PROTO
+            address(this), settlement, PathFundingBook(bookAt), marks, vols, IEquityFeed(address(board)), PROTO
         );
         book = new PathFundingBook(engineAt, address(this), marks, vols);
         engine = new Engine(address(this), book, pool, marks, vols);
         require(address(book) == bookAt && address(engine) == engineAt, "prediction");
-        wb = new WriterBook(book, IEngineConfig(address(engine)), pool, marks, vols, usdc, whype);
+        wb = new WriterBook(book, IEngineConfig(address(engine)), pool, marks, vols, settlement, covers);
         pool.setEngine(address(engine));
         engine.setWriterBook(address(wb));
         pool.setWriterBook(address(wb));
-        pool.setWhype(whype, HYPE);
+        pool.setCoverAssets(covers);
         pool.listMarket(BTC, 2000);
-        pool.listMarket(HYPE, 3500);
+        pool.listMarket(STK1, 3500);
         pool.setHedgerDeltaCap(BTC, 1e16);
-        pool.setHedgerDeltaCap(HYPE, 1e16);
+        pool.setHedgerDeltaCap(STK1, 1e16);
         pool.setCaps(BTC, 1e15, 1e15);
-        pool.setCaps(HYPE, 1e15, 1e15);
+        pool.setCaps(STK1, 1e15, 1e15);
         pool.grantRole(pool.RISK_PAUSER_ROLE(), address(this));
         engine.grantRole(engine.PAUSER_ROLE(), address(this));
         engine.setMarket(BTC, 100e18, 200);
-        engine.setMarket(HYPE, 1e18, 200);
+        engine.setMarket(STK1, 1e18, 200);
         marks.set(BTC, sBtc);
-        marks.set(HYPE, sHype);
+        marks.set(STK1, sHype);
         vols.set(BTC, 4500);
-        vols.set(HYPE, 8000);
+        vols.set(STK1, 8000);
         book.record(BTC, sBtc, 4500);
-        book.record(HYPE, sHype, 8000);
+        book.record(STK1, sHype, 8000);
 
-        usdc.mint(LP, START_USDC);
+        settlement.mint(LP, START_USDC);
         vm.startPrank(LP);
-        usdc.approve(address(pool), type(uint256).max);
+        settlement.approve(address(pool), type(uint256).max);
         pool.deposit(10_000_000e6);
         vm.stopPrank();
         pool.startEpoch();
@@ -115,17 +122,17 @@ contract WriterHandler is Test {
         pool.claimShares(0);
 
         for (uint256 i; i < 3; ++i) {
-            usdc.mint(writers[i], START_USDC);
-            whype.mint(writers[i], START_WHYPE);
+            settlement.mint(writers[i], START_USDC);
+            stock.mint(writers[i], START_STOCK);
             vm.startPrank(writers[i]);
-            usdc.approve(address(wb), type(uint256).max);
-            whype.approve(address(wb), type(uint256).max);
+            settlement.approve(address(wb), type(uint256).max);
+            stock.approve(address(wb), type(uint256).max);
             vm.stopPrank();
         }
         for (uint256 i; i < 2; ++i) {
-            usdc.mint(traders[i], START_USDC);
+            settlement.mint(traders[i], START_USDC);
             vm.prank(traders[i]);
-            usdc.approve(address(engine), type(uint256).max);
+            settlement.approve(address(engine), type(uint256).max);
         }
     }
 
@@ -137,7 +144,7 @@ contract WriterHandler is Test {
         return StrategyMath.Leg(isCall, uint128(k), int128(q));
     }
 
-    /// The writer's legs, market and whether WHYPE covers the net short calls.
+    /// The writer's legs, market and whether STK1 stock covers the net short calls.
     function shape(uint256 i) public pure returns (StrategyMath.Leg[] memory l, bytes32 market, bool cover) {
         if (i == 0) {
             // written call spread
@@ -175,21 +182,21 @@ contract WriterHandler is Test {
             return (l, BTC, false);
         }
         if (i == 5) {
-            // covered HYPE Rise
+            // covered STK1 Rise
             l = new StrategyMath.Leg[](1);
             l[0] = _leg(true, 44e18, -1e18);
-            return (l, HYPE, true);
+            return (l, STK1, true);
         }
         if (i == 6) {
             // Guard: buy the Fall, write the Rise, covered
             l = new StrategyMath.Leg[](2);
             (l[0], l[1]) = (_leg(false, 36e18, 1e18), _leg(true, 44e18, -1e18));
-            return (l, HYPE, true);
+            return (l, STK1, true);
         }
-        // a written HYPE Fall (cash-secured)
+        // a written STK1 Fall (cash-secured)
         l = new StrategyMath.Leg[](1);
         l[0] = _leg(false, 38e18, -1e18);
-        return (l, HYPE, false);
+        return (l, STK1, false);
     }
 
     function _neg(StrategyMath.Leg[] memory legs) internal pure returns (StrategyMath.Leg[] memory out) {
@@ -229,7 +236,7 @@ contract WriterHandler is Test {
             writesOk++;
             writeIds.push(wid);
             shapeOf[wid] = i;
-            (lastRequired[wid], lastRequiredWhype[wid]) = wb.required(wid);
+            (lastRequired[wid], lastRequiredCover[wid]) = wb.required(wid);
         } catch (bytes memory err) {
             _classifyOpen(err);
         }
@@ -253,7 +260,7 @@ contract WriterHandler is Test {
     function unwrite(uint256 seed, uint256 fracSeed) external {
         uint256 wid = _pickOpen(seed);
         if (wid == 0) return;
-        (address w, bytes32 m,, uint256 raw,,, uint256 usdcL, uint256 whypeL) = wb.writes(wid);
+        (address w, bytes32 m,, uint256 raw,,, uint256 settlementL, uint256 coverL) = wb.writes(wid);
         uint256 frac = fracSeed % 3; // 0: all, 1: a third, 2: two thirds of the units now
         uint256 units = type(uint256).max;
         if (frac != 0) {
@@ -264,13 +271,13 @@ contract WriterHandler is Test {
         vm.prank(w);
         try wb.unwrite(wid, units, type(int256).max, nowT) returns (uint256, int256 cost) {
             unwritesOk++;
-            (,,, uint256 rawAfter,,, uint256 usdcAfter, uint256 whypeAfter) = wb.writes(wid);
-            uint256 usdcPart = usdcL - usdcAfter;
-            uint256 whypePart = whypeL - whypeAfter;
-            uint256 cap = usdcPart + Math.mulDiv(whypePart, mark(m), 1e18) / 1e12;
+            (,,, uint256 rawAfter,,, uint256 settlementAfter, uint256 coverAfter) = wb.writes(wid);
+            uint256 settlementPart = settlementL - settlementAfter;
+            uint256 coverPart = coverL - coverAfter;
+            uint256 cap = settlementPart + Math.mulDiv(coverPart, mark(m), 1e18) / 1e12;
             if (cost > int256(cap)) unwriteOverCap++;
             rawAfter;
-            (lastRequired[wid], lastRequiredWhype[wid]) = wb.required(wid);
+            (lastRequired[wid], lastRequiredCover[wid]) = wb.required(wid);
         } catch (bytes memory err) {
             // writers can always close; only a pool truly unable to pay a negative cost could refuse
             if (_sel(err) == MainspringPool.Insolvent.selector) {
@@ -334,9 +341,9 @@ contract WriterHandler is Test {
         sBtc = _move(sBtc, seed, 60_000e18, 80_000e18);
         sHype = _move(sHype, seed >> 64, 34e18, 46e18);
         marks.set(BTC, sBtc);
-        marks.set(HYPE, sHype);
+        marks.set(STK1, sHype);
         book.record(BTC, sBtc, 4500);
-        book.record(HYPE, sHype, 8000);
+        book.record(STK1, sHype, 8000);
         try pool.startEpoch() {
             while (!pool.markChunk(100)) {}
             pool.settle();
@@ -354,7 +361,7 @@ contract WriterHandler is Test {
             if (engine.buysPaused()) engine.unpauseBuys();
             else engine.pauseBuys();
         } else {
-            bytes32 m = k == 1 ? BTC : HYPE;
+            bytes32 m = k == 1 ? BTC : STK1;
             if (pool.marketPaused(m)) pool.unpauseMarket(m);
             else pool.pauseMarket(m);
         }
@@ -362,6 +369,26 @@ contract WriterHandler is Test {
 
     function resumeIfPaused() external {
         if (pool.opensPaused()) pool.resumeOpens();
+    }
+
+    /// RH5 (owner D3): the issuer freezes or unfreezes the covering token at random. Unwrites and claims must still
+    /// work (the cover stays owed), and the book must still hold exactly what is locked plus what is owed.
+    function freezeCover(uint256 seed) external {
+        stock.setFrozen(seed % 2 == 0);
+        freezes++;
+    }
+
+    /// Once the token moves, anyone settles what the book owes (to the pool and to each writer).
+    function settleOwed() external {
+        if (stock.frozen()) return;
+        IERC20 st = IERC20(address(stock));
+        address[4] memory to = [address(pool), writers[0], writers[1], writers[2]];
+        for (uint256 i; i < 4; ++i) {
+            if (wb.owedCover(st, to[i]) > 0) {
+                wb.settleCover(st, to[i]);
+                settles++;
+            }
+        }
     }
 
     // ---------------------------------------------------------------- checks after every action
@@ -376,8 +403,8 @@ contract WriterHandler is Test {
         for (uint256 j; j < writeIds.length; ++j) {
             uint256 wid = writeIds[j];
             (uint256 u, uint256 h) = wb.required(wid);
-            if (u > lastRequired[wid] || h > lastRequiredWhype[wid]) obligationRose++;
-            (lastRequired[wid], lastRequiredWhype[wid]) = (u, h);
+            if (u > lastRequired[wid] || h > lastRequiredCover[wid]) obligationRose++;
+            (lastRequired[wid], lastRequiredCover[wid]) = (u, h);
         }
     }
 
@@ -420,6 +447,8 @@ contract WriterHandler is Test {
                 || sel == Engine.NotCaughtUp.selector || sel == WriterBook.ZeroRaw.selector
                 || sel == Engine.ZeroRaw.selector
         ) return;
+        // a write cannot pull a frozen covering token (the token's own refusal): refused, nothing changed
+        if (stock.frozen() && sel == bytes4(keccak256("Error(string)"))) return;
         unexpectedFailures++;
         lastError = err;
     }
@@ -438,14 +467,17 @@ contract WriterHandler is Test {
 
 /// forge-config: default.invariant.runs = 64
 /// forge-config: default.invariant.depth = 60
+/// forge-config: deep.invariant.runs = 1000
+/// forge-config: deep.invariant.depth = 100
 /// forge-config: default.invariant.fail-on-revert = true
+/// forge-config: deep.invariant.fail-on-revert = true
 contract WriterInvariantTest is Test {
     WriterHandler h;
 
     function setUp() public {
         h = new WriterHandler();
         targetContract(address(h));
-        bytes4[] memory sel = new bytes4[](8);
+        bytes4[] memory sel = new bytes4[](10);
         sel[0] = WriterHandler.write.selector;
         sel[1] = WriterHandler.claim.selector;
         sel[2] = WriterHandler.unwrite.selector;
@@ -454,6 +486,8 @@ contract WriterInvariantTest is Test {
         sel[5] = WriterHandler.hour.selector;
         sel[6] = WriterHandler.togglePause.selector;
         sel[7] = WriterHandler.resumeIfPaused.selector;
+        sel[8] = WriterHandler.freezeCover.selector;
+        sel[9] = WriterHandler.settleOwed.selector;
         targetSelector(FuzzSelector({addr: address(h), selectors: sel}));
     }
 
@@ -462,12 +496,12 @@ contract WriterInvariantTest is Test {
         bytes32 market;
         uint256 sid;
         uint256 raw;
-        uint256 usdcL;
-        uint256 whypeL;
+        uint256 settlementL;
+        uint256 coverL;
     }
 
     function _w(uint256 wid) internal view returns (W memory w) {
-        (w.writer, w.market, w.sid, w.raw,,, w.usdcL, w.whypeL) = h.wb().writes(wid);
+        (w.writer, w.market, w.sid, w.raw,,, w.settlementL, w.coverL) = h.wb().writes(wid);
     }
 
     /// 1. Law 4, checked independently of the WriterBook's own `required`: every open write's locked collateral
@@ -492,10 +526,10 @@ contract WriterInvariantTest is Test {
             }
             if (minS < 0) {
                 // locked USDC (6 decimals → WAD) × 1e18 ≥ |min| (WAD × WAD per unit) × units now (WAD)
-                assertGe(w.usdcL * 1e12 * 1e18, Math.mulDiv(uint256(-minS), unitsNow, 1e18), "law 4: USDC");
+                assertGe(w.settlementL * 1e12 * 1e18, Math.mulDiv(uint256(-minS), unitsNow, 1e18), "law 4: USDC");
             }
             if (coverQty > 0) {
-                assertGe(w.whypeL, Math.mulDiv(uint256(coverQty), unitsNow, 1e18), "law 4: WHYPE cover");
+                assertGe(w.coverL, Math.mulDiv(uint256(coverQty), unitsNow, 1e18), "law 4: STK1 stock cover");
             }
         }
     }
@@ -517,8 +551,8 @@ contract WriterInvariantTest is Test {
                 uint256 s = h.mark(m) * g / 100;
                 int256 v = EnginePricing.shapeValue(poolLegs, s, sig, TempoBlend.single(1 days), true);
                 if (v <= 0) continue;
-                uint256 owed = Math.mulDiv(unitsNow, uint256(v), 1e18); // WAD USDC
-                uint256 coll = w.usdcL * 1e12 + Math.mulDiv(w.whypeL, s, 1e18); // WAD USDC
+                uint256 owed = Math.mulDiv(unitsNow, uint256(v), 1e18); // WAD settlement
+                uint256 coll = w.settlementL * 1e12 + Math.mulDiv(w.coverL, s, 1e18); // WAD settlement
                 assertLe(
                     owed,
                     coll + uint256(h.WEI_TOLERANCE()) * (unitsNow / 1e18 + 1),
@@ -541,21 +575,23 @@ contract WriterInvariantTest is Test {
     /// 4 and 6. Claims never take collateral below what is required (law 4 above); the WriterBook holds exactly what
     ///    is locked; the Engine holds nothing.
     function invariant_writerBookHoldsExactlyWhatIsLocked() public view {
-        assertEq(h.usdc().balanceOf(address(h.wb())), h.wb().totalUsdcLocked());
-        assertEq(h.whype().balanceOf(address(h.wb())), h.wb().totalWhypeLocked());
-        assertEq(h.usdc().balanceOf(address(h.engine())), 0);
+        assertEq(h.settlement().balanceOf(address(h.wb())), h.wb().totalSettlementLocked());
+        IERC20 st = IERC20(address(h.stock()));
+        // the book holds exactly what is locked plus any cover owed because it could not move (CoverLedger)
+        assertEq(st.balanceOf(address(h.wb())), h.wb().totalCoverLocked(st) + h.wb().owedCoverTotal(st));
+        assertEq(h.settlement().balanceOf(address(h.engine())), 0);
         uint256 sumU;
         uint256 sumH;
         for (uint256 j; j < h.writeCount(); ++j) {
             W memory w = _w(h.writeIds(j));
-            sumU += w.usdcL;
-            sumH += w.whypeL;
+            sumU += w.settlementL;
+            sumH += w.coverL;
         }
-        assertEq(sumU, h.wb().totalUsdcLocked());
-        assertEq(sumH, h.wb().totalWhypeLocked());
+        assertEq(sumU, h.wb().totalSettlementLocked());
+        assertEq(sumH, h.wb().totalCoverLocked(st));
     }
 
-    /// 7. The pool's written raw per series equals the WriterBook's total for it; USDC and WHYPE are conserved.
+    /// 7. The pool's written raw per series equals the WriterBook's total for it; USDC and STK1 stock are conserved.
     function invariant_accountingAgrees() public view {
         for (uint256 i; i < h.N_SHAPES(); ++i) {
             uint256 sid = h.seriesOfShape(i);
@@ -566,20 +602,21 @@ contract WriterInvariantTest is Test {
             }
             assertEq(h.pool().writtenRaw(sid), sum, "pool written raw = WriterBook raw");
         }
-        uint256 totalUsdc = h.usdc().balanceOf(h.LP()) + h.usdc().balanceOf(address(h.pool()))
-            + h.usdc().balanceOf(address(h.wb())) + h.usdc().balanceOf(h.PROTO());
+        uint256 totalSettlement = h.settlement().balanceOf(h.LP()) + h.settlement().balanceOf(address(h.pool()))
+            + h.settlement().balanceOf(address(h.wb())) + h.settlement().balanceOf(h.PROTO());
         for (uint256 i; i < 3; ++i) {
-            totalUsdc += h.usdc().balanceOf(h.writers(i));
+            totalSettlement += h.settlement().balanceOf(h.writers(i));
         }
         for (uint256 i; i < 2; ++i) {
-            totalUsdc += h.usdc().balanceOf(h.traders(i));
+            totalSettlement += h.settlement().balanceOf(h.traders(i));
         }
-        assertEq(totalUsdc, h.usdc().totalSupply(), "USDC conserved");
-        uint256 totalWhype = h.whype().balanceOf(address(h.pool())) + h.whype().balanceOf(address(h.wb()));
+        assertEq(totalSettlement, h.settlement().totalSupply(), "USDC conserved");
+        // owed cover is still held by the book until it settles, so it is counted where it sits
+        uint256 totalStock = h.stock().balanceOf(address(h.pool())) + h.stock().balanceOf(address(h.wb()));
         for (uint256 i; i < 3; ++i) {
-            totalWhype += h.whype().balanceOf(h.writers(i));
+            totalStock += h.stock().balanceOf(h.writers(i));
         }
-        assertEq(totalWhype, h.whype().totalSupply(), "WHYPE conserved");
+        assertEq(totalStock, h.stock().totalSupply(), "STK1 stock conserved");
     }
 
     /// The handler reaches every path.
@@ -600,6 +637,13 @@ contract WriterInvariantTest is Test {
         h.togglePause(0);
         h.hour(999);
         h.sell(1);
+        // a frozen covering token: unwrites still work, the cover stays owed, then settles
+        h.freezeCover(0);
+        h.unwrite(4, 0);
+        h.write(5, 1e18);
+        h.freezeCover(1);
+        h.settleOwed();
+        assertGe(h.freezes(), 2);
         assertGe(h.writesOk(), 8);
         assertGe(h.unwritesOk(), 3);
         assertGe(h.claimsOk(), 1);

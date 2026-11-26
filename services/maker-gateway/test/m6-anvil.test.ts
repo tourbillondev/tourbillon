@@ -6,12 +6,13 @@ import { createPublicClient, createWalletClient, getAddress, hashTypedData, http
 import { foundry } from "viem/chains";
 import { readPositions } from "../../hedger/src/book.ts";
 import { Walker } from "../../poker/src/walker.ts";
-import { fund, quoteOnce, type BotParams } from "../src/bot.ts";
+import { depositToVault, quoteOnce, type BotParams } from "../src/bot.ts";
 import { chainReader, loadM6Deployment, type M6Deployment } from "../src/chain.ts";
 import { domainFor, quoteTypes, toJson, type Quote } from "../src/quote.ts";
 import { makeHandler } from "../src/server.ts";
+import { TEARDOWN_MS, hookLimit, within } from "@tourbillon/common/hooks.ts";
 
-// On a local anvil: DeployM1 + DeployM6, markets live, an LP round. The reference bot funds its vault and posts a
+// On a local anvil: DeployM1 + DeployM6, markets live, an LP round. The reference bot deposits into its vault and posts a
 // quote it signed through anvil's unlocked account; the gateway serves it; the OpenBook fills the buyer from it. Then:
 // the hedger leaves matched raw out; a pool-carried buy can be auctioned; the risk-monitor announces the lot; a sell
 // buys the maker back. Skipped without anvil/forge.
@@ -19,7 +20,7 @@ const haveTools = Bun.which("anvil") !== null && Bun.which("forge") !== null;
 const CONTRACTS = resolve(import.meta.dir, "../../../contracts");
 const PORT = 23545 + Math.floor(Math.random() * 1000);
 const RPC = `http://127.0.0.1:${PORT}`;
-const PX: Record<string, string> = { BTC: "74000", ETH: "2000", HYPE: "40" };
+const PX: Record<string, string> = { BTC: "74000", ETH: "2000", STK1: "40" };
 
 const b32 = (m: string) => stringToHex(m, { size: 32 });
 const legT = { type: "tuple[]", components: [{ type: "bool", name: "isCall" }, { type: "uint128", name: "kWad" }, { type: "int128", name: "qty" }] } as const;
@@ -54,12 +55,11 @@ const abi = [
   { type: "function", name: "lockedOf", stateMutability: "view", inputs: [{ type: "address" }, { type: "address" }], outputs: [{ type: "uint256" }] },
   { type: "function", name: "start", stateMutability: "nonpayable", inputs: [{ type: "bytes32" }], outputs: [{ type: "uint256" }] },
   { type: "event", name: "Routed", inputs: [{ type: "address", name: "buyer", indexed: true }, { type: "uint256", name: "id", indexed: true }, { type: "uint8", name: "kind" }, { type: "uint256", name: "sigmaBps" }, { type: "uint256", name: "cost" }, { type: "address", name: "source" }] },
-  { type: "event", name: "BuybackSettled", inputs: [{ type: "uint256", name: "id", indexed: true }, { type: "uint256", name: "paidUsdc" }, { type: "uint256", name: "paidWhype" }, { type: "uint256", name: "shortfall" }] },
+  { type: "event", name: "BuybackSettled", inputs: [{ type: "uint256", name: "id", indexed: true }, { type: "uint256", name: "paidSettlement" }, { type: "uint256", name: "paidCover" }, { type: "uint256", name: "shortfall" }] },
 ] as const;
 
 let anvil: ReturnType<typeof Bun.spawn> | undefined;
 let gw: ReturnType<typeof Bun.serve> | undefined;
-let hl: ReturnType<typeof Bun.serve> | undefined;
 let tmp = "";
 let m6File = "";
 let m1: Record<string, Address>;
@@ -83,7 +83,7 @@ async function send(from: Address, address: Address, functionName: string, args:
 }
 
 async function vote(): Promise<void> {
-  for (const m of ["BTC", "ETH", "HYPE"]) {
+  for (const m of ["BTC", "ETH", "STK1"]) {
     for (const fn of ["markKey", "volKey"] as const) {
       const key = await client.readContract({ address: m1.QuorumBoard!, abi, functionName: fn, args: [b32(m)] });
       let round = 0n;
@@ -107,20 +107,9 @@ const spread = [
 ];
 const days = (n: bigint) => [{ tempo: n * 86_400n, weight: W }];
 
-beforeAll(async () => {
+beforeAll(within(import.meta.path, "setup", 240_000, async () => {
   if (!haveTools) return;
   tmp = mkdtempSync(join(tmpdir(), "m6-anvil-"));
-  hl = Bun.serve({
-    port: 0,
-    async fetch(req) {
-      const b = (await req.json()) as { type: string };
-      if (b.type === "metaAndAssetCtxs") {
-        const names = ["BTC", "ETH", "HYPE"];
-        return Response.json([{ universe: names.map((n) => ({ name: n, szDecimals: 3 })) }, names.map((n) => ({ markPx: PX[n], oraclePx: PX[n], midPx: PX[n] }))]);
-      }
-      return new Response("?", { status: 400 });
-    },
-  });
   anvil = Bun.spawn(["anvil", "--port", String(PORT), "--silent"], { stdout: "ignore", stderr: "ignore" });
   for (let i = 0; i < 50; i++) {
     try {
@@ -147,25 +136,24 @@ beforeAll(async () => {
   dep = loadM6Deployment(m6File);
   await rpc("evm_increaseTime", [3600]);
   await rpc("evm_mine");
-  for (const m of ["BTC", "ETH", "HYPE"]) await send(acc[5]!, m1.MarkRouter!, "applyRoute", [b32(m)]);
+  for (const m of ["BTC", "ETH", "STK1"]) await send(acc[5]!, m1.MarkRouter!, "applyRoute", [b32(m)]);
   await vote();
-  for (const m of ["BTC", "ETH", "HYPE"]) await send(acc[9]!, m6.PathFundingBook!, "poke", [b32(m)]);
+  for (const m of ["BTC", "ETH", "STK1"]) await send(acc[9]!, m6.PathFundingBook!, "poke", [b32(m)]);
   const LP = acc[7]!;
-  await send(LP, m6.MockUSDC!, "mint", [LP, 5_000_000n * 10n ** 6n]);
-  await send(LP, m6.MockUSDC!, "approve", [m6.MainspringPool!, 5_000_000n * 10n ** 6n]);
+  await send(LP, m6.SettlementToken!, "mint", [LP, 5_000_000n * 10n ** 6n]);
+  await send(LP, m6.SettlementToken!, "approve", [m6.MainspringPool!, 5_000_000n * 10n ** 6n]);
   await send(LP, m6.MainspringPool!, "deposit", [5_000_000n * 10n ** 6n]);
   await send(acc[9]!, m6.MainspringPool!, "startEpoch");
   await send(acc[9]!, m6.MainspringPool!, "markChunk", [100n]);
   await send(acc[9]!, m6.MainspringPool!, "settle");
   gw = Bun.serve({ port: 0, fetch: makeHandler(chainReader(client, dep)).fetch });
-}, 240_000);
+}), hookLimit(240_000));
 
-afterAll(() => {
+afterAll(within(import.meta.path, "teardown", TEARDOWN_MS, () => {
   gw?.stop(true);
-  hl?.stop(true);
   anvil?.kill();
   if (tmp) rmSync(tmp, { recursive: true, force: true });
-});
+}), hookLimit(TEARDOWN_MS));
 
 test.skipIf(!haveTools)(
   "bot quote → gateway → routed fill; hedger leaves matched raw out; an auction lot and its alarm; a sell buys the maker back",
@@ -173,8 +161,8 @@ test.skipIf(!haveTools)(
     const maker = acc[6]!;
     const T = acc[8]!;
     const mw = createWalletClient({ chain: foundry, transport: http(RPC), account: maker });
-    // the bot funds its vault and quotes 3 vol points under the board, signing through anvil (no key anywhere)
-    await fund(client, mw, dep, maker, 100_000n * 10n ** 6n);
+    // the bot deposits into its vault and quotes 3 vol points under the board, signing through anvil (no key anywhere)
+    await depositToVault(client, mw, dep, maker, 100_000n * 10n ** 6n);
     const p: BotParams = { maker, market: "BTC", sigmaOffsetBps: -300, maxUnits: 50n * W, ttlSeconds: 600, bandPct: 0.3 };
     const q = (await quoteOnce(client, mw, dep, p, gw!.url.toString(), 1n)) as Quote;
     expect(q.sigmaBps).toBe(4200n);
@@ -188,8 +176,8 @@ test.skipIf(!haveTools)(
     const best = (await res.json()) as { quotes: { quote: Record<string, string>; sig: `0x${string}` }[] };
     expect(best.quotes.length).toBe(1);
     const quotes = best.quotes.map((x) => ({ ...q, ...Object.fromEntries(Object.entries(x.quote).map(([k, v]) => [k, k === "maker" || k === "name" ? v : k === "sides" || k === "tauLo" || k === "tauHi" ? Number(v) : BigInt(v)])) }));
-    await send(T, m6.MockUSDC!, "mint", [T, 1_000_000n * 10n ** 6n]);
-    await send(T, m6.MockUSDC!, "approve", [m6.Engine!, 1_000_000n * 10n ** 6n]);
+    await send(T, m6.SettlementToken!, "mint", [T, 1_000_000n * 10n ** 6n]);
+    await send(T, m6.SettlementToken!, "approve", [m6.Engine!, 1_000_000n * 10n ** 6n]);
     const deadline = (await client.getBlock()).timestamp + 600n;
     let r = await send(T, m6.OpenBook!, "buy", [b32("BTC"), spread, days(1n), 2n * W, 10n ** 12n, deadline, quotes, best.quotes.map((x) => x.sig), []]);
     const routed = parseEventLogs({ abi, logs: r.logs, eventName: "Routed" })[0]!;
@@ -197,7 +185,7 @@ test.skipIf(!haveTools)(
     expect(routed.args.sigmaBps).toBe(4200n);
     expect(routed.args.source).toBe(maker);
     const id = routed.args.id;
-    expect(await client.readContract({ address: m6.MakerVault!, abi, functionName: "lockedOf", args: [maker, m6.MockUSDC!] })).toBe(4_000n * 10n ** 6n);
+    expect(await client.readContract({ address: m6.MakerVault!, abi, functionName: "lockedOf", args: [maker, m6.SettlementToken!] })).toBe(4_000n * 10n ** 6n);
 
     // the hedger: the matched series carries nothing for the pool
     let pos = await readPositions(client, m6.MainspringPool!, m6.PathFundingBook!, "BTC");
@@ -210,16 +198,16 @@ test.skipIf(!haveTools)(
     pos = await readPositions(client, m6.MainspringPool!, m6.PathFundingBook!, "BTC");
     expect(pos.map((x) => x.units > 0)).toEqual([false, true]);
     await send(acc[9]!, m6.RiskAuction!, "start", [b32("BTC")]);
-    const mon = Bun.spawn(["bun", "src/main.ts", "--deployment", m6File, "--rpc", RPC, "--watch", acc[1]!, "--hl-api", hl!.url.toString(), "--once"], {
+    const mon = Bun.spawn(["bun", "src/main.ts", "--deployment", m6File, "--rpc", RPC, "--watch", acc[1]!, "--once"], {
       cwd: resolve(import.meta.dir, "../../risk-monitor"),
       stdout: "pipe",
       stderr: "pipe",
     });
     const lines = (await new Response(mon.stdout).text()).trim().split("\n").filter(Boolean).map((l) => JSON.parse(l) as Record<string, unknown>);
     await mon.exited;
-    const started = lines.find((l) => l.name === "AUCTION_STARTED");
+    const started = lines.find((l) => l.name === "auction-started");
     expect(started?.market).toBe("BTC");
-    expect(lines.some((l) => l.name === "MONITOR_ERROR")).toBe(false);
+    expect(lines.some((l) => l.name === "monitor-error")).toBe(false);
 
     // the walker sees routed buys (the Engine's openFor emits ShapeBought), so matched series are walked like any other
     const walker = new Walker(client, m6.PathFundingBook!, m6.Engine!, BigInt(Number(m6.deployBlock)), m6.WriterBook!);
@@ -231,7 +219,7 @@ test.skipIf(!haveTools)(
     const bb = parseEventLogs({ abi, logs: r.logs, eventName: "BuybackSettled" })[0]!;
     expect(bb.args.shortfall).toBe(0n);
     expect(await client.readContract({ address: m6.MainspringPool!, abi, functionName: "matchedRawOf", args: [id] })).toBe(0n);
-    expect(await client.readContract({ address: m6.MakerVault!, abi, functionName: "lockedOf", args: [maker, m6.MockUSDC!] })).toBe(0n);
+    expect(await client.readContract({ address: m6.MakerVault!, abi, functionName: "lockedOf", args: [maker, m6.SettlementToken!] })).toBe(0n);
     await walker.scan();
     expect(walker.series.get(id)?.openRaw).toBe(0n);
   },

@@ -60,27 +60,28 @@ function walk(dir: string, base = dir): string[] {
 export type Prepared = { dir: string; files: string[]; submodules: { path: string; sha: string }[]; head: string; problems: string[] };
 
 /// Steps 1 and 2: the export and every check. Touches no remote.
-export function prepare(fromWorktree = false): Prepared {
-  const rules = excludes(readFileSync(join(ROOT, "publish-exclude.txt"), "utf8"));
-  const head = sh(["git", "rev-parse", "--short", "HEAD"]).trim();
+/// `root` and `ref` default to this repo at HEAD; the release pipeline passes its server repo and an update's commit.
+export function prepare(fromWorktree = false, root = ROOT, ref = "HEAD"): Prepared {
+  const rules = excludes(readFileSync(join(root, "publish-exclude.txt"), "utf8"));
+  const head = sh(["git", "rev-parse", "--short", ref], root).trim();
   const dir = mkdtempSync(join(tmpdir(), "tourbillon-publish-"));
   const tar = join(dir, "..", `${dir.split("/").pop()}.tar`);
   if (fromWorktree) {
-    const list = sh(["git", "ls-files", "--cached", "--others", "--exclude-standard"]).split("\n").filter(Boolean);
-    const subs = new Set(sh(["git", "ls-files", "-s"]).split("\n").filter((l) => l.startsWith("160000")).map((l) => l.split("\t")[1]));
+    const list = sh(["git", "ls-files", "--cached", "--others", "--exclude-standard"], root).split("\n").filter(Boolean);
+    const subs = new Set(sh(["git", "ls-files", "-s"], root).split("\n").filter((l) => l.startsWith("160000")).map((l) => l.split("\t")[1]));
     for (const f of list) {
-      if (subs.has(f) || !existsSync(join(ROOT, f)) || statSync(join(ROOT, f)).isDirectory()) continue;
+      if (subs.has(f) || !existsSync(join(root, f)) || statSync(join(root, f)).isDirectory()) continue;
       mkdirSync(dirname(join(dir, f)), { recursive: true });
-      cpSync(join(ROOT, f), join(dir, f));
+      cpSync(join(root, f), join(dir, f));
     }
   } else {
-    sh(["git", "archive", "--format=tar", "-o", tar, "HEAD"]);
-    sh(["tar", "-xf", tar, "-C", dir]);
+    sh(["git", "archive", "--format=tar", "-o", tar, ref], root);
+    sh(["tar", "-xf", tar, "-C", dir], root);
     rmSync(tar, { force: true });
   }
   for (const f of walk(dir)) if (excluded(f, rules)) rmSync(join(dir, f), { force: true });
   for (const r of rules) if (r.endsWith("/")) rmSync(join(dir, r), { recursive: true, force: true });
-  const submodules = sh(["git", "ls-tree", "-r", "HEAD"])
+  const submodules = sh(["git", "ls-tree", "-r", ref], root)
     .split("\n")
     .filter((l) => l.split(/\s+/)[1] === "commit")
     .map((l) => ({ sha: l.split(/\s+/)[2]!, path: l.split("\t")[1]! }));
@@ -91,10 +92,33 @@ export function prepare(fromWorktree = false): Prepared {
     const text = readFileSync(join(dir, f), "utf8");
     problems.push(...secretFindings(f, text));
     if ([".md", ".txt", ".json"].includes(extname(f)) && !f.endsWith("bun.lock") && !f.includes(".gas-snapshot") && !f.endsWith("foundry.lock")) {
-      for (const x of lintText(text)) problems.push(`${f}:${x.line}: "${x.match}": ${why(x.rule)}`);
+      for (const x of lintText(text, f)) problems.push(`${f}:${x.line}: "${x.match}": ${why(x.rule)}`);
     }
   }
   return { dir, files, submodules, head, problems };
+}
+
+/// Commits an export on the public repo's own history (a fresh clone of `url`; no private history, ever) and pushes
+/// its main branch, never forced. `env` carries the author and, for the release server, the access header (in the
+/// environment, never on a command line). Gives the public commit, and whether anything was pushed.
+export function pushExport(p: Prepared, o: { url: string; message: string; name: string; email: string; env?: Record<string, string> }): { pushed: boolean; commit: string } {
+  const env = { GIT_AUTHOR_NAME: o.name, GIT_AUTHOR_EMAIL: o.email, GIT_COMMITTER_NAME: o.name, GIT_COMMITTER_EMAIL: o.email, GIT_TERMINAL_PROMPT: "0", ...o.env };
+  const work = mkdtempSync(join(tmpdir(), "tourbillon-public-"));
+  try {
+    sh(["git", "clone", "--quiet", o.url, work], ROOT, env);
+    for (const f of readdirSync(work)) if (f !== ".git") rmSync(join(work, f), { recursive: true, force: true });
+    cpSync(p.dir, work, { recursive: true });
+    // the export is the whole public tree: every file in it is added even if a .gitignore rule matches it (-f), and
+    // every file the public repo had that the export lacks is staged as deleted (-A), so nothing old is left behind
+    sh(["git", "add", "-A", "-f"], work);
+    for (const s of p.submodules) sh(["git", "update-index", "--add", "--cacheinfo", `160000,${s.sha},${s.path}`], work);
+    if (!sh(["git", "status", "--porcelain"], work).trim()) return { pushed: false, commit: sh(["git", "rev-parse", "HEAD"], work).trim() };
+    sh(["git", "commit", "--quiet", "-m", o.message], work, env);
+    sh(["git", "push", "--quiet", "origin", "HEAD:main"], work, env);
+    return { pushed: true, commit: sh(["git", "rev-parse", "HEAD"], work).trim() };
+  } finally {
+    rmSync(work, { recursive: true, force: true });
+  }
 }
 
 /// Step 3 (owner only, with --push): commit the export on the public repo's own history and push.
@@ -103,23 +127,9 @@ function push(p: Prepared): void {
   const name = sh(["git", "config", "user.name"]).trim();
   const email = sh(["git", "config", "user.email"]).trim();
   if (name !== "tourbillondev") throw new Error(`the commit author must be tourbillondev (git config user.name is "${name}")`);
-  const work = mkdtempSync(join(tmpdir(), "tourbillon-public-"));
-  sh(["git", "clone", "--quiet", url, work]);
-  for (const f of readdirSync(work)) if (f !== ".git") rmSync(join(work, f), { recursive: true, force: true });
-  cpSync(p.dir, work, { recursive: true });
-  sh(["git", "add", "-A"], work);
-  for (const s of p.submodules) sh(["git", "update-index", "--add", "--cacheinfo", `160000,${s.sha},${s.path}`], work);
-  const status = sh(["git", "status", "--porcelain"], work);
-  if (!status.trim()) {
-    console.log("nothing changed since the last publish: nothing pushed");
-    return;
-  }
   const when = new Date().toISOString().slice(0, 16).replace("T", " ");
-  const env = { GIT_AUTHOR_NAME: name, GIT_AUTHOR_EMAIL: email, GIT_COMMITTER_NAME: name, GIT_COMMITTER_EMAIL: email };
-  sh(["git", "commit", "--quiet", "-m", `Publish ${when} UTC`], work, env);
-  sh(["git", "push", "--quiet", "origin", "HEAD:main"], work);
-  console.log(`pushed to ${url} (main)`);
-  rmSync(work, { recursive: true, force: true });
+  const r = pushExport(p, { url, message: `Publish ${when} UTC`, name, email });
+  console.log(r.pushed ? `pushed to ${url} (main)` : "nothing changed since the last publish: nothing pushed");
 }
 
 if (import.meta.main) {

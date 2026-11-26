@@ -76,9 +76,9 @@ contract EngineShapesTest is MainspringPoolBase {
         for (uint256 i; i < 3; ++i) {
             int256 v = EnginePricing.shapeValue(shapes[i], S, SIG, _day(), true);
             (uint256 premium, uint256 fee) = EnginePricing.shapeBuyQuote(v, units[i], shapes[i], S, 200);
-            uint256 traderBefore = usdc.balanceOf(TRADER);
-            uint256 poolBefore = usdc.balanceOf(address(pool));
-            uint256 protoBefore = usdc.balanceOf(PROTO);
+            uint256 traderBefore = settlement.balanceOf(TRADER);
+            uint256 poolBefore = settlement.balanceOf(address(pool));
+            uint256 protoBefore = settlement.balanceOf(PROTO);
             uint256 id = book.idOfShape(BTC, shapes[i], _day());
             vm.expectEmit(true, true, true, true, address(engine));
             emit Engine.ShapeBought(TRADER, id, BTC, units[i], units[i], S, SIG, v, premium, fee);
@@ -86,12 +86,12 @@ contract EngineShapesTest is MainspringPoolBase {
             assertEq(got, id);
             assertEq(cost, premium + fee);
             assertTrue(book.isShape(id));
-            assertEq(traderBefore - usdc.balanceOf(TRADER), premium + fee, "the buyer pays exactly the quote");
+            assertEq(traderBefore - settlement.balanceOf(TRADER), premium + fee, "the buyer pays exactly the quote");
             uint256 cut = fee * pool.protocolFeeBps() / 10_000;
-            assertEq(usdc.balanceOf(PROTO) - protoBefore, cut);
-            assertEq(usdc.balanceOf(address(pool)) - poolBefore, premium + fee - cut);
+            assertEq(settlement.balanceOf(PROTO) - protoBefore, cut);
+            assertEq(settlement.balanceOf(address(pool)) - poolBefore, premium + fee - cut);
             assertEq(book.balanceOf(id, TRADER), units[i], "a fresh series: norm 1, raw = units");
-            assertEq(usdc.balanceOf(address(engine)), 0);
+            assertEq(settlement.balanceOf(address(engine)), 0);
         }
         // a second buy of the same shape joins its series
         (uint256 again,) = _buyShape(_spread(), 1e18);
@@ -196,12 +196,12 @@ contract EngineShapesTest is MainspringPoolBase {
         _set(nowT + 3 minutes);
         marks.set(BTC, 72_000e18);
         int256 v = EnginePricing.shapeValue(_condor(), 72_000e18, SIG, _day(), false);
-        uint256 before = usdc.balanceOf(TRADER);
+        uint256 before = settlement.balanceOf(TRADER);
         vm.prank(TRADER);
         (uint256 paidUnits, uint256 net) = engine.sell(id, 1e18, 0, nowT);
         (uint256 gross, uint256 fee) = EnginePricing.shapeSellQuote(v, paidUnits, _condor(), 72_000e18, 200);
         assertEq(net, gross - fee, "paid exactly the quote");
-        assertEq(usdc.balanceOf(TRADER) - before, net);
+        assertEq(settlement.balanceOf(TRADER) - before, net);
         assertLe(paidUnits, 1e18);
 
         // stale mark and vol: the last recorded sample prices the sell
@@ -307,15 +307,15 @@ contract EngineShapesTest is MainspringPoolBase {
         units = bound(units, 1e15, 20e18);
         move = bound(move, 9_000, 11_000);
         StrategyMath.Leg[] memory legs = which % 3 == 0 ? _condor() : which % 3 == 1 ? _spread() : _swing();
-        uint256 start = usdc.balanceOf(TRADER);
+        uint256 start = settlement.balanceOf(TRADER);
         (uint256 id, uint256 cost) = _buyShape(legs, units);
         _set(nowT + 4 minutes);
         marks.set(BTC, S * move / 10_000);
         vm.prank(TRADER);
         (, uint256 net) = engine.sell(id, ALL, 0, nowT);
-        assertEq(usdc.balanceOf(TRADER), start - cost + net);
-        assertGe(usdc.balanceOf(TRADER) + cost, start, "never loses more than paid");
-        assertEq(usdc.balanceOf(address(engine)), 0);
+        assertEq(settlement.balanceOf(TRADER), start - cost + net);
+        assertGe(settlement.balanceOf(TRADER) + cost, start, "never loses more than paid");
+        assertEq(settlement.balanceOf(address(engine)), 0);
     }
 
     // ---------------------------------------------------------------- 5. gas

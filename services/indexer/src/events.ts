@@ -12,6 +12,7 @@ export const eventsAbi = parseAbi([
   "event Sold(address indexed seller, uint256 indexed id, bytes32 indexed market, uint256 units, uint256 raw, uint256 sWad, uint256 sigmaBps, uint256 unitValueWad, uint256 gross, uint256 fee, uint256 net, bool markFromSample, bool volFromSample)",
   "event AgentBought(bytes32 indexed mandate, address indexed owner, uint256 indexed id, uint256 raw, uint256 cost, uint8 kind)",
   "event PositionSold(address indexed owner, uint256 indexed id, uint256 raw, uint256 units, uint256 net, bytes32 mandate)",
+  "event HedgeSwapped(bytes32 indexed market, bool buy, uint256 amountIn, uint256 amountOut, uint256 markWad)",
 ]);
 
 export const marketName = (h: Hex) => hexToString(h, { size: 32 }).replace(/\0+$/, "");
@@ -32,13 +33,14 @@ export type Op =
   | { t: "vote"; key: Hex; round: bigint; signer: Address; value: bigint; ts: bigint }
   | { t: "drop"; key: Hex; round: bigint; signer: Address }
   | { t: "final"; key: Hex; round: bigint; median: bigint; published: bigint; votes: bigint; ts: bigint }
+  | { t: "hedge"; id: string; market: string; buy: boolean; token: bigint; settlementAmount: bigint; markWad: bigint; ts: bigint }
   | { t: "position"; id: bigint; owner: Address; held: "direct" | "agentRouter"; market: string | null; delta: bigint; norm: bigint | null; ts: bigint };
 
 const WAD = 10n ** 18n;
 
 /// Row operations for one decoded event (`router` is the AgentRouter: its own Engine buys and sells are the
 /// sub-accounts' and are not counted as a direct holding).
-export function opsFor(e: { eventName: string; args: Record<string, unknown> }, ts: bigint, router: Address | null): Op[] {
+export function opsFor(e: { eventName: string; args: Record<string, unknown> }, ts: bigint, router: Address | null, ref = ""): Op[] {
   const a = e.args;
   switch (e.eventName) {
     case "Recorded": {
@@ -63,6 +65,11 @@ export function opsFor(e: { eventName: string; args: Record<string, unknown> }, 
       if (router && seller === router) return [];
       const raw = a.raw as bigint;
       return [{ t: "position", id: a.id as bigint, owner: seller, held: "direct", market: marketName(a.market as Hex), delta: -raw, norm: raw > 0n ? ((a.units as bigint) * WAD) / raw : null, ts }];
+    }
+    case "HedgeSwapped": {
+      const buy = a.buy as boolean;
+      const [inA, outA] = [a.amountIn as bigint, a.amountOut as bigint];
+      return [{ t: "hedge", id: ref, market: marketName(a.market as Hex), buy, token: buy ? outA : inA, settlementAmount: buy ? inA : outA, markWad: a.markWad as bigint, ts }];
     }
     case "AgentBought":
       return [{ t: "position", id: a.id as bigint, owner: getAddress(a.owner as string), held: "agentRouter", market: null, delta: a.raw as bigint, norm: null, ts }];

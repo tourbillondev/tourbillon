@@ -5,7 +5,7 @@ import {Script, console} from "forge-std/Script.sol";
 import {PathFundingBook, IMarkRouter, IVolSource} from "../src/PathFundingBook.sol";
 import {HousePool} from "../src/HousePool.sol";
 import {Engine} from "../src/Engine.sol";
-import {MockUSDC} from "../test/mocks/MockUSDC.sol";
+import {MockSettlementToken} from "../test/mocks/MockSettlementToken.sol";
 
 /// @title DeployM2
 /// @notice M2 deployment on top of an M1 deployment: mock USDC, HousePool, PathFundingBook and Engine, wired to the
@@ -17,8 +17,8 @@ import {MockUSDC} from "../test/mocks/MockUSDC.sol";
 ///
 ///         - The book has no bootstrap recorder: samples come only through the permissionless `poke`, as in
 ///           production.
-///         - Local defaults: markets BTC / ETH / HYPE with strike steps $100 / $5 / $0.10 at a 2% spread; pool funded
-///           with 10,000,000 mock USDC; caps BTC $2,000,000, ETH $1,000,000, HYPE $500,000.
+///         - Local defaults: markets BTC / ETH / STK1 (the placeholder tokenized stock) with strike steps $100 / $5 / $1 at a 2% spread; pool seeded
+///           with 10,000,000 mock USDC; caps BTC $2,000,000, ETH $1,000,000, STK1 $500,000.
 ///
 ///         Settings (environment):
 ///           ADMIN          receives every admin role and the pauser role
@@ -37,7 +37,7 @@ contract DeployM2 is Script {
     }
 
     struct Deployed {
-        MockUSDC usdc;
+        MockSettlementToken settlement; // the settlement token (anvil only here: a mock USDG)
         HousePool pool;
         PathFundingBook book;
         Engine engine;
@@ -57,7 +57,7 @@ contract DeployM2 is Script {
         vm.stopBroadcast();
 
         _write(c, d, deployer);
-        console.log("MockUSDC        ", address(d.usdc));
+        console.log("SettlementToken ", address(d.settlement));
         console.log("HousePool       ", address(d.pool));
         console.log("PathFundingBook ", address(d.book));
         console.log("Engine          ", address(d.engine));
@@ -79,8 +79,8 @@ contract DeployM2 is Script {
         if (c.feeRecipient == address(0)) revert BadConfig("fee recipient");
         if (address(c.router).code.length == 0 || address(c.board).code.length == 0) revert BadConfig("M1 contracts");
 
-        d.usdc = new MockUSDC();
-        d.pool = new HousePool(deployer, d.usdc, c.feeRecipient);
+        d.settlement = new MockSettlementToken("Mock Global Dollar", "USDG", 6);
+        d.pool = new HousePool(deployer, d.settlement, c.feeRecipient);
         // The book stores its engine permanently: predict the engine's address (created right after the book).
         address predicted = vm.computeCreateAddress(deployer, vm.getNonce(deployer) + 1);
         d.book = new PathFundingBook(predicted, address(0), c.router, c.board);
@@ -90,12 +90,12 @@ contract DeployM2 is Script {
         d.pool.setEngine(address(d.engine));
         d.engine.setMarket("BTC", 100e18, SPREAD_BPS);
         d.engine.setMarket("ETH", 5e18, SPREAD_BPS);
-        d.engine.setMarket("HYPE", 0.1e18, SPREAD_BPS);
+        d.engine.setMarket("STK1", 1e18, SPREAD_BPS);
         d.pool.setCap("BTC", 2_000_000e6);
         d.pool.setCap("ETH", 1_000_000e6);
-        d.pool.setCap("HYPE", 500_000e6);
-        d.usdc.mint(deployer, POOL_FUNDING);
-        d.usdc.approve(address(d.pool), POOL_FUNDING);
+        d.pool.setCap("STK1", 500_000e6);
+        d.settlement.mint(deployer, POOL_FUNDING);
+        d.settlement.approve(address(d.pool), POOL_FUNDING);
         d.pool.deposit(POOL_FUNDING);
 
         bytes32 adminRole = d.engine.DEFAULT_ADMIN_ROLE();
@@ -116,11 +116,13 @@ contract DeployM2 is Script {
         vm.serializeAddress(k, "feeRecipient", c.feeRecipient);
         vm.serializeAddress(k, "MarkRouter", address(c.router));
         vm.serializeAddress(k, "QuorumBoard", address(c.board));
-        vm.serializeAddress(k, "MockUSDC", address(d.usdc));
+        vm.serializeAddress(k, "SettlementToken", address(d.settlement));
+        vm.serializeString(k, "settlementSymbol", d.settlement.symbol());
+        vm.serializeUint(k, "settlementDecimals", d.settlement.decimals());
         vm.serializeAddress(k, "HousePool", address(d.pool));
         vm.serializeAddress(k, "PathFundingBook", address(d.book));
         string[] memory markets = new string[](3);
-        (markets[0], markets[1], markets[2]) = ("BTC", "ETH", "HYPE");
+        (markets[0], markets[1], markets[2]) = ("BTC", "ETH", "STK1");
         vm.serializeString(k, "markets", markets);
         vm.serializeUint(k, "deployBlock", block.number); // where event scanning starts
         string memory json = vm.serializeAddress(k, "Engine", address(d.engine));

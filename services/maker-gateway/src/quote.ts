@@ -50,7 +50,7 @@ export function domainFor(chainId: number, quoteBook: Address) {
 }
 
 /// The quote's own terms, as the contract checks them before any order: sides, σ inside the maths bounds, bands in
-/// order, a size. Returns the reason it is refused, or null.
+/// order, a size. Gives the reason it is refused, or null.
 export function termsProblem(q: Quote): string | null {
   if (!Number.isInteger(q.sides) || q.sides < SIDE_CALLS || q.sides > SIDE_BOTH) return "sides must be 1 (calls), 2 (puts) or 3 (both)";
   if (q.sigmaBps < MIN_SIGMA_BPS || q.sigmaBps > MAX_SIGMA_BPS) return "sigma outside 5%–500%";
@@ -107,7 +107,7 @@ export function writerWorstPerUnit(buyerLegs: Leg[]): bigint | null {
   return min < 0n ? -min : 0n;
 }
 
-/// The USDC (6 decimals) a maker needs free in its vault to fill `units` of the order: worst per unit × units,
+/// The settlement token (6-decimal units) a maker needs free in its vault to fill `units` of the order: worst per unit × units,
 /// rounded up. null when unbounded.
 export function collateralUsdc(buyerLegs: Leg[], units: bigint): bigint | null {
   const w = writerWorstPerUnit(buyerLegs);

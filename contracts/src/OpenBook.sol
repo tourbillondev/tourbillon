@@ -31,7 +31,7 @@ interface IEngineOpenFor {
 /// @dev    - Law 2 (D8): a fresh mark always (the Engine reads it for every fill); the board vol only when the pool is a
 ///           candidate (a stale board leaves the pool out; makers and offers can still fill).
 ///         - Law 5: no input here sets a σ or a price. σ comes only from a valid signed quote (`VolQuoteBook.fill`
-///           returns the maker's signed σ), an on-chain offer (its posted σ), or the board.
+///           gives the maker's signed σ), an on-chain offer (its posted σ), or the board.
 ///         - Candidates (at most 4 quotes and 4 offers per call) are priced at their σ; the buyer's total cost (premium +
 ///           fee) orders them; the cheapest is tried first and, if it refuses (the pool's coverage or caps, a quote's
 ///           size, an offer's escrow), the next, in the same transaction (D5, owner: fallback in cost order). A failed
@@ -98,7 +98,7 @@ contract OpenBook is ReentrancyGuard {
     }
 
     /// @notice Buys `units` of the shape `legs` (the buyer's side, spelled the book's one way) with `movement`, paying at
-    ///         most `maxCost` USDC (approved to the Engine), from the cheapest of the pool, the given signed quotes and
+    ///         most `maxCost` settlement token (approved to the Engine), from the cheapest of the pool, the given signed quotes and
     ///         the given offers that can fill it.
     function buy(
         bytes32 market,
@@ -150,7 +150,7 @@ contract OpenBook is ReentrancyGuard {
                 engine.openFor(o.buyer, o.market, o.legs, o.movement, o.units, c.sigmaBps, o.maxCost, address(0));
         } else if (c.kind == KIND_QUOTE) {
             VolQuote.Quote calldata q = quotes[c.index];
-            // records the size used and returns the maker's signed σ (law 5)
+            // records the size used and gives the maker's signed σ (law 5)
             uint64 sigma = quoteBook.fill(q, sigs[c.index], o.market, o.legs, o.movement, uint128(o.units));
             (id, raw, cost) = engine.openFor(o.buyer, o.market, o.legs, o.movement, o.units, sigma, o.maxCost, q.maker);
             matchBook.matchMaker(q.maker, id, o.units, raw);
@@ -196,7 +196,7 @@ contract OpenBook is ReentrancyGuard {
         try marks.markWad(o.market) returns (uint256 px) {
             s = px;
         } catch {}
-        uint256 weight = o.units * s / 1e36 * 1e6; // USDC notional, whole dollars
+        uint256 weight = o.units * s / 1e36 * 1e6; // settlement token notional, whole dollars
         try volFeed.record(o.market, o.movement, c.sigmaBps, board, weight, c.kind) {} catch {}
     }
 

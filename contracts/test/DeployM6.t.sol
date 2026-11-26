@@ -46,7 +46,8 @@ contract DeployM6Test is Test {
         c1.signers = new address[](3);
         (c1.signers[0], c1.signers[1], c1.signers[2]) = (S1, S2, S3);
         c1.markets = new bytes32[](3);
-        (c1.markets[0], c1.markets[1], c1.markets[2]) = (bytes32("BTC"), bytes32("ETH"), bytes32("HYPE"));
+        (c1.markets[0], c1.markets[1], c1.markets[2]) = (bytes32("BTC"), bytes32("ETH"), bytes32("STK1"));
+        c1.calendar = m1Script.loadCalendar(m1Script.CALENDAR_FILE());
         m1 = m1Script.deploy(c1, address(m1Script));
         m6Script = new DeployM6();
         maker = vm.addr(MAKER_PK);
@@ -73,7 +74,7 @@ contract DeployM6Test is Test {
     }
 
     function _caps() internal pure returns (DeployM6.Caps6 memory caps) {
-        (caps.btc, caps.eth, caps.hype) = (5_000_000e6, 3_000_000e6, 1_000_000e6);
+        (caps.btc, caps.eth, caps.stk1) = (5_000_000e6, 3_000_000e6, 1_000_000e6);
     }
 
     function test_wiringAndRoles() public {
@@ -91,10 +92,16 @@ contract DeployM6Test is Test {
         assertEq(d6.volFeed.recorder(), ob);
         assertEq(address(d6.openBook.volFeed()), address(d6.volFeed));
         assertEq(d6.openBook.auction(), address(d6.auction));
-        assertEq(address(d6.vault.usdc()), address(d.usdc));
-        assertEq(address(d6.vault.whype()), address(d6.m4.whype));
+        assertEq(address(d6.vault.settlement()), address(d.settlement));
+        assertEq(address(d6.vault.covers()), address(d6.m4.covers));
+        assertEq(address(d6.matchBook.covers()), address(d6.m4.covers));
+        assertTrue(d6.vault.covers().isCover(IERC20(address(d6.m4.stock))), "STK1's token is a vault token");
+        // listed once with every holder checked; the admin holds the table, the deployer nothing
+        assertEq(d6.m4.covers.listedCount(), 1);
+        assertTrue(d6.m4.covers.hasRole(d6.m4.covers.DEFAULT_ADMIN_ROLE(), ADMIN));
+        assertFalse(d6.m4.covers.hasRole(d6.m4.covers.DEFAULT_ADMIN_ROLE(), address(m6Script)));
         assertEq(d.pool.openBookCap("BTC"), 5_000_000e6);
-        assertEq(d.pool.openBookCap("HYPE"), 1_000_000e6);
+        assertEq(d.pool.openBookCap("STK1"), 1_000_000e6);
         // the M4 wiring is still there
         assertEq(d.book.writer(), address(d6.m4.writerBook));
         assertEq(d.pool.writerBook(), address(d6.m4.writerBook));
@@ -132,7 +139,7 @@ contract DeployM6Test is Test {
         vm.prank(ADMIN);
         b.setFeed(eqKey, 5000, 2 hours);
         _set(nowT + 1 hours);
-        bytes32[3] memory ms = [bytes32("BTC"), "ETH", "HYPE"];
+        bytes32[3] memory ms = [bytes32("BTC"), "ETH", "STK1"];
         uint256[3] memory px = [uint256(74_000e18), 2_000e18, 70e18];
         for (uint256 i; i < 3; ++i) {
             m1.router.applyRoute(ms[i]);
@@ -140,9 +147,9 @@ contract DeployM6Test is Test {
             _voteAll(b, b.volKey(ms[i]), 0.45e18);
         }
         d.book.poke("BTC");
-        d.usdc.mint(LP, 2_000_000e6);
+        d.settlement.mint(LP, 2_000_000e6);
         vm.startPrank(LP);
-        d.usdc.approve(address(d.pool), type(uint256).max);
+        d.settlement.approve(address(d.pool), type(uint256).max);
         d.pool.deposit(2_000_000e6);
         vm.stopPrank();
         d.pool.startEpoch();
@@ -161,11 +168,11 @@ contract DeployM6Test is Test {
         DeployM3.Deployed memory d = d6.m4.m3;
         _live(d);
 
-        // a maker funds its vault and quotes BTC calls at 40% (the board is at 45%)
-        d.usdc.mint(maker, 100_000e6);
+        // a maker deposits into its vault and quotes BTC calls at 40% (the board is at 45%)
+        d.settlement.mint(maker, 100_000e6);
         vm.startPrank(maker);
-        d.usdc.approve(address(d6.vault), type(uint256).max);
-        d6.vault.deposit(IERC20(address(d.usdc)), 100_000e6);
+        d.settlement.approve(address(d6.vault), type(uint256).max);
+        d6.vault.deposit(IERC20(address(d.settlement)), 100_000e6);
         vm.stopPrank();
         VolQuote.Quote memory q = VolQuote.Quote(
             maker,
@@ -186,14 +193,14 @@ contract DeployM6Test is Test {
         bytes[] memory sigs = new bytes[](1);
         sigs[0] = abi.encodePacked(r, s_, v);
 
-        d.usdc.mint(TRADER, 100_000e6);
+        d.settlement.mint(TRADER, 100_000e6);
         vm.startPrank(TRADER);
-        d.usdc.approve(address(d.engine), type(uint256).max);
+        d.settlement.approve(address(d.engine), type(uint256).max);
         (uint256 id,, uint8 kind) = d6.openBook
             .buy("BTC", _spread(), TempoBlend.single(1 days), 2e18, type(uint256).max, nowT, qs, sigs, new uint256[](0));
         vm.stopPrank();
         assertEq(kind, d6.openBook.KIND_QUOTE(), "the maker is cheaper than the pool");
-        assertGt(d6.vault.lockedOf(maker, IERC20(address(d.usdc))), 0, "exact collateral locked");
+        assertGt(d6.vault.lockedOf(maker, IERC20(address(d.settlement))), 0, "exact collateral locked");
         assertEq(d.pool.matchedRawOf(id), d6.matchBook.matchedRaw(id), "the pool mirrors the MatchBook");
         (,,, uint256 count,) = d6.volFeed.read("BTC", 1);
         assertEq(count, 1, "the fill is in the vol feed");
@@ -221,6 +228,6 @@ contract DeployM6Test is Test {
         uint256 lotId = d6.auction.start("BTC");
         assertGt(d6.auction.lot(lotId).raw, 0);
         assertGt(d6.auction.lot(lotId).bond, 0);
-        assertEq(d.usdc.balanceOf(address(d.engine)), 0);
+        assertEq(d.settlement.balanceOf(address(d.engine)), 0);
     }
 }

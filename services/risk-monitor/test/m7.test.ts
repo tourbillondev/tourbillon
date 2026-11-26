@@ -10,7 +10,7 @@ describe("M7 alarms", () => {
   test("a queued action is named with its arguments and when it can run; executed and cancelled are announced", () => {
     const data = encodeFunctionData({ abi: governedAbi, functionName: "setCaps", args: [stringToHex("BTC", { size: 32 }), 4_000_000_000_000n, 1_000_000_000_000n] });
     const out = m7Alarms([ev("CallScheduled", { id: "0xaa", target: A(10), data, delay: 3600n }, A(1)), ev("CallExecuted", { id: "0xaa", target: A(10), data }, A(1)), ev("Cancelled", { id: "0xbb" }, A(1))], addrs);
-    expect(out.map((a) => a.name)).toEqual(["TIMELOCK_QUEUED", "TIMELOCK_EXECUTED", "TIMELOCK_CANCELLED"]);
+    expect(out.map((a) => a.name)).toEqual(["timelock-queued", "timelock-executed", "timelock-cancelled"]);
     expect(out[0]!.values.call).toBe("setCaps(BTC, 4000000000000, 1000000000000)");
     expect(out[0]!.values.contract).toBe("MainspringPool");
     expect(out[0]!.values.executableAt).toBe(4_600);
@@ -31,7 +31,7 @@ describe("M7 alarms", () => {
       ],
       addrs,
     );
-    expect(out.map((a) => a.name)).toEqual(["PAUSED", "PAUSED", "PAUSED", "UNPAUSED", "UNPAUSED", "ROLE_CHANGED"]);
+    expect(out.map((a) => a.name)).toEqual(["paused", "paused", "paused", "unpaused", "unpaused", "role-changed"]);
     expect(out[0]!.values.by).toBe("the guardian");
     expect(out[1]!.values.by).toBe("the automated risk key (E1)");
     expect(out[1]!.market).toBe("ETH");
@@ -43,5 +43,19 @@ describe("M7 alarms", () => {
   test("receipts age: since the end of the last posted hour, or since the deploy", () => {
     expect(receiptsAgeHours(true, 10, 0, 11 * 3600 + 1800)).toBe(0.5);
     expect(receiptsAgeHours(false, 0, 7_200, 7_200 + 3 * 3600)).toBe(3);
+  });
+});
+
+describe("RH8b: the hedge keeper gate", () => {
+  test("a freeze by the guardian is a pause, an unfreeze by the Safe an unpause, a new hedger key a role change", () => {
+    const gate = A(12);
+    const out = m7Alarms([ev("HedgingFrozen", { by: A(4) }, gate), ev("HedgingUnfrozen", { by: A(3) }, gate), ev("HedgerSet", { hedger: A(20) }, gate)], addrs);
+    expect(out.map((a) => a.name)).toEqual(["paused", "unpaused", "role-changed"]);
+    expect(out[0]!.values.by).toBe("the guardian");
+    expect(out[0]!.what).toContain("stock hedging");
+    expect(out[1]!.values.by).toBe("the Safe");
+    expect(out[2]!.values).toMatchObject({ role: "hedger key", account: A(20) });
+    const set = encodeFunctionData({ abi: governedAbi, functionName: "setHedger", args: [A(20)] });
+    expect(describeCall(gate, set, new Map([[gate.toLowerCase(), "HedgeKeeperGate"]]))).toEqual({ contract: "HedgeKeeperGate", call: `setHedger("${A(20)}")` });
   });
 });

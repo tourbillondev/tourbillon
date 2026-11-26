@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { concat, createPublicClient, createWalletClient, getAddress, http, parseAbi, parseEther, stringToHex, type Address, type Hex, type PublicClient } from "viem";
 import { foundry } from "viem/chains";
+import { freePort } from "./ports.ts";
 
 /// LOCAL ONLY: a fresh anvil with the M7 system (DeployM7), routes applied, marks and vols voted by the test signers
 /// and an LP round settled. For service tests and runs; anvil's unlocked accounts, no key anywhere.
@@ -49,7 +50,8 @@ const safeAbi = parseAbi([
   "function execTransaction(address to, uint256 value, bytes data, uint8 operation, uint256 safeTxGas, uint256 baseGas, uint256 gasPrice, address gasToken, address refundReceiver, bytes signatures) payable returns (bool)",
 ]);
 
-export async function startLocalM7(port: number, prices: Record<string, string> = { BTC: "74000", ETH: "2000", HYPE: "40" }): Promise<LocalM7> {
+export async function startLocalM7(wanted: number, prices: Record<string, string> = { BTC: "74000", ETH: "2000", STK1: "40" }): Promise<LocalM7> {
+  const port = freePort(wanted);
   const rpc = `http://127.0.0.1:${port}`;
   const tmp = mkdtempSync(join(tmpdir(), "local-m7-"));
   const anvil = Bun.spawn(["anvil", "--port", String(port), "--accounts", "20", "--silent"], { stdout: "ignore", stderr: "ignore" });
@@ -75,8 +77,17 @@ export async function startLocalM7(port: number, prices: Record<string, string> 
     RECEIPTS_POSTER: acc[10]!,
     PROTOCOL_RECIPIENT: acc[11]!,
     SIGNERS: acc.slice(12, 15).join(","),
+    // no market bound to the session rule here, so a service test does not depend on the time of day (the session
+    // rule has its own contract tests and the anvil calendar test)
+    STOCK_MARKETS: "none",
   };
-  const r = Bun.spawnSync(["forge", "script", "script/DeployM7.s.sol:DeployM7", "--rpc-url", rpc, "--unlocked", "--sender", acc[0]!, "--broadcast"], { cwd: CONTRACTS, env });
+  const deployStart = Date.now();
+  const r = Bun.spawnSync(["forge", "script", "script/DeployM7.s.sol:DeployM7", "--rpc-url", rpc, "--unlocked", "--sender", acc[0]!, "--broadcast"], { cwd: CONTRACTS, env, timeout: 240_000 });
+  if (r.signalCode && Date.now() - deployStart >= 239_000) {
+    anvil.kill();
+    throw new Error("local M7: forge script DeployM7 did not finish in 240 s");
+  }
+  if (r.signalCode) throw new Error(`DeployM7 stopped by ${r.signalCode}: ${r.stderr.toString().slice(0, 300)}`);
   if (r.exitCode !== 0) throw new Error(`DeployM7 failed: ${r.stderr.toString()}`);
   const m7File = join(tmp, "31337-m7.json");
   copyFileSync(join(CONTRACTS, "deployments", "31337-m7.json"), m7File);
@@ -115,8 +126,8 @@ export async function startLocalM7(port: number, prices: Record<string, string> 
   await vote(prices);
   for (const m of Object.keys(prices)) await send(acc[0]!, m7.PathFundingBook!, abi, "poke", [b32(m)]);
   const LP = acc[15]!;
-  await send(LP, m7.MockUSDC!, abi, "mint", [LP, 5_000_000n * 10n ** 6n]);
-  await send(LP, m7.MockUSDC!, abi, "approve", [m7.MainspringPool!, 5_000_000n * 10n ** 6n]);
+  await send(LP, m7.SettlementToken!, abi, "mint", [LP, 5_000_000n * 10n ** 6n]);
+  await send(LP, m7.SettlementToken!, abi, "approve", [m7.MainspringPool!, 5_000_000n * 10n ** 6n]);
   await send(LP, m7.MainspringPool!, abi, "deposit", [5_000_000n * 10n ** 6n]);
   await send(acc[0]!, m7.MainspringPool!, abi, "startEpoch");
   await send(acc[0]!, m7.MainspringPool!, abi, "markChunk", [100n]);

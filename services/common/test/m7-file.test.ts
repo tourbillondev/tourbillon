@@ -10,13 +10,14 @@ import { loadM7 } from "../../mcp/src/tools.ts";
 
 // M7 step 10: the M7 deployment file (DeployM7) is a superset of the M6 file, so every service reads it unchanged.
 const keys = [
-  "MarkRouter", "QuorumBoard", "QuorumMarkSource", "MockUSDC", "MockWHYPE", "MainspringPool", "PathFundingBook", "WriterBook", "MakerVault", "MatchBook",
-  "VolQuoteBook", "OpenBook", "VolFeed", "RiskAuction", "Engine", "Safe", "Guardian", "Timelock", "SafeSingleton", "SafeProxyFactory", "ReceiptRoots", "AgentRouter",
+  "MarkRouter", "QuorumBoard", "QuorumMarkSource", "SettlementToken", "MockStockToken", "MainspringPool", "PathFundingBook", "WriterBook", "MakerVault", "MatchBook",
+  "VolQuoteBook", "OpenBook", "VolFeed", "RiskAuction", "Engine", "Safe", "Guardian", "Timelock", "SafeSingleton", "SafeProxyFactory", "ReceiptRoots", "AgentRouter", "CoveringAssets", "UsdcAdapter", "SessionCalendar",
   "deployer", "admin", "riskPauser", "receiptsPoster", "protocolRecipient",
 ];
 
 test("every service reads an M7 deployment file", () => {
-  const d: Record<string, unknown> = { chainId: 31337, markets: ["BTC", "ETH", "HYPE"], deployBlock: 7, timelockDelay: 3600 };
+  // RH7b: the deploy writes the settlement token's symbol and decimals as the token gives them (owner D1: USDG)
+  const d: Record<string, unknown> = { chainId: 31337, markets: ["BTC", "ETH", "STK1"], deployBlock: 7, timelockDelay: 3600, settlementSymbol: "USDG", settlementDecimals: 6 };
   keys.forEach((k, i) => (d[k] = getAddress(`0x${(0x1000 + i).toString(16).padStart(40, "0")}`)));
   const json = JSON.stringify(d);
   const m2 = parseM2Deployment(json); // poker: walker, keeper
@@ -27,6 +28,7 @@ test("every service reads an M7 deployment file", () => {
   const tmp = mkdtempSync(join(tmpdir(), "m7-file-"));
   writeFileSync(join(tmp, "m7.json"), json);
   expect(loadM7(join(tmp, "m7.json")).agents).toBe(d.AgentRouter as `0x${string}`); // mcp
+  expect(loadM7(join(tmp, "m7.json")).settlement).toMatchObject({ symbol: "USDG", decimals: 6 }); // read from the file, never assumed
   rmSync(tmp, { recursive: true, force: true });
   // an M6 file is refused by the M7-only services, with a clear reason
   const m6only = { ...d };

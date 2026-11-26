@@ -10,7 +10,8 @@ import {IMarkSource} from "./IMarkSource.sol";
 /// @dev Every route change, including a market's first route, waits out `delay` after it is
 ///      queued. Queuing and cancelling sit behind DEFAULT_ADMIN_ROLE (the timelock); once the
 ///      delay has passed anyone may apply the queued route.
-///      T0: primary = quorum, no secondary. T2: primary = precompile, secondary = quorum (50 bps).
+///      T0: primary = quorum (two sources inside each signer), no secondary. T2: primary = native
+///      (Robinhood Chain's first-party mark, NativeMarkSource), secondary = quorum (50 bps).
 contract MarkRouter is AccessControl {
     uint256 internal constant BPS = 10_000;
 
@@ -77,7 +78,7 @@ contract MarkRouter is AccessControl {
         return (p.route, p.eta);
     }
 
-    /// @dev A source that reverts, returns zero, or is older than maxAge counts as unavailable.
+    /// @dev A source that reverts, gives zero, or is older than maxAge counts as unavailable.
     function _read(IMarkSource src, bytes32 market, uint256 maxAge) internal view returns (bool, uint256) {
         try src.markWad(market) returns (uint256 px, uint256 updatedAt) {
             if (px == 0 || updatedAt > block.timestamp || block.timestamp - updatedAt > maxAge) return (false, 0);

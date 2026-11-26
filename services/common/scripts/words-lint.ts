@@ -1,5 +1,5 @@
 import { readdirSync, readFileSync, statSync } from "node:fs";
-import { extname, join } from "node:path";
+import { extname, join, relative, resolve, sep } from "node:path";
 import { lintText, why } from "../src/words.ts";
 
 /// Words lint (launch core): checks published texts against the spec's wording rules (Overview section 9). The release
@@ -23,6 +23,7 @@ function jsonText(v: unknown): string {
   return "";
 }
 
+const REPO = resolve(import.meta.dir, "../../.."); // repo paths, for file-scoped allow entries
 const paths = process.argv.slice(2);
 if (paths.length === 0) {
   process.stderr.write("usage: words-lint <file or directory> [...]\n");
@@ -39,7 +40,7 @@ for (const f of paths.flatMap(files)) {
       text = raw;
     }
   }
-  for (const x of lintText(text)) {
+  for (const x of lintText(text, relative(REPO, resolve(f)).split(sep).join("/"))) {
     n++;
     process.stdout.write(`${f}:${x.line}: "${x.match}": ${why(x.rule)}\n  ${x.text}\n`);
   }

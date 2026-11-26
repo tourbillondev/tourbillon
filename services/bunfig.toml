@@ -1,0 +1,4 @@
+[install]
+# Never install a package version published less than 3 days ago (in seconds).
+# Most poisoned releases are found and pulled within that window.
+minimumReleaseAge = 259200

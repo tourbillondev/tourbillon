@@ -1,0 +1,14 @@
+/* Keep the approved section geometry; only the artwork crosses its boundary. */
+.landing-flow{overflow-x:clip}
+.landing-flow .hero{overflow:visible;z-index:2}
+.landing-flow .hero-media{mask-image:none;-webkit-mask-image:none;overflow:visible}
+.social-soon{display:flex;align-items:center;gap:12px}
+.social-soon-item{display:flex;align-items:center;gap:10px;padding:10px 14px;border:1px solid #a4b9ef24;border-radius:10px;background:#a9bfff08;min-width:112px}
+.social-soon-item img{width:20px;height:20px;object-fit:contain}
+.social-soon-item:first-child img{filter:invert(1);width:17px;height:17px}
+.social-soon-item>span{font-size:11px;color:#e3e7ef}.social-soon-item small{display:block;color:#8e9bb3;font-size:9px;margin-top:3px}
+.site-footer .footer-community{display:flex;justify-content:space-between;align-items:center;gap:24px;margin-top:40px;padding-top:28px;border-top:1px solid #c7d4f11a}
+.footer-community>span{font-size:10px;letter-spacing:1.5px;color:#8e9bb3}.site-footer .footer-bottom{margin-top:28px}
+.tb-footer .social-soon-item{padding:7px 10px;min-width:100px}.tb-footer .social-soon{gap:8px}
+@media(max-width:760px){.footer-community{flex-wrap:wrap}.tb-footer .social-soon{display:flex}.tb-footer{flex-wrap:wrap}}
+.hero-note .note-symbol>svg{display:block;width:29px;height:29px;flex-shrink:0}

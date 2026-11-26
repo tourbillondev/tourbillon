@@ -16,7 +16,7 @@ type Request = { jsonrpc: "2.0"; id?: number | string | null; method: string; pa
 
 const toJson = (v: unknown) => JSON.parse(JSON.stringify(v, (_k, x) => (typeof x === "bigint" ? x.toString() : x))) as Json;
 
-/// Handles one message; returns the response line, or null for a notification.
+/// Handles one message; gives the response line, or null for a notification.
 export async function handle(tools: Tool[], line: string, info = { name: "tourbillon-mcp", version: "0.1.0" }): Promise<string | null> {
   let req: Request;
   try {

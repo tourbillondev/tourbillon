@@ -100,6 +100,8 @@ contract AgentHandler is Test {
 
 /// forge-config: default.invariant.runs = 32
 /// forge-config: default.invariant.depth = 40
+/// forge-config: deep.invariant.runs = 1000
+/// forge-config: deep.invariant.depth = 100
 /// M7 step 8: AgentRouter invariants: no budget or cap is ever exceeded; the mandates' raw adds up to the owner's,
 /// the owner's to the router's book balance; each mandate's delta and vega are exactly the sum over its series.
 contract AgentInvariantTest is AgentRouterBase {
@@ -154,7 +156,7 @@ contract AgentInvariantTest is AgentRouterBase {
                 assertEq(ar.mandateDelta(h0, id) + ar.mandateDelta(h1, id), 0, "nothing held, nothing charged");
             }
         }
-        assertEq(usdc.balanceOf(address(ar)), 0, "the router keeps no USDC");
+        assertEq(settlement.balanceOf(address(ar)), 0, "the router keeps no USDC");
     }
 
     function test_handlerReachesEveryPath() public {

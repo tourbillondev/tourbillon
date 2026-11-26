@@ -15,14 +15,16 @@ import {MakerVault} from "../src/MakerVault.sol";
 import {MatchBook} from "../src/MatchBook.sol";
 import {OpenBook, IEngineOpenFor} from "../src/OpenBook.sol";
 import {IEngineConfig} from "../src/WriterBook.sol";
-import {MockWHYPE} from "./mocks/MockWHYPE.sol";
+import {MockStockToken} from "./mocks/MockStockToken.sol";
+import {CoverFixture} from "./mocks/CoverFixture.sol";
+import {CoveringAssets} from "../src/CoveringAssets.sol";
 import {VolFeed} from "../src/VolFeed.sol";
 import {MockMarks, MockVols} from "./Engine.t.sol";
 
 /// M6 step 6: Engine.openFor and the OpenBook best-of-three router, on the full stack.
 contract OpenBookTest is MainspringPoolBase {
     uint256 constant S = 70_000e18;
-    MockWHYPE whype;
+    MockStockToken stock;
     MakerVault vault;
     MatchBook mb;
     VolQuoteBook qb;
@@ -37,8 +39,8 @@ contract OpenBookTest is MainspringPoolBase {
     function setUp() public override {
         super.setUp();
         _seed(5_000_000e6);
-        whype = new MockWHYPE();
-        vault = new MakerVault(address(this), IERC20(address(usdc)), IERC20(address(whype)));
+        stock = new MockStockToken("Mock Stock One", "STK1", 18);
+        vault = new MakerVault(address(this), IERC20(address(settlement)), CoverFixture.listed(address(this), address(marks), IERC20(address(stock))));
         mb = new MatchBook(address(this), book, IEngineConfig(address(engine)), vault, marks, vols);
         address obAt = vm.computeCreateAddress(address(this), vm.getNonce(address(this)) + 1);
         qb = new VolQuoteBook(obAt);
@@ -57,15 +59,15 @@ contract OpenBookTest is MainspringPoolBase {
         (maker2, maker2Pk) = makeAddrAndKey("maker2");
         address[2] memory ms = [maker, maker2];
         for (uint256 i; i < 2; ++i) {
-            usdc.mint(ms[i], 50_000_000e6);
+            settlement.mint(ms[i], 50_000_000e6);
             vm.startPrank(ms[i]);
-            usdc.approve(address(vault), type(uint256).max);
-            vault.deposit(IERC20(address(usdc)), 10_000_000e6);
+            settlement.approve(address(vault), type(uint256).max);
+            vault.deposit(IERC20(address(settlement)), 10_000_000e6);
             vm.stopPrank();
         }
-        usdc.mint(WRITER, 10_000_000e6);
+        settlement.mint(WRITER, 10_000_000e6);
         vm.prank(WRITER);
-        usdc.approve(address(mb), type(uint256).max);
+        settlement.approve(address(mb), type(uint256).max);
     }
 
     // ---------------------------------------------------------------- helpers
@@ -162,15 +164,15 @@ contract OpenBookTest is MainspringPoolBase {
         (VolQuote.Quote[] memory qs, bytes[] memory ss) = _one(q, _sign(q, makerPk));
         (,, uint256[] memory none) = _none();
         (uint256 premium, uint256 fee) = _cost(4000, 2e18);
-        uint256 traderBefore = usdc.balanceOf(TRADER);
-        uint256 makerBefore = usdc.balanceOf(maker);
-        uint256 protoBefore = usdc.balanceOf(PROTO);
+        uint256 traderBefore = settlement.balanceOf(TRADER);
+        uint256 makerBefore = settlement.balanceOf(maker);
+        uint256 protoBefore = settlement.balanceOf(PROTO);
         (uint256 id, uint256 cost, uint8 kind) = _buy(qs, ss, none, 2e18, type(uint256).max);
         assertEq(kind, ob.KIND_QUOTE());
         assertEq(cost, premium + fee);
-        assertEq(traderBefore - usdc.balanceOf(TRADER), cost, "the buyer pays the maker's price + fee");
-        assertEq(usdc.balanceOf(maker) - makerBefore, _credit(4000, 2e18), "the maker gets its value");
-        assertEq(usdc.balanceOf(PROTO) - protoBefore, fee * 1000 / 10_000);
+        assertEq(traderBefore - settlement.balanceOf(TRADER), cost, "the buyer pays the maker's price + fee");
+        assertEq(settlement.balanceOf(maker) - makerBefore, _credit(4000, 2e18), "the maker gets its value");
+        assertEq(settlement.balanceOf(PROTO) - protoBefore, fee * 1000 / 10_000);
         assertEq(qb.filled(maker, 1), 2e18, "the quote's size is recorded");
         assertEq(pool.matchedRawOf(id), 2e18);
         assertEq(mb.matchedRaw(id), 2e18);
@@ -199,9 +201,9 @@ contract OpenBookTest is MainspringPoolBase {
     function test_fallsBackInCostOrder() public {
         (,, uint256[] memory none) = _none();
         // the cheapest maker cannot lock its collateral (its vault is nearly empty): the next maker fills
-        uint256 free = vault.freeOf(maker, IERC20(address(usdc)));
+        uint256 free = vault.freeOf(maker, IERC20(address(settlement)));
         vm.prank(maker);
-        vault.withdraw(IERC20(address(usdc)), free - 100e6);
+        vault.withdraw(IERC20(address(settlement)), free - 100e6);
         VolQuote.Quote[] memory qs = new VolQuote.Quote[](2);
         bytes[] memory ss = new bytes[](2);
         qs[0] = _quote(maker, 3500, 1, 100e18);
@@ -227,7 +229,7 @@ contract OpenBookTest is MainspringPoolBase {
         uint8 kind;
         // the pool is cheapest (board at 30%) but over its coverage for this size: a maker fills
         vm.prank(maker2);
-        vault.deposit(IERC20(address(usdc)), 30_000_000e6); // 5,000 spreads need 25,000,000 locked
+        vault.deposit(IERC20(address(settlement)), 30_000_000e6); // 5,000 spreads need 25,000,000 locked
         vols.set(BTC, 3000);
         book.record(BTC, S, 3000);
         VolQuote.Quote memory q = _quote(maker2, 4000, 2, 10_000e18);
@@ -391,12 +393,12 @@ contract OpenBookTest is MainspringPoolBase {
         assertEq(raw, pool.matchedRawOf(id), "the MatchBook and the pool agree");
         assertEq(lockedU, 15_000e6, "exact collateral: 3 x the 5,000 width");
         assertEq(pool.stressedLiability(), stressed0, "the pool is flat");
-        uint256 makerLockedBefore = vault.lockedOf(maker, IERC20(address(usdc)));
+        uint256 makerLockedBefore = vault.lockedOf(maker, IERC20(address(settlement)));
         vm.prank(TRADER);
         engine.sell(id, ALL, 0, nowT);
         assertEq(mb.matchedRaw(id), 0, "bought back");
         assertEq(pool.matchedRawOf(id), 0);
-        assertLt(vault.lockedOf(maker, IERC20(address(usdc))), makerLockedBefore);
+        assertLt(vault.lockedOf(maker, IERC20(address(settlement))), makerLockedBefore);
     }
 
     // ---------------------------------------------------------------- 7. law 1 fuzz with routed fills
@@ -413,17 +415,17 @@ contract OpenBookTest is MainspringPoolBase {
             offers = new uint256[](1);
             offers[0] = _post(3000, 100e18);
         }
-        uint256 start = usdc.balanceOf(TRADER);
+        uint256 start = settlement.balanceOf(TRADER);
         (uint256 id, uint256 cost, uint8 kind) = _buy(qs, ss, offers, units, type(uint256).max);
         assertEq(kind, k + 1);
         _set(nowT + 3 minutes);
         marks.set(BTC, S * move / 10_000);
         vm.prank(TRADER);
         (, uint256 net) = engine.sell(id, ALL, 0, nowT);
-        assertEq(usdc.balanceOf(TRADER), start - cost + net);
-        assertGe(usdc.balanceOf(TRADER) + cost, start, "never loses more than paid");
-        assertEq(usdc.balanceOf(address(engine)), 0);
-        assertEq(usdc.balanceOf(address(ob)), 0, "the router holds nothing");
+        assertEq(settlement.balanceOf(TRADER), start - cost + net);
+        assertGe(settlement.balanceOf(TRADER) + cost, start, "never loses more than paid");
+        assertEq(settlement.balanceOf(address(engine)), 0);
+        assertEq(settlement.balanceOf(address(ob)), 0, "the router holds nothing");
     }
 
     // ---------------------------------------------------------------- 8. Engine setup; gas

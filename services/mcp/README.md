@@ -6,7 +6,7 @@ holds a key: read tools answer from the chain (and the maker-gateway for quotes)
 transactions and EIP-712 mandates for the owner or agent to sign with their own wallet.
 
 Tools: `chains_by_tempo` (indicative values at the board's vol; the router prices every fill), `vol_feed`, `shapes`
-(families, buyer-safety of legs), `quotes`, `positions` (direct and AgentRouter sub-account), `mandates` (hash and
+(families, the buyer limits of each leg), `quotes`, `positions` (direct and AgentRouter sub-account), `mandates` (hash and
 usage), `build_mandate`, `build_buy` (OpenBook, or AgentRouter under a mandate), `build_sell` (direct, owner, agent).
 
     bun src/main.ts --deployment ../../contracts/deployments/31337-m7.json [--rpc URL] [--gateway http://127.0.0.1:8547]

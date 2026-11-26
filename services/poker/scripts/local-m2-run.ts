@@ -18,7 +18,7 @@ import { bookAbi, engineAbi as engineEvents } from "../src/abi.ts";
 import { windowsDueIn, windowStart } from "../src/poke.ts";
 
 /// M2 step 9: the whole local system for about 45 minutes of real time. anvil (1 s blocks), DeployM1 + DeployM2,
-/// three signers on live Hyperliquid data, a primary and a backup poker, three traders trading at random every
+/// three signers on live market data (their default public feeds), a primary and a backup poker, three traders trading at random every
 /// minute, and a sleeper holder the walker must keep walkable. No key: anvil's unlocked accounts. Raw logs go to a
 /// temporary folder outside the repo.
 ///
@@ -36,8 +36,8 @@ const SERVICES = resolve(import.meta.dir, "../..");
 const CONTRACTS = resolve(SERVICES, "../contracts");
 const PORT = 29545;
 const RPC = `http://127.0.0.1:${PORT}`;
-const MARKETS = ["BTC", "ETH", "HYPE"];
-const STEP: Record<string, bigint> = { BTC: parseEther("100"), ETH: parseEther("5"), HYPE: parseEther("0.1") };
+const MARKETS = ["BTC", "ETH", "STK1"];
+const STEP: Record<string, bigint> = { BTC: parseEther("100"), ETH: parseEther("5"), STK1: parseEther("0.1") };
 const out = mkdtempSync(join(tmpdir(), "tourbillon-m2-run-"));
 const say = (msg: string) => {
   const line = `${new Date().toISOString()} ${msg}`;
@@ -158,10 +158,10 @@ for (const m of MARKETS) {
 }
 const START_USDC = 1_000_000n * 10n ** 6n;
 for (const t of [...traders, SLEEPER]) {
-  await client.waitForTransactionReceipt({ hash: await wallet(t).writeContract({ address: m2.MockUSDC!, abi: viewAbi, functionName: "mint", args: [t, START_USDC] }) });
-  await client.waitForTransactionReceipt({ hash: await wallet(t).writeContract({ address: m2.MockUSDC!, abi: viewAbi, functionName: "approve", args: [m2.Engine!, START_USDC] }) });
+  await client.waitForTransactionReceipt({ hash: await wallet(t).writeContract({ address: m2.SettlementToken!, abi: viewAbi, functionName: "mint", args: [t, START_USDC] }) });
+  await client.waitForTransactionReceipt({ hash: await wallet(t).writeContract({ address: m2.SettlementToken!, abi: viewAbi, functionName: "approve", args: [m2.Engine!, START_USDC] }) });
 }
-say(`deployed; routes applied; traders funded. board ${m1.QuorumBoard} book ${m2.PathFundingBook} engine ${m2.Engine}`);
+say(`deployed; routes applied; traders given USDC. board ${m1.QuorumBoard} book ${m2.PathFundingBook} engine ${m2.Engine}`);
 
 // ---------------------------------------------------------------- services
 
@@ -482,11 +482,11 @@ check(maxBehind <= 16, `walker: no held series more than 16 intervals behind at 
 check(walks.length > 0, `walker: the sleeper's (or another held) series was walked (${walks.length} walks)`);
 
 // 6: accounting
-const usdcBal = (a: Address) => client.readContract({ address: m2.MockUSDC!, abi: viewAbi, functionName: "balanceOf", args: [a] });
+const usdcBal = (a: Address) => client.readContract({ address: m2.SettlementToken!, abi: viewAbi, functionName: "balanceOf", args: [a] });
 const engineUsdc = await usdcBal(m2.Engine!);
 let sum = (await usdcBal(m2.HousePool!)) + (await usdcBal(ADMIN)) + (await usdcBal(acc[0]!));
 for (const t of [...traders, SLEEPER]) sum += await usdcBal(t);
-const supply = await client.readContract({ address: m2.MockUSDC!, abi: viewAbi, functionName: "totalSupply" });
+const supply = await client.readContract({ address: m2.SettlementToken!, abi: viewAbi, functionName: "totalSupply" });
 let rawMismatch = 0;
 for (const s of held.values()) {
   let h = 0n;
@@ -519,7 +519,7 @@ report.push(
   `gas medians: buy ${median(buyGas)}, sell ${median(sellGas)}, poke ${pokeMed}, walk ${median(walks.map((w) => w.gas))}`,
 );
 const pokesPerDay = 288n * BigInt(MARKETS.length);
-report.push(`poker cost: ${pokesPerDay} pokes a day × ${pokeMed} gas × 0.1 gwei ≈ ${Number(pokesPerDay * pokeMed) * 1e-10} test HYPE a day (plus walks; execution only)`);
+report.push(`poker cost: ${pokesPerDay} pokes a day × ${pokeMed} gas × 0.1 gwei ≈ ${Number(pokesPerDay * pokeMed) * 1e-10} of the gas token a day at 0.1 gwei (plus walks; execution only)`);
 
 const text = [...report, "", ...crit].join("\n") + "\n";
 writeFileSync(join(out, "report.txt"), text);

@@ -2,10 +2,10 @@ import { readFileSync } from "node:fs";
 import { formatEther, getAddress, parseEther, type Address } from "viem";
 import { LOW_BALANCE } from "@tourbillon/common/gas.ts";
 
-/// Key watcher (launch core): every service key's gas balance (HYPE on Elysium), against a minimum. A key that runs dry
+/// Key watcher (launch core): every service key's gas balance (the chain's gas token), against a minimum. A key that runs dry
 /// stops its service (signers stop voting, the poker stops sampling, the receipts poster stops posting, E1 cannot pause).
 /// The list holds addresses only, never keys:
-///   [{ "name": "signer-1", "address": "0x…", "min": "0.2" }, …]     (min in HYPE; default 0.2, the M1 gas policy)
+///   [{ "name": "signer-1", "address": "0x…", "min": "0.2" }, …]     (min in the gas token; default 0.2, the M1 gas policy)
 
 export type WatchedKey = { name: string; address: Address; min: bigint };
 
@@ -24,7 +24,7 @@ export function parseKeys(json: string): WatchedKey[] {
 
 export const loadKeys = (path: string) => parseKeys(readFileSync(path, "utf8"));
 
-/// The keys below their minimum, with their balances in HYPE.
+/// The keys below their minimum, with their balances in the gas token.
 export function lowKeys(keys: WatchedKey[], balances: Map<Address, bigint>): { name: string; address: Address; balance: number; min: number }[] {
   return keys
     .filter((k) => (balances.get(k.address) ?? 0n) < k.min)

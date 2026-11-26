@@ -5,12 +5,12 @@
   "license": "MIT",
   "type": "module",
   "scripts": {
-    "start": "bun src/main.ts",
+    "start": "bun src/cex.ts",
     "test": "bun test",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "start:onchain": "bun src/onchain.ts"
   },
   "dependencies": {
-    "@msgpack/msgpack": "3.1.3",
     "@tourbillon/common": "workspace:*",
     "viem": "2.57.12"
   }

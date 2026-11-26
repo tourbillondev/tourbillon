@@ -21,7 +21,7 @@ export function unitDelta(p: Position, s: number, sigmaBps: number): number {
 }
 
 /// The pool's net delta on a market, in coins: −Σ units × unit delta (it is short what holders own and long what it
-/// holds from writers), plus `heldCoins` the pool holds outright (its WHYPE on HYPE, M4 decision A).
+/// holds from writers), plus `heldCoins` the pool holds outright (its covering stock on a stock market, RH5).
 export function poolNetDelta(positions: Position[], s: number, sigmaBps: number, heldCoins = 0): number {
   let sum = 0;
   for (const p of positions) {

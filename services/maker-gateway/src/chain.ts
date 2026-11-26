@@ -24,7 +24,7 @@ export function parseM6Deployment(json: string): M6Deployment {
   };
   return {
     chainId: Number(d.chainId),
-    usdc: need("MockUSDC"),
+    usdc: need("SettlementToken"),
     router: need("MarkRouter"),
     board: need("QuorumBoard"),
     vault: need("MakerVault"),

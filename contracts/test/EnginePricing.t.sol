@@ -142,7 +142,7 @@ contract EnginePricingTest is Test {
         assertLe(sellFee, gross, "fee capped at the gross");
     }
 
-    /// Buying and selling straight back at the same S and σ never returns more than was paid.
+    /// Buying and selling straight back at the same S and σ never pays back more than was paid.
     function testFuzz_roundTripNeverReturnsMoreThanPaid(uint256 v, uint256 units, uint256 s, uint256 spread)
         public
         view
@@ -175,7 +175,7 @@ contract EnginePricingTest is Test {
         h.checkStrike(0, s, step);
         vm.expectRevert(EnginePricing.ZeroStep.selector);
         h.checkStrike(50_000e18, s, 0);
-        // HYPE step $0.10
+        // STK1 step $0.10
         h.checkStrike(73.4e18, 73.258e18, 0.1e18);
         vm.expectRevert(abi.encodeWithSelector(EnginePricing.StrikeOffStep.selector, 73.45e18, 0.1e18));
         h.checkStrike(73.45e18, 73.258e18, 0.1e18);

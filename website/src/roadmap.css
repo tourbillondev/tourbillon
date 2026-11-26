@@ -1,0 +1,60 @@
+/* Scoped rollout treatment; the continuous page atmosphere remains underneath. */
+.rollout{color:#202838;scroll-margin-top:20px}
+.rollout-heading{display:grid;grid-template-columns:1.35fr 1fr;align-items:end;gap:70px}
+.rollout-heading h2{max-width:710px}
+.rollout-context{max-width:390px;justify-self:end;padding-bottom:4px}
+.rollout-status{display:flex;align-items:center;gap:8px;font-size:10px;font-weight:600;letter-spacing:1.2px;color:#536283}
+.rollout-status i{width:7px;height:7px;border:1px solid #7088c2;border-radius:50%;box-shadow:0 0 0 4px #5e7bd90b}
+.rollout-context p{font-size:15px;line-height:1.65;color:#515d73;margin:17px 0 12px}
+.rollout-context small{display:block;font-size:12px;line-height:1.6;color:#6a758a}
+.rollout-tabs{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:9px;margin:42px 0 18px}
+.rollout-tabs button{position:relative;min-width:0;min-height:123px;padding:18px 19px 20px;text-align:left;border:1px solid #b7c5df5c;border-radius:13px;color:#536078;background:#ffffff40;cursor:pointer;transition:background .22s ease-out,border-color .22s ease-out,box-shadow .3s ease-out,transform .25s var(--ease-out)}
+.rollout-step{display:flex;align-items:center;gap:10px;margin-bottom:19px}
+.rollout-step b{font-size:12px;letter-spacing:.6px;font-weight:600;color:#465d8d}
+.rollout-step>span{font-size:8px;letter-spacing:1px;color:#65738b}
+.rollout-step svg{margin-left:auto;opacity:.45;transition:transform .3s var(--ease-out),opacity .2s}
+.rollout-tabs strong{display:block;font-size:16px;font-weight:500;letter-spacing:-.3px}
+.rollout-tabs small{display:block;font-size:11px;margin-top:5px;color:#5c6d86;line-height:1.5}
+.rollout-tabs button[aria-selected=true]{background:linear-gradient(145deg,#ffffffec,#e9efffd9);border-color:#8ea3deaa;color:#243964;box-shadow:inset 0 1px #fff,0 8px 24px #3858970b}
+.rollout-tabs button[aria-selected=true]:after{content:'';position:absolute;left:19px;right:19px;bottom:-1px;height:2px;background:linear-gradient(90deg,#4664f7,#afbbfc);border-radius:2px}
+.rollout-tabs button[aria-selected=true] .rollout-step svg{opacity:1}
+.rollout button:focus-visible,.rollout a:focus-visible,.rollout-panel:focus-visible{outline:2px solid #4664f7;outline-offset:4px}
+.rollout-tabs button:active{transform:scale(.985);transition-duration:.08s}
+.rollout-panel{border:1px solid #bdcbe270;border-radius:20px;background:linear-gradient(130deg,#ffffffbb,#f7faff8c);box-shadow:inset 0 1px #fff,0 18px 50px #2c497508;backdrop-filter:blur(18px);overflow:hidden}
+.rollout-panel-content{display:grid;grid-template-columns:minmax(0,1.35fr) minmax(0,1fr);animation:rollout-reveal .42s var(--ease-out) both}
+.rollout-scope{padding:37px 40px 32px}
+.rollout-wave-label{display:flex;align-items:center;gap:12px;font-size:9px;letter-spacing:1.4px;color:#5f708e;margin-bottom:22px}
+.rollout-wave-label>span:first-child{font-size:12px;letter-spacing:.5px;padding:7px 9px;border:1px solid #c3cee9;border-radius:6px;background:#edf1fb;color:#526bb6}
+.rollout-scope h3{font:34px/1.12 var(--display);letter-spacing:-.3px;color:#263349}
+.rollout-intro{font-size:14px;line-height:1.7;color:#5a687d;margin:16px 0 23px;max-width:600px}
+.rollout-scope dl{margin:0}
+.rollout-scope dl>div{display:grid;grid-template-columns:125px 1fr;gap:18px;padding:16px 0;border-top:1px solid #a9bbd52d}
+.rollout-scope dt{font-size:12px;line-height:1.6;font-weight:600;color:#3b4f6e}
+.rollout-scope dd{font-size:12px;line-height:1.7;color:#65738a;margin:0}
+.rollout-gates{position:relative;margin:12px 12px 12px 0;padding:27px 29px;min-height:390px;border-radius:13px;border:1px solid #a9bce13b;background:linear-gradient(145deg,#e5ecfaac,#e7ebf875 65%,#d6e0fa85);box-shadow:inset 0 1px #ffffffa6;display:flex;flex-direction:column}
+.rollout-gate-label{display:flex;gap:10px;align-items:center;color:#5f75ac;font-size:9px;letter-spacing:1.5px;margin-bottom:16px}
+.rollout-gates h4{font-size:22px;font-weight:500;letter-spacing:-.7px;color:#2b426a;margin:0}
+.rollout-gate-caption{font-size:11px;line-height:1.6;color:#5c6d88;margin:8px 0 4px}
+.rollout-gates ol{padding:0;margin:6px 0 26px;list-style:none}
+.rollout-gates li{display:flex;gap:13px;padding:18px 0;border-bottom:1px solid #a0b3da2b}
+.rollout-check-number{display:grid;place-items:center;width:25px;height:25px;flex-shrink:0;border-radius:50%;border:1px solid #a6b7db77;background:#ffffff50;color:#5c729b;font-size:9px;font-variant-numeric:tabular-nums}
+.rollout-gates h5{font:500 13px/1.6 Inter,sans-serif;color:#3d5174;margin:0}
+.rollout-gates li p{font-size:12px;line-height:1.65;color:#526581;margin:5px 0 0}
+.rollout-gate-foot{margin-top:auto;display:flex;gap:8px;align-items:center;font-size:10px;line-height:1.5;color:#596b89}
+.rollout-gate-foot>span{width:5px;height:5px;border-radius:50%;border:1px solid #8192b4;flex-shrink:0}
+.rollout-outcome{grid-column:1/-1;display:flex;justify-content:space-between;align-items:center;gap:30px;padding:24px 40px;border-top:1px solid #afbfda40;background:#f4f7fc52}
+.rollout-outcome>div{max-width:660px}
+.rollout-outcome span{font-size:9px;letter-spacing:1.2px;color:#5f708b}
+.rollout-outcome p{font-size:13px;line-height:1.65;color:#52627e;margin:7px 0 0}
+.rollout-outcome a{display:flex;align-items:center;gap:12px;flex-shrink:0;font-size:12px;color:#4664ba;padding-block:8px}
+.rollout-outcome a svg,.rollout-footer button svg{transition:transform .3s var(--ease-out)}
+.rollout-footer{display:flex;justify-content:space-between;align-items:center;gap:40px;margin-top:22px;min-height:42px}
+.rollout-footer>p{font-size:11px;line-height:1.7;color:#606f86;max-width:730px}
+.rollout-footer button{display:flex;align-items:center;gap:12px;flex-shrink:0;background:transparent;border:0;border-radius:6px;padding:10px 0 10px 10px;color:#536d9f;font:500 12px Inter,sans-serif;cursor:pointer}
+@media(hover:hover) and (pointer:fine){.rollout-tabs button:hover{background:#ffffffc4;border-color:#a8b9de;box-shadow:0 7px 22px #3858970a}.rollout-tabs button:hover .rollout-step svg,.rollout-outcome a:hover svg{transform:translate(2px,-2px);opacity:1}.rollout-footer button:hover svg{transform:translateX(4px)}}
+@keyframes rollout-reveal{from{opacity:.25;transform:translateY(7px)}to{opacity:1;transform:none}}
+@media(max-width:1100px){.rollout-heading{gap:35px;grid-template-columns:1.3fr 1fr}.rollout-tabs button{padding:16px 13px}.rollout-tabs small{font-size:10px}.rollout-scope{padding:30px 27px}.rollout-scope dl>div{grid-template-columns:100px 1fr;gap:13px}.rollout-gates{padding:25px 21px}.rollout-outcome{padding:23px 27px}.rollout-step>span{font-size:7px}}
+@media(max-width:760px){.rollout-heading{grid-template-columns:1fr;gap:23px}.rollout-context{max-width:500px;justify-self:start}.rollout-context p{font-size:14px;margin:12px 0 8px}.rollout-heading h2{font-size:38px}.rollout-tabs{gap:5px;margin:28px 0 14px}.rollout-tabs button{min-height:94px;padding:12px 5px 14px;text-align:center;border-radius:9px}.rollout-step{justify-content:center;margin-bottom:13px}.rollout-step>span,.rollout-step svg,.rollout-tabs small{display:none}.rollout-tabs strong{font-size:10px;letter-spacing:-.15px;line-height:1.4;overflow-wrap:anywhere}.rollout-tabs button[aria-selected=true]:after{left:8px;right:8px}.rollout-panel-content{grid-template-columns:1fr}.rollout-scope{padding:26px 22px 13px}.rollout-scope h3{font-size:29px}.rollout-intro{font-size:13px;margin:14px 0 21px}.rollout-scope dl>div{grid-template-columns:1fr;gap:5px;padding:14px 0}.rollout-scope dt{font-size:12px}.rollout-scope dd{font-size:12px}.rollout-wave-label{margin-bottom:18px}.rollout-gates{margin:0 10px 10px;padding:23px 21px;min-height:0}.rollout-gates ol{margin-bottom:20px}.rollout-gates li{padding:15px 0}.rollout-outcome{display:block;padding:22px}.rollout-outcome a{margin-top:13px}.rollout-outcome p{font-size:12px}.rollout-footer{align-items:start;gap:18px}.rollout-footer>p{font-size:10px}.rollout-footer button{font-size:11px;gap:6px;padding-top:3px}.rollout-footer button svg{width:14px}}
+@media(prefers-reduced-motion:reduce){.rollout *,.rollout *:before,.rollout *:after{animation:none!important;transition:none!important;transform:none!important}}
+html[data-art-paused=true] .rollout-panel-content{animation:none}
+@supports not (backdrop-filter:blur(1px)){.rollout-panel{background:#f6f8fc}.rollout-gates{background:#e8eef8}}

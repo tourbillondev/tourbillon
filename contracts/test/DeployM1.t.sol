@@ -5,6 +5,8 @@ import {Test} from "forge-std/Test.sol";
 import {DeployM1} from "../script/DeployM1.s.sol";
 import {QuorumBoard} from "../src/QuorumBoard.sol";
 import {MarkRouter} from "../src/MarkRouter.sol";
+import {SessionCalendar} from "../src/SessionCalendar.sol";
+import {M1Core} from "../script/M1Core.sol";
 
 contract DeployM1Test is Test {
     address constant ADMIN = address(0xAD);
@@ -30,7 +32,7 @@ contract DeployM1Test is Test {
         script = new DeployM1();
     }
 
-    function _config() internal pure returns (DeployM1.Config memory c) {
+    function _config() internal view returns (DeployM1.Config memory c) {
         c.admin = ADMIN;
         c.signers = new address[](3);
         c.signers[0] = S1;
@@ -39,7 +41,8 @@ contract DeployM1Test is Test {
         c.markets = new bytes32[](3);
         c.markets[0] = "BTC";
         c.markets[1] = "ETH";
-        c.markets[2] = "HYPE";
+        c.markets[2] = "STK1";
+        c.calendar = script.loadCalendar(script.CALENDAR_FILE());
     }
 
     function _deploy() internal returns (DeployM1.Deployed memory) {
@@ -56,7 +59,7 @@ contract DeployM1Test is Test {
         assertEq(b.quorum(), 2);
         assertEq(b.window(), 30);
 
-        bytes32[3] memory names = [bytes32("BTC"), "ETH", "HYPE"];
+        bytes32[3] memory names = [bytes32("BTC"), "ETH", "STK1"];
         for (uint256 i; i < 3; ++i) {
             (bool listed, uint16 step, uint32 hb) = b.feeds(b.markKey(names[i]));
             assertTrue(listed);
@@ -77,6 +80,34 @@ contract DeployM1Test is Test {
         assertFalse(b.hasRole(adminRole, address(script)));
         assertFalse(d.router.hasRole(adminRole, address(script)));
         assertFalse(b.hasRole(adminRole, S1));
+        // the session calendar: loaded from the data file, wired to the board, administered by the admin only
+        SessionCalendar cal = d.calendar;
+        assertEq(address(b.calendar()), address(cal));
+        (bool set2026,,) = cal.yearInfo(2026);
+        (bool set2027,,) = cal.yearInfo(2027);
+        assertTrue(set2026 && set2027);
+        assertTrue(cal.hasRole(adminRole, ADMIN));
+        assertFalse(cal.hasRole(adminRole, address(script)));
+        // no stock market given: no MARK key is bound to the session rule
+        assertEq(b.sessionBandBps(b.markKey("BTC")), 0);
+    }
+
+    /// RH4: the tokenized-stock markets are listed on the calendar and their MARK keys bound at ±10%; never guessed.
+    function test_stockMarketsAreBoundToTheSessionRule() public {
+        DeployM1.Config memory c = _config();
+        c.markets[2] = "STK1";
+        c.stockMarkets = new bytes32[](1);
+        c.stockMarkets[0] = "STK1";
+        DeployM1.Deployed memory d = script.deploy(c, address(script));
+        assertEq(d.board.sessionBandBps(d.board.markKey("STK1")), 1000);
+        assertEq(d.board.sessionBandBps(d.board.volKey("STK1")), 0, "VOL keys are never bound");
+        assertEq(d.board.sessionBandBps(d.board.markKey("BTC")), 0, "crypto keys are never bound");
+        assertTrue(d.calendar.isStockMarket("STK1"));
+        assertFalse(d.calendar.isStockMarket("BTC"));
+        // a stock market that is not a market on the board is refused
+        c.stockMarkets[0] = "NOPE";
+        vm.expectRevert(abi.encodeWithSelector(M1Core.NotAMarket.selector, bytes32("NOPE")));
+        script.deploy(c, address(script));
     }
 
     function test_routesWaitOneHourThenMarksFlowThroughRouter() public {
@@ -85,7 +116,7 @@ contract DeployM1Test is Test {
         uint64 eta = uint64(nowT + 1 hours);
         assertEq(d.routeEta, eta);
 
-        bytes32[3] memory names = [bytes32("BTC"), "ETH", "HYPE"];
+        bytes32[3] memory names = [bytes32("BTC"), "ETH", "STK1"];
         for (uint256 i; i < 3; ++i) {
             (MarkRouter.Route memory p, uint64 e) = r.pending(names[i]);
             assertEq(e, eta);
@@ -172,8 +203,11 @@ contract DeployM1Test is Test {
     }
 
     function test_runRefusesOtherChains() public {
-        vm.chainId(999); // HyperEVM mainnet id, for example
-        vm.expectRevert(abi.encodeWithSelector(DeployM1.WrongChain.selector, uint256(999)));
-        script.run();
+        uint256[3] memory refused = [uint256(4663), 99801, 1]; // Robinhood Chain mainnet, the old Elysium testnet, Ethereum
+        for (uint256 i; i < refused.length; ++i) {
+            vm.chainId(refused[i]);
+            vm.expectRevert(abi.encodeWithSelector(DeployM1.WrongChain.selector, refused[i]));
+            script.run();
+        }
     }
 }

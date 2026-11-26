@@ -5,7 +5,7 @@ import {AccessControl} from "@openzeppelin/contracts/access/AccessControl.sol";
 import {MerkleProof} from "@openzeppelin/contracts/utils/cryptography/MerkleProof.sol";
 
 /// @title ReceiptRoots
-/// @notice Receipts (spec: "Trades, vol finals and NAV snapshots roll into an hourly Merkle root on Elysium";
+/// @notice Receipts (spec: "Trades, vol finals and NAV snapshots roll into an hourly Merkle root on Robinhood Chain";
 ///         `post(epoch, root, count)`). Each root commits to every receipt leaf of one UTC hour, built off-chain by the
 ///         receipts service from the chain's own events, so anyone can rebuild it and check it.
 /// @dev    M7 decisions G10 and G11:

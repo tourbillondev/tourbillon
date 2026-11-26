@@ -5,7 +5,7 @@ the router and the vol from the board itself, so the poker only chooses *when* a
 recorded. It also walks series with open positions that fall behind, so buys stay within the book's 16-interval
 limit.
 
-Runs on Elysium testnet (99801) and a local anvil (31337) only.
+Runs on the Robinhood Chain testnet (46630) and a local anvil (31337) only.
 
 ## Requirements
 
@@ -21,7 +21,7 @@ bun src/main.ts --deployment ../../contracts/deployments/<chainId>-m2.json --key
 | Flag | Meaning |
 |---|---|
 | `--deployment <file>` | Written by `contracts/script/DeployM2.s.sol`: book, engine, markets, deploy block |
-| `--rpc <url>` | RPC endpoint (default: the chain's public RPC) |
+| `--rpc <url>` | RPC endpoint: required on the testnet (no built-in default); anvil's local endpoint otherwise |
 | `--keystore <name>` | Foundry keystore account; the password is asked at a hidden prompt and the key stays in memory |
 | `--role primary\|backup` | Primary pokes from 5 s into each window, backup from 35 s; both only if the window has no sample yet |
 | `--dry-run` | Decide and log `would poke` / `would walk`; send nothing |
@@ -43,7 +43,7 @@ Every 20 s it:
   "another poker got there first" is skipped quietly; a stale mark means no epoch (law 2), logged with the reason.
 
 Gas: the max fee is capped at 1 gwei (above it, transactions pause with an alarm); the balance is checked every
-pass, with a warning below 0.2 HYPE. Logs are JSON lines on stdout.
+pass, with a warning below 0.2 STK1. Logs are JSON lines on stdout.
 
 ## Test
 

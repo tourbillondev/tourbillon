@@ -1,16 +1,12 @@
 import { redact } from "./config.ts";
 
-/// The Telegram Bot API calls the bot uses. The token never leaves this module: errors carry the HTTP status and
+/// The one Telegram call this bot makes: sendMessage. It never reads updates (the team bot, on the same bot, is the
+/// only reader) and never edits, pins or uploads. The token never leaves this module: errors carry the HTTP status and
 /// Telegram's own description only, passed through `redact` before they can reach a log.
 
 export type Sender = (chatId: string, text: string) => Promise<number | void>; // the message id when sent
 
-export type Telegram = {
-  send: Sender;
-  edit(chatId: string, messageId: number, text: string): Promise<void>;
-  pin(chatId: string, messageId: number): Promise<void>;
-  updates(offset: number): Promise<{ update_id: number; message?: { chat: { id: number }; text?: string } }[]>;
-};
+export type Telegram = { send: Sender };
 
 export function telegramClient(token: string, fetchFn: typeof fetch = fetch): Telegram {
   const call = async <T>(method: string, body: Record<string, unknown>): Promise<T> => {
@@ -31,15 +27,6 @@ export function telegramClient(token: string, fetchFn: typeof fetch = fetch): Te
   };
   return {
     send: async (chatId, text) => (await call<{ message_id: number }>("sendMessage", { chat_id: chatId, text, disable_web_page_preview: true }))?.message_id,
-    edit: async (chatId, messageId, text) => {
-      try {
-        await call("editMessageText", { chat_id: chatId, message_id: messageId, text, disable_web_page_preview: true });
-      } catch (e) {
-        if (!String((e as Error).message).includes("message is not modified")) throw e;
-      }
-    },
-    pin: async (chatId, messageId) => void (await call("pinChatMessage", { chat_id: chatId, message_id: messageId, disable_notification: true })),
-    updates: async (offset) => (await call<{ update_id: number; message?: { chat: { id: number }; text?: string } }[]>("getUpdates", { offset, timeout: 0, allowed_updates: ["message"] })) ?? [],
   };
 }
 

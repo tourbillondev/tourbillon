@@ -1,0 +1,14 @@
+/* A single responsive painting under the entire landing page. No per-section
+   background reset, blur surface, scroll animation, or oversized raster. */
+.landing-flow{position:relative;isolation:isolate;background:#f8faff}
+.page-atmosphere{position:absolute;inset:0;z-index:-1;pointer-events:none;overflow:hidden;contain:strict}
+.page-atmosphere>svg{display:block;width:100%;height:100%}
+.landing-flow>.dark-start,.landing-flow .hero,.landing-flow .stats,.landing-flow>.section,.landing-flow>.site-footer,.landing-flow .site-header{background:transparent}
+.landing-flow .hero:after,.landing-flow .stats:before,.landing-flow .case-study:before,.landing-flow .case-study:after,.landing-flow .site-footer:before,.landing-flow .site-footer:after{content:none}
+.landing-flow>.site-footer{border-top:0}
+.landing-flow .product-panel{background:#ffffffa6;border:1px solid #ffffffc4}
+.landing-flow .tabs{background:#e7ecf3b3}
+.landing-flow .gate{background:#e5eaf1a6}
+.landing-flow .shape-card{background:#ffffffa8}
+.landing-flow .final-cta{padding-top:145px}
+@media(max-width:760px){.landing-flow .final-cta{padding-top:110px}}

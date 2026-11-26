@@ -2,6 +2,7 @@
 pragma solidity 0.8.28;
 
 import {AccessControl} from "@openzeppelin/contracts/access/AccessControl.sol";
+import {ISessionCalendar} from "./SessionCalendar.sol";
 
 /// @title QuorumBoard
 /// @notice m-of-n signer board for marks and vols. Each key runs numbered rounds:
@@ -14,11 +15,17 @@ import {AccessControl} from "@openzeppelin/contracts/access/AccessControl.sol";
 ///      enter a median; their signers may vote again. Votes for a finalised round are refused.
 ///      Values are WAD: a mark is a WAD price, a vol is a WAD fraction (0.5e18 = 50%).
 ///      All configuration sits behind DEFAULT_ADMIN_ROLE, meant to be the timelock.
+///      Session rule (Backend §4, tokenized stocks; owner G1): a MARK key bound to the session calendar records every
+///      value finalised during the regular session; a round finalised outside it is clamped to ±sessionBandBps (at most
+///      10%) of that last in-session value. The trigger is the round's own finalisation, which anyone can call: no key
+///      chooses a price or a time. With no in-session value yet, an out-of-session round does not finalise, so the
+///      key stays stale and opens stay closed (law 2). Crypto keys are never bound.
 contract QuorumBoard is AccessControl {
     uint8 public constant DECIMALS = 8;
     uint256 public constant MIN_QUORUM = 2; // no single key can set a value
     uint256 public constant MAX_VALUE = 1e36; // same ceiling as TempoMath.MAX_PRICE; keeps every read and clamp in range
     uint256 internal constant BPS = 10_000;
+    uint16 public constant MAX_SESSION_BAND_BPS = 1_000; // ±10% (Backend §4)
 
     struct Feed {
         bool listed;
@@ -56,6 +63,9 @@ contract QuorumBoard is AccessControl {
     mapping(bytes32 => Final) internal _previous; // the final before the latest (round 0 if none)
     mapping(bytes32 => Vote[]) internal _open; // open round votes, in arrival order
     mapping(bytes32 => mapping(uint80 => mapping(address => bool))) public hasVoted;
+    ISessionCalendar public calendar;
+    mapping(bytes32 => uint16) public sessionBandBps; // 0: no session rule (crypto, and every VOL key)
+    mapping(bytes32 => uint256) public sessionValue; // the last value finalised during the regular session
 
     event Voted(bytes32 indexed key, uint80 indexed round, address indexed signer, uint256 value);
     event VoteDropped(bytes32 indexed key, uint80 indexed round, address indexed signer, uint256 value);
@@ -66,6 +76,9 @@ contract QuorumBoard is AccessControl {
     event FeedSet(bytes32 indexed key, uint16 stepBps, uint32 heartbeat);
     event AnchorSet(bytes32 indexed key, uint256 value, uint16 bandBps);
     event AnchorCleared(bytes32 indexed key);
+    event CalendarSet(address calendar);
+    event SessionKeySet(bytes32 indexed key, uint16 bandBps);
+    event SessionValueRecorded(bytes32 indexed key, uint80 indexed round, uint256 value);
 
     error NotSigner(address account);
     error UnknownKey(bytes32 key);
@@ -133,9 +146,16 @@ contract QuorumBoard is AccessControl {
 
     function _ready(bytes32 key, Vote[] storage vs) internal view returns (bool) {
         uint256 n = vs.length;
-        if (n >= signerCount) return true;
+        if (n >= signerCount) return _sessionAllows(key);
         if (_latest[key].round == 0) return false; // first round: no step clamp, so all n
-        return n >= quorum && block.timestamp >= vs[0].at + window;
+        if (n < quorum || block.timestamp < vs[0].at + window) return false;
+        return _sessionAllows(key);
+    }
+
+    /// @dev Out of session, a session-bound key finalises only once it has an in-session value to anchor to.
+    function _sessionAllows(bytes32 key) internal view returns (bool) {
+        if (sessionBandBps[key] == 0 || sessionValue[key] != 0) return true;
+        return calendar.isRegularSession(block.timestamp);
     }
 
     /// @dev Removes votes older than the key's heartbeat; their signers may vote again.
@@ -178,6 +198,17 @@ contract QuorumBoard is AccessControl {
         Anchor storage a = anchors[key];
         if (a.active) {
             out = _clamp(out, a.value * (BPS - a.bandBps) / BPS, a.value * (BPS + a.bandBps) / BPS);
+        }
+        // session rule: in session, record; out of session, clamp to the last in-session value
+        uint256 band = sessionBandBps[key];
+        if (band != 0) {
+            if (calendar.isRegularSession(block.timestamp)) {
+                sessionValue[key] = out;
+                emit SessionValueRecorded(key, round, out);
+            } else {
+                uint256 sv = sessionValue[key];
+                out = _clamp(out, sv * (BPS - band) / BPS, sv * (BPS + band) / BPS);
+            }
         }
 
         if (last.round != 0) _previous[key] = last;
@@ -267,6 +298,22 @@ contract QuorumBoard is AccessControl {
         (uint256 v,) = latestValue(key);
         anchors[key] = Anchor(true, bandBps, v);
         emit AnchorSet(key, v, bandBps);
+    }
+
+    function setCalendar(ISessionCalendar calendar_) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        if (address(calendar_).code.length == 0) revert BadConfig();
+        calendar = calendar_;
+        emit CalendarSet(address(calendar_));
+    }
+
+    /// @notice Binds a listed MARK key to the session rule with a band of at most 10%; 0 unbinds it.
+    function setSessionKey(bytes32 key, uint16 bandBps) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        if (!feeds[key].listed || bandBps > MAX_SESSION_BAND_BPS || (bandBps != 0 && address(calendar) == address(0))) {
+            revert BadConfig();
+        }
+        sessionBandBps[key] = bandBps;
+        if (bandBps == 0) delete sessionValue[key];
+        emit SessionKeySet(key, bandBps);
     }
 
     function clearAnchor(bytes32 key) external onlyRole(DEFAULT_ADMIN_ROLE) {

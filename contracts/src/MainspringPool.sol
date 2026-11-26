@@ -11,16 +11,19 @@ import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 import {ICounterparty} from "./ICounterparty.sol";
 import {IWriteCounterparty} from "./IWriteCounterparty.sol";
 import {IMatchPool} from "./MatchBook.sol";
+import {ISessionCalendar} from "./SessionCalendar.sol";
+import {ICoveringAssets} from "./CoveringAssets.sol";
 
 /// @notice What the pool needs from the MatchBook (M6).
 interface IMatchBookForPool {
     function buyback(uint256 seriesId, uint256 rawSold, uint256 gross, uint256 sWad)
         external
-        returns (uint256 paidUsdc, uint256 paidWhype, uint256 shortfall);
+        returns (uint256 paidSettlement, uint256 paidCover, uint256 shortfall);
     function matchedRaw(uint256 seriesId) external view returns (uint256);
 }
 import {PoolLiability} from "./PoolLiability.sol";
 import {PathFundingBook, IMarkRouter, IVolSource} from "./PathFundingBook.sol";
+import {HedgeSwap} from "./HedgeSwap.sol";
 
 /// The QuorumBoard reads the pool needs for the EQUITY key.
 interface IEquityFeed {
@@ -29,30 +32,33 @@ interface IEquityFeed {
 }
 
 /// @title MainspringPool
-/// @notice The USDC pool that takes the other side of every Engine trade. LPs hold shares; deposits and withdrawals
+/// @notice The settlement token pool that takes the other side of every Engine trade. LPs hold shares; deposits and withdrawals
 ///         are queued and settled once per liability epoch, at that hour's NAV (M3 decision 4).
-/// @dev    NAV = available USDC + equity term − NAV base liability, where
-///         - available USDC = balance − queued deposits − USDC owed to settled withdrawals and refunds;
-///         - the equity term counts the pool's capital outside Elysium (M3 step 4): max(0, (sentOut − receivedBack)
-///           + P), P = lower of the latest and previous EQUITY finals − EQUITY_OFFSET, P at 95% when positive and at
-///           100% when negative (capital in transit or on HyperCore at par). EQUITY is posted by the
-///           signer quorum as Hyperliquid P&L only (account value − deposits credited + withdrawals sent home, net of
-///           fee) plus a fixed offset, so transfers never pass through it; the in-transit part comes from the pool's
-///           own counters. Gains count one round late, losses at once. 0 until two finals exist or once the latest is
-///           2 h old; treasury sends need two finals and a latest under 2 h old;
+/// @dev    NAV = available settlement token + equity term − NAV base liability, where
+///         - available settlement token = balance − queued deposits − settlement token owed to settled withdrawals and refunds;
+///         - the covering-stock term (RH6): the pool's tokenized stock (its on-chain hedge inventory and cover received
+///           in buybacks) at each market's router mark, 0 for a market whose mark is stale (Backend §5, G6);
+///         - the equity term counts the pool's capital at the crypto hedge exchange (Backend §6; M3 step 4):
+///           max(0, (sentOut − receivedBack) + P), P = lower of the latest and previous EQUITY finals − EQUITY_OFFSET,
+///           P at 95% when positive and at 100% when negative (capital in transit or at the exchange at par). EQUITY
+///           is posted by the signer quorum as the exchange account's P&L only (account value − deposits credited +
+///           withdrawals sent home, net of fee) plus a fixed offset, so transfers never pass through it; the
+///           in-transit part comes from the pool's own counters. Gains count one round late, losses at once. 0 until
+///           two finals exist or once the latest is 2 h old; treasury sends need two finals and a latest under 2 h
+///           old;
 ///         - the NAV base liability is accurate (PoolLiability.navBase: buys add their base value, sells subtract
 ///           theirs at their own S and σ), so a round's NAV favours neither depositors nor those staying.
-///         Withdrawals are filled only from available USDC above the stressed liability (sells first, decision 6),
+///         Withdrawals are filled only from available settlement token above the stressed liability (sells first, decision 6),
 ///         pro rata when short; unfilled shares go back to their owners. If NAV is not positive, a round's deposits
 ///         are refunded and its withdrawals go unfilled. Shares use a virtual offset (as OpenZeppelin's ERC-4626),
 ///         so donations cannot skew the share price.
 ///         As counterparty: buys register their series and liability (256 open series per market); sells are paid
-///         from available USDC only, else `Insolvent` (decision 7: residual risk beyond the stress scenario, an
+///         from available settlement token only, else `Insolvent` (decision 7: residual risk beyond the stress scenario, an
 ///         alarm); 10% of every trade fee goes to the protocol, the rest stays in the pool (decision 8).
 ///         Risk rules on opens (M3 step 5), all in onBuy so that a refusal undoes the buy and never touches sells,
 ///         withdrawals or settlement (law 3):
-///         - coverage: available Elysium USDC ≥ stressed liability after the buy (equity, queued deposits and owed
-///           USDC do not count);
+///         - coverage: available settlement token on Robinhood Chain ≥ stressed liability after the buy (equity, queued deposits and owed
+///           settlement token do not count);
 ///         - per-market caps on open entry notional (units × S, released pro rata on sells) and on directional
 ///           exposure (|stressed up − stressed down|); a buy that lowers directional exposure is never refused by it;
 ///         - a drawdown pause: NAV per share more than 15% below its 30-day high (a ring of daily highs, updated at
@@ -63,12 +69,12 @@ contract MainspringPool is IWriteCounterparty, IMatchPool, ICounterparty, ERC20,
     using SafeERC20 for IERC20;
     using PoolLiability for PoolLiability.State;
 
-    uint256 internal constant WAD_PER_USDC_UNIT = 1e12;
+    uint256 internal constant WAD_PER_SETTLEMENT_UNIT = 1e12;
     uint256 internal constant BPS = 10_000;
-    uint256 internal constant VIRTUAL_SHARES = 1e12; // shares are 18 decimals, USDC 6
+    uint256 internal constant VIRTUAL_SHARES = 1e12; // shares are 18 decimals, settlement token 6
     uint256 internal constant VIRTUAL_ASSETS = 1;
     uint256 public constant MAX_PROTOCOL_FEE_BPS = 2000;
-    /// Fixed offset added by the signers to the (possibly negative) P&L-only EQUITY value: 10^12 USDC in WAD.
+    /// Fixed offset added by the signers to the (possibly negative) P&L-only EQUITY value: 10^12 settlement token in WAD.
     uint256 public constant EQUITY_OFFSET = 1e30;
     uint256 public constant EQUITY_MAX_AGE = 2 hours;
     uint256 public constant EQUITY_HAIRCUT_BPS = 9500;
@@ -77,73 +83,79 @@ contract MainspringPool is IWriteCounterparty, IMatchPool, ICounterparty, ERC20,
     bytes32 public constant PAUSER_ROLE = keccak256("PAUSER_ROLE");
     /// @notice Lifts market, drawdown and deposit pauses (M7 G4: the Safe directly, no timelock delay).
     bytes32 public constant UNPAUSER_ROLE = keccak256("UNPAUSER_ROLE");
-    /// @notice Moves USDC to and from the treasury within the daily cap (M7 G6: the Safe directly).
+    /// @notice Moves settlement token to and from the treasury within the daily cap (M7 G6: the Safe directly).
     bytes32 public constant TREASURER_ROLE = keccak256("TREASURER_ROLE");
+    /// @notice RH6 (G7): the on-chain hedge keeper; may only call hedgeSwap. Granted by governance, never at deploy.
+    bytes32 public constant HEDGER_ROLE = keccak256("HEDGER_ROLE");
     uint256 public constant DRAWDOWN_BPS = 1500;
     uint256 public constant DRAWDOWN_DAYS = 30;
 
     struct Round {
-        uint256 deposits; // USDC queued
+        uint256 deposits; // settlement token queued
         uint256 withdrawShares; // shares escrowed
         bool settled;
         bool refunded; // NAV was not positive: deposits refunded
         uint256 sharesMinted; // for the round's deposits, held by the pool until claimed
         uint256 sharesFilled; // of withdrawShares, burned
-        uint256 assetsPaid; // USDC owed to the round's withdrawals
-        uint256 nav; // USDC, at settlement
-        uint256 navPerShare; // USDC (6 decimals) per 1e18 shares, at settlement
+        uint256 assetsPaid; // settlement token owed to the round's withdrawals
+        uint256 nav; // settlement token, at settlement
+        uint256 navPerShare; // settlement token (6 decimals) per 1e18 shares, at settlement
         uint64 at;
     }
 
-    IERC20 internal immutable _usdc;
+    IERC20 internal immutable _settlement;
     IEquityFeed public immutable equityFeed;
     address public engine;
     address public writerBook; // M4: the WriterBook, set once
-    IERC20 public whype; // M4: WHYPE received in buybacks, counted in NAV at the HYPE mark × 95% (owner decision A)
-    bytes32 public whypeMarket; // the market whose mark values WHYPE (HYPE)
-    uint256 public constant WHYPE_HAIRCUT_BPS = 9500;
+    /// @notice The covering-asset table (RH5): covering tokens the pool receives in buybacks count in NAV at their
+    ///         market's mark × 95% (owner decision A), never in coverage or withdrawals (settlement token only). Set once.
+    ICoveringAssets public coverAssets;
     address public matchBook; // M6: matched writes of the open book, set once
     address public auction; // M6: the weekly risk auction, set once
-    mapping(bytes32 => uint256) public openBookCap; // USDC; matched notional allowed per market (testnet cap, D2)
-    mapping(bytes32 => uint256) public openBookNotional; // USDC, entry notional of matched raw per market
+    mapping(bytes32 => uint256) public openBookCap; // settlement token; matched notional allowed per market (testnet cap, D2)
+    mapping(bytes32 => uint256) public openBookNotional; // settlement token, entry notional of matched raw per market
     mapping(uint256 => uint256) public openBookSeriesNotional;
     address public protocolRecipient;
     uint16 public protocolFeeBps = 1000;
 
     PoolLiability.State internal liab;
 
-    uint256 public queuedDeposits; // USDC of the open round
-    uint256 public owed; // USDC owed to settled withdrawals and refunds, not yet claimed
+    uint256 public queuedDeposits; // settlement token of the open round
+    uint256 public owed; // settlement token owed to settled withdrawals and refunds, not yet claimed
     uint256 public round; // the open round
     uint256 public lastSettledEpoch;
     mapping(uint256 => Round) public rounds;
     mapping(uint256 => mapping(address => uint256)) public depositOf;
     mapping(uint256 => mapping(address => uint256)) public withdrawOf;
 
-    // treasury (manual capital moves to and from the pool's Hyperliquid account, M3 decision 1)
+    // treasury (manual capital moves to and from the pool's account at the crypto hedge exchange, M3 decision 1)
     address public treasury;
     uint16 public treasuryDailyCapBps = 2000; // of NAV per UTC day
-    uint256 public sentOut; // USDC, cumulative
-    uint256 public receivedBack; // USDC, cumulative
-    mapping(uint256 => uint256) public sentOnDay; // UTC day → USDC sent
+    uint256 public sentOut; // settlement token, cumulative
+    uint256 public receivedBack; // settlement token, cumulative
+    mapping(uint256 => uint256) public sentOnDay; // UTC day → settlement token sent
 
     // risk rules on opens (step 5)
-    mapping(bytes32 => uint256) public notionalCap; // USDC; 0 = no opens
-    mapping(bytes32 => uint256) public directionalCap; // USDC; 0 = no opens
-    mapping(bytes32 => uint256) public openNotional; // USDC, entry notional per market
-    mapping(uint256 => uint256) public seriesNotional; // USDC, entry notional per series
+    mapping(bytes32 => uint256) public notionalCap; // settlement token; 0 = no opens
+    mapping(bytes32 => uint256) public directionalCap; // settlement token; 0 = no opens
+    /// @notice Scales the open caps of tokenized-stock markets on weekends and holidays (G3: 25%); unset = 100%.
+    ISessionCalendar public sessionCalendar;
+    mapping(bytes32 => uint256) public openNotional; // settlement token, entry notional per market
+    mapping(uint256 => uint256) public seriesNotional; // settlement token, entry notional per series
     mapping(bytes32 => bool) public marketPaused;
     bool public opensPaused; // drawdown
     bool public depositsPaused; // the guardian (M7)
     uint256[30] internal _dayHigh; // NAV per share, daily highs
-    /// @notice The hedger's delta cap per market (USD of delta, USDC units). Rule: directionalCap ≤ hedgerDeltaCap ×
+    /// @notice The hedger's delta cap per market (USD of delta, settlement token units). Rule: directionalCap ≤ hedgerDeltaCap ×
     ///         2 × shock, so the directional book the pool accepts is one the hedger can carry (owner rule, M3).
     mapping(bytes32 => uint256) public hedgerDeltaCap;
+    HedgeSwap.Limits internal _hedge; // RH6 (G7): the on-chain stock hedge, set by governance
     uint256[30] internal _dayOf; // the UTC day (plus one) each slot holds
 
     event EngineSet(address engine);
     event WriterBookSet(address writerBook);
-    event WhypeSet(address whype, bytes32 market);
+    event CoverAssetsSet(address coverAssets);
+    event CoverStuckPaused(bytes32 indexed market, address by);
     event MatchBookSet(address matchBook);
     event AuctionSet(address auction);
     event OpenBookCapSet(bytes32 indexed market, uint256 cap);
@@ -156,7 +168,7 @@ contract MainspringPool is IWriteCounterparty, IMatchPool, ICounterparty, ERC20,
         uint256 fee,
         uint256 cut
     );
-    event BuybackSettled(uint256 indexed id, uint256 paidUsdc, uint256 paidWhype, uint256 shortfall);
+    event BuybackSettled(uint256 indexed id, uint256 paidSettlement, uint256 paidCover, uint256 shortfall);
     event BuybackFailed(uint256 indexed id, uint256 rawSold);
     event Carried(uint256 indexed id, uint256 raw);
     event AuctionFilled(uint256 indexed id, uint256 raw, uint256 price, address winner);
@@ -173,7 +185,7 @@ contract MainspringPool is IWriteCounterparty, IMatchPool, ICounterparty, ERC20,
         int256 cost,
         uint256 fee,
         uint256 cut,
-        uint256 whypeIn
+        uint256 coverIn
     );
     event ProtocolFeeSet(uint256 bps, address recipient);
     event DepositQueued(uint256 indexed round, address indexed lp, uint256 assets);
@@ -199,6 +211,7 @@ contract MainspringPool is IWriteCounterparty, IMatchPool, ICounterparty, ERC20,
     event TreasurySent(address indexed treasury, uint256 amount, uint256 sentOut, uint256 sentToday, uint256 navBefore);
     event TreasuryReturned(address indexed treasury, uint256 amount, uint256 receivedBack);
     event CapsSet(bytes32 indexed market, uint256 notionalCap, uint256 directionalCap);
+    event SessionCalendarSet(address calendar);
     event HedgerDeltaCapSet(bytes32 indexed market, uint256 deltaCap);
     event MarketPaused(bytes32 indexed market, address by);
     event MarketUnpaused(bytes32 indexed market, address by);
@@ -212,8 +225,9 @@ contract MainspringPool is IWriteCounterparty, IMatchPool, ICounterparty, ERC20,
     error NotEngine();
     error EngineAlreadySet();
     error NotWriterBook();
+    error NotABook();
     error WriterBookAlreadySet();
-    error WhypeAlreadySet();
+    error CoverAssetsAlreadySet();
     error NotMatchBook();
     error NotAuction();
     error MatchBookAlreadySet();
@@ -240,7 +254,7 @@ contract MainspringPool is IWriteCounterparty, IMatchPool, ICounterparty, ERC20,
 
     constructor(
         address admin,
-        IERC20 usdc_,
+        IERC20 settlement_,
         PathFundingBook book,
         IMarkRouter marks,
         IVolSource vols,
@@ -248,15 +262,15 @@ contract MainspringPool is IWriteCounterparty, IMatchPool, ICounterparty, ERC20,
         address protocolRecipient_
     ) ERC20("Mainspring Share", "MSPR") {
         if (
-            admin == address(0) || address(usdc_) == address(0) || protocolRecipient_ == address(0)
+            admin == address(0) || address(settlement_) == address(0) || protocolRecipient_ == address(0)
                 || address(equityFeed_) == address(0)
         ) {
             revert ZeroAddress();
         }
         equityFeed = equityFeed_;
-        uint8 d = IERC20Metadata(address(usdc_)).decimals();
+        uint8 d = IERC20Metadata(address(settlement_)).decimals();
         if (d != 6) revert NotSixDecimals(d);
-        _usdc = usdc_;
+        _settlement = settlement_;
         protocolRecipient = protocolRecipient_;
         liab.init(book, marks, vols, 15_000);
         _grantRole(DEFAULT_ADMIN_ROLE, admin);
@@ -277,11 +291,11 @@ contract MainspringPool is IWriteCounterparty, IMatchPool, ICounterparty, ERC20,
 
     // ---------------------------------------------------------------- LPs
 
-    /// @notice Queues `assets` USDC for the open round; shares are minted at that round's NAV.
+    /// @notice Queues `assets` settlement token for the open round; shares are minted at that round's NAV.
     function deposit(uint256 assets) external nonReentrant {
         if (depositsPaused) revert DepositsArePaused();
         if (assets == 0) revert ZeroAmount();
-        _usdc.safeTransferFrom(msg.sender, address(this), assets);
+        _settlement.safeTransferFrom(msg.sender, address(this), assets);
         rounds[round].deposits += assets;
         depositOf[round][msg.sender] += assets;
         queuedDeposits += assets;
@@ -295,7 +309,7 @@ contract MainspringPool is IWriteCounterparty, IMatchPool, ICounterparty, ERC20,
         rounds[round].deposits -= a;
         queuedDeposits -= a;
         emit DepositCancelled(round, msg.sender, a);
-        _usdc.safeTransfer(msg.sender, a);
+        _settlement.safeTransfer(msg.sender, a);
     }
 
     /// @notice Queues `shares` for withdrawal in the open round; they are held by the pool until settlement.
@@ -331,7 +345,7 @@ contract MainspringPool is IWriteCounterparty, IMatchPool, ICounterparty, ERC20,
             queuedDeposits -= rd.deposits;
             owed += rd.deposits;
         } else {
-            // withdrawals first, at NAV, from free USDC above the stressed liability only (sells first)
+            // withdrawals first, at NAV, from free settlement token above the stressed liability only (sells first)
             if (rd.withdrawShares > 0) {
                 uint256 value = _toAssets(rd.withdrawShares, nav, supply);
                 uint256 free = freeForWithdrawals();
@@ -365,7 +379,7 @@ contract MainspringPool is IWriteCounterparty, IMatchPool, ICounterparty, ERC20,
         );
     }
 
-    /// @notice A depositor's shares from a settled round (or the USDC back if that round was refunded).
+    /// @notice A depositor's shares from a settled round (or the settlement token back if that round was refunded).
     function claimShares(uint256 r) external nonReentrant {
         Round storage rd = rounds[r];
         if (!rd.settled) revert RoundNotSettled(r);
@@ -375,7 +389,7 @@ contract MainspringPool is IWriteCounterparty, IMatchPool, ICounterparty, ERC20,
         if (rd.refunded) {
             owed -= a;
             emit SharesClaimed(r, msg.sender, 0, a);
-            _usdc.safeTransfer(msg.sender, a);
+            _settlement.safeTransfer(msg.sender, a);
             return;
         }
         uint256 sh = Math.mulDiv(a, rd.sharesMinted, rd.deposits);
@@ -383,28 +397,28 @@ contract MainspringPool is IWriteCounterparty, IMatchPool, ICounterparty, ERC20,
         _transfer(address(this), msg.sender, sh);
     }
 
-    /// @notice A withdrawer's USDC from a settled round, and any shares that were not filled.
+    /// @notice A withdrawer's settlement token from a settled round, and any shares that were not filled.
     function withdraw(uint256 r) external nonReentrant {
         Round storage rd = rounds[r];
         if (!rd.settled) revert RoundNotSettled(r);
         uint256 sh = withdrawOf[r][msg.sender];
         if (sh == 0) revert NothingQueued();
         withdrawOf[r][msg.sender] = 0;
-        // USDC rounded down and filled shares rounded up, so the sums over all withdrawers never exceed what the
-        // round set aside (the USDC owed and the unfilled shares held in escrow)
+        // settlement token rounded down and filled shares rounded up, so the sums over all withdrawers never exceed what the
+        // round set aside (the settlement token owed and the unfilled shares held in escrow)
         uint256 assets = Math.mulDiv(sh, rd.assetsPaid, rd.withdrawShares);
         uint256 filled = Math.mulDiv(sh, rd.sharesFilled, rd.withdrawShares, Math.Rounding.Ceil);
         uint256 back = sh - filled;
         owed -= assets;
         emit Withdrawn(r, msg.sender, assets, back);
         if (back > 0) _transfer(address(this), msg.sender, back);
-        if (assets > 0) _usdc.safeTransfer(msg.sender, assets);
+        if (assets > 0) _settlement.safeTransfer(msg.sender, assets);
     }
 
     // ---------------------------------------------------------------- counterparty
 
     function asset() external view returns (IERC20) {
-        return _usdc;
+        return _settlement;
     }
 
     /// @inheritdoc ICounterparty
@@ -424,25 +438,27 @@ contract MainspringPool is IWriteCounterparty, IMatchPool, ICounterparty, ERC20,
         // notional cap (entry notional, released pro rata on sells); a shape counts max(long, short) units of
         // underlying per unit (M4 step 6)
         uint256 underlying = Math.mulDiv(units, liab.notionalPerUnit(id), 1e18, Math.Rounding.Ceil);
-        uint256 notional = Math.ceilDiv(Math.mulDiv(underlying, sWad, 1e18, Math.Rounding.Ceil), WAD_PER_USDC_UNIT);
+        uint256 notional = Math.ceilDiv(Math.mulDiv(underlying, sWad, 1e18, Math.Rounding.Ceil), WAD_PER_SETTLEMENT_UNIT);
         uint256 nWould = openNotional[market] + notional;
-        if (nWould > notionalCap[market]) revert NotionalCapExceeded(market, nWould, notionalCap[market]);
+        uint256 nCap = _cap(notionalCap[market], market);
+        if (nWould > nCap) revert NotionalCapExceeded(market, nWould, nCap);
         openNotional[market] = nWould;
         seriesNotional[id] += notional;
 
         // directional cap: refused only if the buy raises exposure above the cap
         uint256 dirBefore = liab.liveDirectional(market);
         liab.onBuy(market, id, units, raw, sWad, sigmaBps);
-        uint256 dirAfter = Math.ceilDiv(liab.liveDirectional(market), WAD_PER_USDC_UNIT);
-        if (dirAfter > directionalCap[market] && dirAfter > Math.ceilDiv(dirBefore, WAD_PER_USDC_UNIT)) {
-            revert DirectionalCapExceeded(market, dirAfter, directionalCap[market]);
+        uint256 dirAfter = Math.ceilDiv(liab.liveDirectional(market), WAD_PER_SETTLEMENT_UNIT);
+        uint256 dCap = _cap(directionalCap[market], market);
+        if (dirAfter > dCap && dirAfter > Math.ceilDiv(dirBefore, WAD_PER_SETTLEMENT_UNIT)) {
+            revert DirectionalCapExceeded(market, dirAfter, dCap);
         }
 
         uint256 cut = fee * protocolFeeBps / BPS;
         emit TradeBought(market, id, premium, fee, cut);
-        if (cut > 0) _usdc.safeTransfer(protocolRecipient, cut);
+        if (cut > 0) _settlement.safeTransfer(protocolRecipient, cut);
 
-        // coverage: Elysium USDC must still cover the stressed liability (sells first, law 3)
+        // coverage: available settlement token must still cover the stressed liability (sells first, law 3)
         uint256 avail = available();
         uint256 stressed = stressedLiability();
         if (avail < stressed) revert CoverageBreached(avail, stressed);
@@ -473,7 +489,7 @@ contract MainspringPool is IWriteCounterparty, IMatchPool, ICounterparty, ERC20,
         liab.setMatched(id, mNew);
         // the NAV base drops only for the raw the pool carried and no longer does
         uint256 dropped = ownAfter < ownBefore ? ownBefore - ownAfter : 0;
-        liab.onSell(id, rawSold, rawSold == 0 ? 0 : Math.mulDiv(gross * WAD_PER_USDC_UNIT, dropped, rawSold));
+        liab.onSell(id, rawSold, rawSold == 0 ? 0 : Math.mulDiv(gross * WAD_PER_SETTLEMENT_UNIT, dropped, rawSold));
         if (ownAfter > ownBefore && rawSold > 0) {
             // a buyback left raw uncovered: the pool carries it, in stress and coverage, from now on (D1 backstop)
             liab.addCarried(id, Math.mulDiv(units, ownAfter - ownBefore, rawSold), sWad, sigmaBps);
@@ -483,12 +499,12 @@ contract MainspringPool is IWriteCounterparty, IMatchPool, ICounterparty, ERC20,
         uint256 avail = available();
         if (avail < net + cut) revert Insolvent(net + cut, avail);
         emit TradeSold(market, id, gross, net, cut);
-        if (net > 0) _usdc.safeTransfer(to, net);
-        if (cut > 0) _usdc.safeTransfer(protocolRecipient, cut);
+        if (net > 0) _settlement.safeTransfer(to, net);
+        if (cut > 0) _settlement.safeTransfer(protocolRecipient, cut);
     }
 
     /// @dev The sources' buyback for a sell (M6 D1). Never blocks the sell (law 3): on a revert the pool pays alone and
-    ///      the matched raw is clamped to the buyer raw left. Returns the matched raw the MatchBook still covers.
+    ///      the matched raw is clamped to the buyer raw left. The result is the matched raw the MatchBook still covers.
     function _buyback(uint256 id, uint256 raw, uint256 gross, uint256 sWad, uint256 mBefore)
         internal
         returns (uint256)
@@ -546,14 +562,15 @@ contract MainspringPool is IWriteCounterparty, IMatchPool, ICounterparty, ERC20,
         if (marketPaused[market]) revert MarketIsPaused(market);
         uint256 n = _notional(id, units, sWad);
         uint256 ob = openBookNotional[market] + n;
-        if (ob > openBookCap[market]) revert OpenBookCapExceeded(market, ob, openBookCap[market]);
+        uint256 obCap = _cap(openBookCap[market], market);
+        if (ob > obCap) revert OpenBookCapExceeded(market, ob, obCap);
         openBookNotional[market] = ob;
         openBookSeriesNotional[id] += n;
         liab.onMatchedBuy(market, id, raw);
         uint256 cut = fee * protocolFeeBps / BPS;
         emit MatchedOpened(market, id, raw, premium, credit, fee, cut);
-        if (credit > 0) _usdc.safeTransfer(payee, credit);
-        if (cut > 0) _usdc.safeTransfer(protocolRecipient, cut);
+        if (credit > 0) _settlement.safeTransfer(payee, credit);
+        if (cut > 0) _settlement.safeTransfer(protocolRecipient, cut);
     }
 
     /// @inheritdoc IMatchPool
@@ -578,21 +595,23 @@ contract MainspringPool is IWriteCounterparty, IMatchPool, ICounterparty, ERC20,
         _releaseNotional(market, id, 0, 0, m, mNew);
         uint256 n = _notional(id, units, sWad);
         uint256 nWould = openNotional[market] + n;
-        if (nWould > notionalCap[market]) revert NotionalCapExceeded(market, nWould, notionalCap[market]);
+        uint256 nCap = _cap(notionalCap[market], market);
+        if (nWould > nCap) revert NotionalCapExceeded(market, nWould, nCap);
         openNotional[market] = nWould;
         seriesNotional[id] += n;
         uint256 dirBefore = liab.liveDirectional(market);
         liab.setMatched(id, mNew);
         liab.addCarried(id, units, sWad, sigmaBps);
-        uint256 dirAfter = Math.ceilDiv(liab.liveDirectional(market), WAD_PER_USDC_UNIT);
-        if (dirAfter > directionalCap[market] && dirAfter > Math.ceilDiv(dirBefore, WAD_PER_USDC_UNIT)) {
-            revert DirectionalCapExceeded(market, dirAfter, directionalCap[market]);
+        uint256 dirAfter = Math.ceilDiv(liab.liveDirectional(market), WAD_PER_SETTLEMENT_UNIT);
+        uint256 dCap = _cap(directionalCap[market], market);
+        if (dirAfter > dCap && dirAfter > Math.ceilDiv(dirBefore, WAD_PER_SETTLEMENT_UNIT)) {
+            revert DirectionalCapExceeded(market, dirAfter, dCap);
         }
         uint256 cut = fee * protocolFeeBps / BPS;
         uint256 payout = cost < 0 ? uint256(-cost) : 0;
         emit EarlyCloseTaken(market, id, raw, cost, fee, cut);
-        if (payout > 0) _usdc.safeTransfer(payee, payout);
-        if (cut > 0) _usdc.safeTransfer(protocolRecipient, cut);
+        if (payout > 0) _settlement.safeTransfer(payee, payout);
+        if (cut > 0) _settlement.safeTransfer(protocolRecipient, cut);
         uint256 avail = available();
         uint256 stressed = stressedLiability();
         if (avail < stressed) revert CoverageBreached(avail, stressed);
@@ -600,7 +619,7 @@ contract MainspringPool is IWriteCounterparty, IMatchPool, ICounterparty, ERC20,
 
     function _notional(uint256 id, uint256 units, uint256 sWad) internal view returns (uint256) {
         uint256 underlying = Math.mulDiv(units, liab.notionalPerUnit(id), 1e18, Math.Rounding.Ceil);
-        return Math.ceilDiv(Math.mulDiv(underlying, sWad, 1e18, Math.Rounding.Ceil), WAD_PER_USDC_UNIT);
+        return Math.ceilDiv(Math.mulDiv(underlying, sWad, 1e18, Math.Rounding.Ceil), WAD_PER_SETTLEMENT_UNIT);
     }
 
     function matchedRawOf(uint256 id) external view returns (uint256) {
@@ -628,22 +647,24 @@ contract MainspringPool is IWriteCounterparty, IMatchPool, ICounterparty, ERC20,
         // the pool holds the written shape: it adds to NAV and counts in the directional cap (D9)
         uint256 dirBefore = liab.liveDirectional(market);
         liab.onWrite(market, seriesId, units, raw, sWad, sigmaBps);
-        uint256 dirAfter = Math.ceilDiv(liab.liveDirectional(market), WAD_PER_USDC_UNIT);
-        if (dirAfter > directionalCap[market] && dirAfter > Math.ceilDiv(dirBefore, WAD_PER_USDC_UNIT)) {
-            revert DirectionalCapExceeded(market, dirAfter, directionalCap[market]);
+        uint256 dirAfter = Math.ceilDiv(liab.liveDirectional(market), WAD_PER_SETTLEMENT_UNIT);
+        uint256 dCap = _cap(directionalCap[market], market);
+        if (dirAfter > dCap && dirAfter > Math.ceilDiv(dirBefore, WAD_PER_SETTLEMENT_UNIT)) {
+            revert DirectionalCapExceeded(market, dirAfter, dCap);
         }
         uint256 cut = fee * protocolFeeBps / BPS;
         emit TradeWritten(market, seriesId, writeId, credit, fee, cut);
-        if (credit > 0) _usdc.safeTransfer(writer, uint256(credit));
-        if (cut > 0) _usdc.safeTransfer(protocolRecipient, cut);
+        if (credit > 0) _settlement.safeTransfer(writer, uint256(credit));
+        if (cut > 0) _settlement.safeTransfer(protocolRecipient, cut);
         uint256 avail = available();
         uint256 stressed = stressedLiability();
         if (avail < stressed) revert CoverageBreached(avail, stressed);
     }
 
     /// @inheritdoc IWriteCounterparty
-    /// @dev Never paused. WHYPE received in a buyback is held by the pool and counted in NAV at the HYPE mark × 95%,
-    ///      never in coverage or withdrawals (USDC only); it is converted through the treasury procedure.
+    /// @dev Never paused. A covering token received in a buyback is held by the pool and counted in NAV at its
+    ///      market's mark × 95%, never in coverage or withdrawals (settlement token only); it is converted through the treasury
+    ///      procedure.
     function onUnwrite(
         bytes32 market,
         uint256 seriesId,
@@ -655,7 +676,7 @@ contract MainspringPool is IWriteCounterparty, IMatchPool, ICounterparty, ERC20,
         int256 cost,
         uint256 fee,
         uint256,
-        uint256 whypeIn,
+        uint256 coverIn,
         address writer
     ) external onlyWriterBook {
         liab.onUnwrite(seriesId, raw, units, sWad, sigmaBps);
@@ -663,9 +684,9 @@ contract MainspringPool is IWriteCounterparty, IMatchPool, ICounterparty, ERC20,
         uint256 payout = cost < 0 ? uint256(-cost) : 0;
         uint256 avail = available();
         if (avail < payout + cut) revert Insolvent(payout + cut, avail);
-        emit TradeUnwritten(market, seriesId, writeId, cost, fee, cut, whypeIn);
-        if (payout > 0) _usdc.safeTransfer(writer, payout);
-        if (cut > 0) _usdc.safeTransfer(protocolRecipient, cut);
+        emit TradeUnwritten(market, seriesId, writeId, cost, fee, cut, coverIn);
+        if (payout > 0) _settlement.safeTransfer(writer, payout);
+        if (cut > 0) _settlement.safeTransfer(protocolRecipient, cut);
     }
 
     // ---------------------------------------------------------------- epochs (permissionless)
@@ -680,9 +701,9 @@ contract MainspringPool is IWriteCounterparty, IMatchPool, ICounterparty, ERC20,
 
     // ---------------------------------------------------------------- reads
 
-    /// @notice USDC that belongs to the pool's LPs and pays sells: balance − queued deposits − owed.
+    /// @notice settlement token that belongs to the pool's LPs and pays sells: balance − queued deposits − owed.
     function available() public view returns (uint256) {
-        uint256 bal = _usdc.balanceOf(address(this));
+        uint256 bal = _settlement.balanceOf(address(this));
         uint256 reserved = queuedDeposits + owed;
         return bal > reserved ? bal - reserved : 0;
     }
@@ -698,16 +719,16 @@ contract MainspringPool is IWriteCounterparty, IMatchPool, ICounterparty, ERC20,
         (ok,) = _equityPnl();
     }
 
-    /// @notice Capital outside Elysium counted in NAV (USDC): max(0, (sentOut − receivedBack) + P'), where P is the
-    ///         lower of the latest and previous EQUITY finals minus the offset (Hyperliquid P&L), counted at 95% when
-    ///         positive and at 100% when negative. Capital in transit or on HyperCore counts at par. 0 unless
+    /// @notice Capital at the crypto hedge exchange counted in NAV (settlement token): max(0, (sentOut − receivedBack) + P'), where P is the
+    ///         lower of the latest and previous EQUITY finals minus the offset (the exchange account's P&L), counted at 95% when
+    ///         positive and at 100% when negative. Capital in transit or at the exchange counts at par. 0 unless
     ///         equityReady().
     function equityTerm() public view returns (uint256) {
         (bool ok, int256 pnl) = _equityPnl();
         if (!ok) return 0;
         if (pnl > 0) pnl = pnl * int256(EQUITY_HAIRCUT_BPS) / int256(BPS); // a gain at 95%, rounded down
-        int256 total = int256(sentOut * WAD_PER_USDC_UNIT) - int256(receivedBack * WAD_PER_USDC_UNIT) + pnl;
-        return total > 0 ? uint256(total) / WAD_PER_USDC_UNIT : 0;
+        int256 total = int256(sentOut * WAD_PER_SETTLEMENT_UNIT) - int256(receivedBack * WAD_PER_SETTLEMENT_UNIT) + pnl;
+        return total > 0 ? uint256(total) / WAD_PER_SETTLEMENT_UNIT : 0;
     }
 
     /// @dev (ready, P): P = lower(latest, previous EQUITY) − EQUITY_OFFSET, WAD, signed.
@@ -731,25 +752,25 @@ contract MainspringPool is IWriteCounterparty, IMatchPool, ICounterparty, ERC20,
         return (true, int256(lower) - int256(EQUITY_OFFSET));
     }
 
-    /// @notice NAV in USDC (0 if not positive): available + equity term + WHYPE term + written shapes the pool holds
-    ///         − NAV base liability.
+    /// @notice NAV in settlement token (0 if not positive): available + equity term + covering-token term + written shapes the pool
+    ///         holds − NAV base liability.
     function navNow() public view returns (uint256) {
-        uint256 assets = available() + equityTerm() + whypeTerm();
-        uint256 liability = Math.ceilDiv(liab.totalNavBase(), WAD_PER_USDC_UNIT);
+        uint256 assets = available() + equityTerm() + coverTerm();
+        uint256 liability = Math.ceilDiv(liab.totalNavBase(), WAD_PER_SETTLEMENT_UNIT);
         // written shapes the pool holds: an asset, or a liability when worth less than 0 (rounded against the pool)
         int256 wWad = liab.totalWrittenNavBase();
         int256 written =
-            wWad >= 0 ? wWad / int256(WAD_PER_USDC_UNIT) : -int256(Math.ceilDiv(uint256(-wWad), WAD_PER_USDC_UNIT));
+            wWad >= 0 ? wWad / int256(WAD_PER_SETTLEMENT_UNIT) : -int256(Math.ceilDiv(uint256(-wWad), WAD_PER_SETTLEMENT_UNIT));
         int256 nav = int256(assets) + written - int256(liability);
         return nav > 0 ? uint256(nav) : 0;
     }
 
-    /// @notice Stressed liability in USDC (the conservative bound used for withdrawals and the coverage rule).
+    /// @notice Stressed liability in settlement token (the conservative bound used for withdrawals and the coverage rule).
     function stressedLiability() public view returns (uint256) {
-        return Math.ceilDiv(liab.totalLiveStressed(), WAD_PER_USDC_UNIT);
+        return Math.ceilDiv(liab.totalLiveStressed(), WAD_PER_SETTLEMENT_UNIT);
     }
 
-    /// @notice Available USDC above the stressed liability: all that withdrawals may take.
+    /// @notice Available settlement token above the stressed liability: all that withdrawals may take.
     function freeForWithdrawals() public view returns (uint256) {
         uint256 a = available();
         uint256 s = stressedLiability();
@@ -778,16 +799,22 @@ contract MainspringPool is IWriteCounterparty, IMatchPool, ICounterparty, ERC20,
         return liab.raw[id];
     }
 
-    /// @notice The pool's WHYPE at the WHYPE market's mark × 95%, in USDC (rounded down); 0 while the mark is stale.
-    function whypeTerm() public view returns (uint256) {
-        if (address(whype) == address(0)) return 0;
-        uint256 bal = whype.balanceOf(address(this));
-        if (bal == 0) return 0;
-        try liab.marks.markWad(whypeMarket) returns (uint256 px) {
-            return Math.mulDiv(bal, px * WHYPE_HAIRCUT_BPS, 1e18 * BPS) / WAD_PER_USDC_UNIT;
-        } catch {
-            return 0;
+    /// @notice The pool's tokenized stock (hedge inventory and cover received), each at its market's router mark, in
+    ///         settlement token (rounded down); a market whose mark is stale counts 0.
+    function coverTerm() public view returns (uint256) {
+        ICoveringAssets c = coverAssets;
+        return address(c) == address(0) ? 0 : c.valueOf(address(this));
+    }
+
+    /// @notice A covering token could not move during a buyback or an unwrite (owner D3): the books keep it owed and
+    ///         call this, and opens on that market pause like a venue outage (Backend §11). Sells and settlement token go on; the
+    ///         Safe unpauses once the token moves again.
+    function onCoverStuck(bytes32 market) external {
+        if ((msg.sender != writerBook || writerBook == address(0)) && (msg.sender != matchBook || matchBook == address(0))) {
+            revert NotABook();
         }
+        marketPaused[market] = true;
+        emit CoverStuckPaused(market, msg.sender);
     }
 
     function writtenNavBase(bytes32 market) external view returns (int256) {
@@ -875,6 +902,19 @@ contract MainspringPool is IWriteCounterparty, IMatchPool, ICounterparty, ERC20,
         emit DepositsUnpaused(msg.sender);
     }
 
+    /// @notice The session calendar whose weekend and holiday rule scales the open caps of stock markets (G3).
+    function setSessionCalendar(ISessionCalendar calendar_) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        sessionCalendar = calendar_;
+        emit SessionCalendarSet(address(calendar_));
+    }
+
+    /// @dev A cap as it applies now: on a weekend or holiday, a stock market's opens get 25% of it (G3). Sells never
+    ///      reach a cap check.
+    function _cap(uint256 c, bytes32 market) internal view returns (uint256) {
+        ISessionCalendar sc = sessionCalendar;
+        return address(sc) == address(0) ? c : c * sc.openCapBps(market) / BPS;
+    }
+
     function setCaps(bytes32 market, uint256 notionalCap_, uint256 directionalCap_)
         external
         onlyRole(DEFAULT_ADMIN_ROLE)
@@ -893,7 +933,7 @@ contract MainspringPool is IWriteCounterparty, IMatchPool, ICounterparty, ERC20,
         emit HedgerDeltaCapSet(market, deltaCap);
     }
 
-    /// @notice The largest directional cap the hedger capacity allows: hedgerDeltaCap × 2 × shock (USDC, rounded
+    /// @notice The largest directional cap the hedger capacity allows: hedgerDeltaCap × 2 × shock (settlement token, rounded
     ///         down). 0 for a market not listed.
     function maxDirectionalCap(bytes32 market) public view returns (uint256) {
         return Math.mulDiv(hedgerDeltaCap[market], 2 * uint256(liab.m[market].shockBps), BPS);
@@ -905,13 +945,13 @@ contract MainspringPool is IWriteCounterparty, IMatchPool, ICounterparty, ERC20,
     }
 
     function directional(bytes32 market) external view returns (uint256) {
-        return Math.ceilDiv(liab.liveDirectional(market), WAD_PER_USDC_UNIT);
+        return Math.ceilDiv(liab.liveDirectional(market), WAD_PER_SETTLEMENT_UNIT);
     }
 
     // ---------------------------------------------------------------- treasury
 
-    /// @notice Sends USDC to the treasury address (bound for the pool's Hyperliquid account). Only from available
-    ///         USDC above the stressed liability (sells first), and at most treasuryDailyCapBps of NAV per UTC day.
+    /// @notice Sends settlement token to the treasury address (bound for the pool's account at the crypto hedge exchange). Only from available
+    ///         settlement token above the stressed liability (sells first), and at most treasuryDailyCapBps of NAV per UTC day.
     function sendToTreasury(uint256 amount) external nonReentrant onlyRole(TREASURER_ROLE) {
         address t = treasury;
         if (t == address(0)) revert NoTreasury();
@@ -927,10 +967,10 @@ contract MainspringPool is IWriteCounterparty, IMatchPool, ICounterparty, ERC20,
         sentOnDay[day] = today + amount;
         sentOut += amount;
         emit TreasurySent(t, amount, sentOut, today + amount, nav);
-        _usdc.safeTransfer(t, amount);
+        _settlement.safeTransfer(t, amount);
     }
 
-    /// @notice Pulls USDC back from the treasury address (it must have approved the pool). Treasurer or treasury only.
+    /// @notice Pulls settlement token back from the treasury address (it must have approved the pool). Treasurer or treasury only.
     function receiveFromTreasury(uint256 amount) external nonReentrant {
         address t = treasury;
         if (t == address(0)) revert NoTreasury();
@@ -938,7 +978,46 @@ contract MainspringPool is IWriteCounterparty, IMatchPool, ICounterparty, ERC20,
         if (amount == 0) revert ZeroAmount();
         receivedBack += amount;
         emit TreasuryReturned(t, amount, receivedBack);
-        _usdc.safeTransferFrom(t, address(this), amount);
+        _settlement.safeTransferFrom(t, address(this), amount);
+    }
+
+    // ---------------------------------------------------------------- on-chain hedge (RH6, G7)
+
+    /// @notice Swaps pool settlement token for `market`'s tokenized stock (`buy`) or back, through the listed router (HedgeSwap.run:
+    ///         no fresh mark, no swap (law 2); `minOut` at least the value at the router mark less the listed slippage;
+    ///         inventory and daily caps). A buy spends only settlement token above queued deposits, owed settlement token and the stressed
+    ///         liability (sells first, law 3). Allowed while opens are paused: hedging only lowers risk.
+    function hedgeSwap(bytes32 market, bool buy, uint256 amountIn, uint256 minOut)
+        external
+        nonReentrant
+        onlyRole(HEDGER_ROLE)
+        returns (uint256 out)
+    {
+        if (buy) {
+            // only settlement token above queued deposits, owed settlement token and the stressed liability (sells first, law 3)
+            uint256 free = freeForWithdrawals();
+            if (amountIn > free) revert AboveFree(amountIn, free);
+        }
+        out = HedgeSwap.run(_hedge, _settlement, coverAssets, liab.marks, market, buy, amountIn, minOut);
+    }
+
+    /// @notice Governance: the swap router (zero turns hedging off), its slippage bound (at most 3%), one market's
+    ///         inventory cap (WAD shares) and the daily swap cap (settlement token, all markets).
+    function setHedge(address router, uint16 slippageBps, bytes32 market, uint256 inventoryCap, uint256 dailyCap)
+        external
+        onlyRole(DEFAULT_ADMIN_ROLE)
+    {
+        HedgeSwap.configure(_hedge, router, slippageBps, market, inventoryCap, dailyCap);
+    }
+
+    /// @notice The hedge settings for `market` and the settlement token swapped on UTC `day`.
+    function hedgeLimits(bytes32 market, uint256 day)
+        external
+        view
+        returns (address router, uint16 slippageBps, uint256 inventoryCap, uint256 dailyCap, uint256 swappedOnDay)
+    {
+        HedgeSwap.Limits storage L = _hedge;
+        return (L.router, L.slippageBps, L.inventoryCap[market], L.dailyCap, L.onDay[day]);
     }
 
     // ---------------------------------------------------------------- admin
@@ -962,7 +1041,6 @@ contract MainspringPool is IWriteCounterparty, IMatchPool, ICounterparty, ERC20,
         emit WriterBookSet(writerBook_);
     }
 
-    /// @notice Sets the WHYPE token and the market whose mark values it (once).
     function setMatchBook(address matchBook_) external onlyRole(DEFAULT_ADMIN_ROLE) {
         if (matchBook != address(0)) revert MatchBookAlreadySet();
         if (matchBook_ == address(0)) revert ZeroAddress();
@@ -999,7 +1077,7 @@ contract MainspringPool is IWriteCounterparty, IMatchPool, ICounterparty, ERC20,
         }
         liab.stopCarrying(id, raw, units, sWad, sigmaBps);
         emit AuctionFilled(id, raw, price, winner);
-        if (price > 0) _usdc.safeTransfer(winner, price);
+        if (price > 0) _settlement.safeTransfer(winner, price);
     }
 
     function setOpenBookCap(bytes32 market, uint256 cap) external onlyRole(DEFAULT_ADMIN_ROLE) {
@@ -1007,12 +1085,13 @@ contract MainspringPool is IWriteCounterparty, IMatchPool, ICounterparty, ERC20,
         emit OpenBookCapSet(market, cap);
     }
 
-    function setWhype(IERC20 whype_, bytes32 market) external onlyRole(DEFAULT_ADMIN_ROLE) {
-        if (address(whype) != address(0)) revert WhypeAlreadySet();
-        if (address(whype_) == address(0)) revert ZeroAddress();
-        whype = whype_;
-        whypeMarket = market;
-        emit WhypeSet(address(whype_), market);
+
+    /// @notice Sets the covering-asset table (once).
+    function setCoverAssets(ICoveringAssets coverAssets_) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        if (address(coverAssets) != address(0)) revert CoverAssetsAlreadySet();
+        if (address(coverAssets_) == address(0)) revert ZeroAddress();
+        coverAssets = coverAssets_;
+        emit CoverAssetsSet(address(coverAssets_));
     }
 
     function setEngine(address engine_) external onlyRole(DEFAULT_ADMIN_ROLE) {

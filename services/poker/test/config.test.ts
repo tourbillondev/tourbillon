@@ -12,7 +12,7 @@ test("arguments: role defaults to primary; exactly one key input; watch only in 
   expect(() => parseArgs(["--deployment", "d.json", "--watch", A])).toThrow("--dry-run only");
   expect(() => parseArgs(["--deployment", "d.json", "--keystore", "a", "--role", "third"])).toThrow("primary or backup");
   expect(() => parseArgs(["--deployment", "d.json", "--keystore", "a", "--private-key", "x"])).toThrow("unknown flag");
-  expect(() => checkForChain(parseArgs(["--deployment", "d.json", "--local-unlocked", A]), 99801)).toThrow("local anvil");
+  expect(() => checkForChain(parseArgs(["--deployment", "d.json", "--local-unlocked", A]), 46630)).toThrow("local anvil");
 });
 
 test("reads the M2 deployment file", () => {
@@ -21,12 +21,12 @@ test("reads the M2 deployment file", () => {
       chainId: 31337,
       PathFundingBook: "0x68b1d87f95878fe05b998f19b66f4baba5de1aed",
       Engine: "0x3aa5ebb10dc797cac828524e59a333d0a371443c",
-      markets: ["BTC", "ETH", "HYPE"],
+      markets: ["BTC", "ETH", "STK1"],
       deployBlock: 12,
     }),
   );
   expect(d.book).toBe("0x68B1D87F95878fE05B998F19b66F4baba5De1aed");
-  expect(d.markets).toEqual(["BTC", "ETH", "HYPE"]);
+  expect(d.markets).toEqual(["BTC", "ETH", "STK1"]);
   expect(d.deployBlock).toBe(12n);
   expect(d.writerBook).toBeNull();
   const m4 = parseM2Deployment(

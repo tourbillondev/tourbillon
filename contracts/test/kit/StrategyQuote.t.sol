@@ -5,8 +5,9 @@ pragma solidity 0.8.28;
 ///
 /// Changes from the kit file, and why:
 ///   1. Contracts renamed KitStrategyQuoteTest / KitStrategyWrapper / KitBlender so names do not clash with ours.
-///   2. writerCollateral takes the market name: covering units (WHYPE) count only on the HYPE market (our rule),
-///      so the covered call is written on "HYPE" and the uncovered shapes on "BTC".
+///   2. writerCollateral takes whether the market has a covering asset (RH5: CoveringAssets lists a tokenized stock as
+///      the cover of its own market only), so the covered call is written as covered (STK1) and the uncovered shapes as
+///      not (BTC). Before RH5 the rule read the market name.
 ///   3. σ passed in basis points (our unit): the fuzz test's uint256(sig) * 1e14 becomes sig.
 ///   4. test_blend: one σ for every tempo of a Movement (decision Q12; per-tempo σ is for later), Parts instead
 ///      of fixed arrays, funding per second from quote() instead of fundingPerYear, and our WeightsNotOne error.
@@ -37,16 +38,16 @@ contract KitStrategyQuoteTest is Test {
     function test_writer_of_call_spread_locks_the_width() public pure {
         // writer sells the 100 call, buys the 110 call: worst case = width 10 per unit
         StrategyMath.Leg[] memory l = _legs(true, 100e18, -1e18, true, 110e18, 1e18);
-        assertEq(StrategyMath.writerCollateral("BTC", l, 0), 10e18);
+        assertEq(StrategyMath.writerCollateral(false, l, 0), 10e18);
     }
 
     function test_cash_secured_put_locks_strike_and_covered_call_locks_nothing() public pure {
         StrategyMath.Leg[] memory p = new StrategyMath.Leg[](1);
         p[0] = StrategyMath.Leg(false, 95e18, -2e18);
-        assertEq(StrategyMath.writerCollateral("BTC", p, 0), 190e18, "2 units x strike");
+        assertEq(StrategyMath.writerCollateral(false, p, 0), 190e18, "2 units x strike");
         StrategyMath.Leg[] memory c = new StrategyMath.Leg[](1);
         c[0] = StrategyMath.Leg(true, 120e18, -1e18);
-        assertEq(StrategyMath.writerCollateral("HYPE", c, 1e18), 0, "1 WHYPE unit covers the short call");
+        assertEq(StrategyMath.writerCollateral(true, c, 1e18), 0, "1 STK1 stock unit covers the short call");
     }
 
     function test_naked_short_call_is_refused() public {
@@ -63,7 +64,7 @@ contract KitStrategyQuoteTest is Test {
         l[1] = StrategyMath.Leg(false, 90e18, -1e18); // short put
         l[2] = StrategyMath.Leg(true, 110e18, -1e18); // short call
         l[3] = StrategyMath.Leg(true, 125e18, 1e18); // long call wing (wider)
-        assertEq(StrategyMath.writerCollateral("BTC", l, 0), 15e18);
+        assertEq(StrategyMath.writerCollateral(false, l, 0), 15e18);
         (int256 mn, int256 mx, bool mnU, bool mxU) = StrategyMath.bounds(l, 0);
         assertEq(mn, -15e18);
         assertEq(mx, 0);
@@ -93,7 +94,7 @@ contract KitStrategyQuoteTest is Test {
         w = uint128(bound(w, 1e18, 100e18));
         uint128 k2 = k1 + w;
         StrategyMath.Leg[] memory l = _legs(true, k1, -1e18, true, k2, 1e18);
-        uint256 coll = StrategyMath.writerCollateral("BTC", l, 0);
+        uint256 coll = StrategyMath.writerCollateral(false, l, 0);
         // deep out of the money both values are a few wei and TempoMath's rounding can order them either way (V(95) = 4
         // wei, V(100) = 5 wei at S = 1.6): a spread worth "less than 0" by rounding is worth 0 (M4 step 6)
         uint256 v1 = TempoMath.value(true, s, k1, sig, tau);
@@ -169,7 +170,7 @@ contract KitStrategyQuoteTest is Test {
 
 contract KitStrategyWrapper {
     function collateral(bytes32 market, StrategyMath.Leg[] memory l, int256 c) external pure returns (uint256) {
-        return StrategyMath.writerCollateral(market, l, c);
+        return StrategyMath.writerCollateral(market == "STK1", l, c); // STK1 has a covering asset (as listed in CoveringAssets)
     }
 }
 

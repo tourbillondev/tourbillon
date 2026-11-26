@@ -6,6 +6,7 @@ import { createPublicClient, createWalletClient, http, parseEther, stringToHex, 
 import { foundry } from "viem/chains";
 import { revertName } from "@tourbillon/common/tx.ts";
 import { windowStart } from "../src/poke.ts";
+import { TEARDOWN_MS, hookLimit, within } from "@tourbillon/common/hooks.ts";
 
 // End to end on a local anvil: DeployM1 + DeployM2 (unlocked accounts, no key), signer votes sent directly by the
 // test (so chain time can be set window by window), and the real poker process. Skipped without anvil and forge.
@@ -13,7 +14,7 @@ const haveTools = Bun.which("anvil") !== null && Bun.which("forge") !== null;
 const CONTRACTS = resolve(import.meta.dir, "../../../contracts");
 const PORT = 19545 + Math.floor(Math.random() * 1000);
 const RPC = `http://127.0.0.1:${PORT}`;
-const MARKS: Record<string, bigint> = { BTC: parseEther("100000"), ETH: parseEther("3000"), HYPE: parseEther("40") };
+const MARKS: Record<string, bigint> = { BTC: parseEther("100000"), ETH: parseEther("3000"), STK1: parseEther("40") };
 
 const boardAbi = [
   { type: "function", name: "markKey", stateMutability: "pure", inputs: [{ type: "bytes32" }], outputs: [{ type: "bytes32" }] },
@@ -108,7 +109,7 @@ async function poker(...args: string[]): Promise<Record<string, unknown>[]> {
 const count = (lines: Record<string, unknown>[], msg: string, extra: Record<string, unknown> = {}) =>
   lines.filter((l) => l.msg === msg && Object.entries(extra).every(([k, v]) => l[k] === v)).length;
 
-beforeAll(async () => {
+beforeAll(within(import.meta.path, "setup", 180_000, async () => {
   if (!haveTools) return;
   tmp = mkdtempSync(join(tmpdir(), "poker-anvil-"));
   anvil = Bun.spawn(["anvil", "--port", String(PORT), "--silent"], { stdout: "ignore", stderr: "ignore" });
@@ -133,20 +134,20 @@ beforeAll(async () => {
   m2 = await Bun.file(m2File).json();
   await rpc("evm_increaseTime", [3600]);
   await rpc("evm_mine");
-  for (const m of ["BTC", "ETH", "HYPE"]) {
+  for (const m of ["BTC", "ETH", "STK1"]) {
     const hash = await wallet(acc[5]!).writeContract({ address: m1.MarkRouter as Address, abi: routerAbi, functionName: "applyRoute", args: [b32(m)] });
     await client.waitForTransactionReceipt({ hash });
   }
-}, 180_000);
+}), hookLimit(180_000));
 
-afterAll(() => {
+afterAll(within(import.meta.path, "teardown", TEARDOWN_MS, () => {
   anvil?.kill();
   if (tmp) rmSync(tmp, { recursive: true, force: true });
-});
+}), hookLimit(TEARDOWN_MS));
 
 test.skipIf(!haveTools)("the primary pokes every market once per window; a second pass skips", async () => {
   await setTime(windowStart(await now()) + 300 + 10);
-  await vote(["BTC", "ETH", "HYPE"]);
+  await vote(["BTC", "ETH", "STK1"]);
   const first = await poker("--local-unlocked", acc[6]!);
   expect(count(first, "poked", { status: "success" })).toBe(3);
   const again = await poker("--local-unlocked", acc[6]!);
@@ -157,7 +158,7 @@ test.skipIf(!haveTools)("the primary pokes every market once per window; a secon
 test.skipIf(!haveTools)("the backup waits until +35 s and pokes only an unsampled window", async () => {
   const w = windowStart(await now()) + 300;
   await setTime(w + 10);
-  await vote(["BTC", "ETH", "HYPE"]);
+  await vote(["BTC", "ETH", "STK1"]);
   const early = await poker("--local-unlocked", acc[7]!, "--role", "backup");
   expect(count(early, "skip", { reason: "wait" })).toBe(3);
   await setTime(w + 40);
@@ -193,7 +194,7 @@ test.skipIf(!haveTools)("the walker brings a held series back within the trade l
     ["mint", [buyer, 10n ** 12n]],
     ["approve", [m2.Engine, 10n ** 12n]],
   ] as const) {
-    const hash = await wallet(buyer).writeContract({ address: m2.MockUSDC as Address, abi: usdcAbi, functionName: fn, args: args as never });
+    const hash = await wallet(buyer).writeContract({ address: m2.SettlementToken as Address, abi: usdcAbi, functionName: fn, args: args as never });
     await client.waitForTransactionReceipt({ hash });
   }
   let hash = await wallet(buyer).writeContract({ address: m2.Engine as Address, abi: engineAbi, functionName: "buy", args: buyArgs });

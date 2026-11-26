@@ -47,7 +47,7 @@ describe("quote checks", () => {
     const q = quote(makers[0]!.address, 4000n, 1n);
     const sig = await sign(0, q);
     expect(await signedByMaker(q, sig, CHAIN, BOOK)).toBe(true);
-    expect(await signedByMaker(q, sig, 99801, BOOK)).toBe(false);
+    expect(await signedByMaker(q, sig, 46630, BOOK)).toBe(false);
     expect(await signedByMaker(q, sig, CHAIN, makers[1]!.address)).toBe(false);
     expect(await signedByMaker({ ...q, sigmaBps: 3000n }, sig, CHAIN, BOOK)).toBe(false);
     expect(await signedByMaker({ ...q, maker: makers[1]!.address }, sig, CHAIN, BOOK)).toBe(false);
@@ -174,7 +174,7 @@ describe("the HTTP side", () => {
     }
     const poor = quote(makers[2]!.address, 4000n, 1n);
     r = await post(h, "/quotes", { quote: poor, sig: await sign(2, poor) });
-    expect(((await r.json()) as { error: string }).error).toContain("no free USDC");
+    expect(((await r.json()) as { error: string }).error).toContain("no free settlement token");
     expect((await post(h, "/quotes", { quote: { maker: "nope" }, sig: "0x" })).status).toBe(400);
 
     r = await post(h, "/best", order());

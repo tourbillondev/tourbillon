@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.28;
 
+import {HedgeKeeperGate} from "../src/HedgeKeeperGate.sol";
+import {MockPoolManagerV4} from "./mocks/MockPoolManagerV4.sol";
+import {SettlementAdapter} from "../src/SettlementAdapter.sol";
+import {MockSettlementToken} from "./mocks/MockSettlementToken.sol";
 import {Vm} from "forge-std/Vm.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {TimelockController} from "@openzeppelin/contracts/governance/TimelockController.sol";
@@ -63,12 +67,15 @@ contract DeployM7Test is SafeHelpers {
         c.signers = new address[](3);
         (c.signers[0], c.signers[1], c.signers[2]) = (S1, S2, S3);
         c.delay = Governance.TESTNET_DELAY;
-        (c.caps.btc, c.caps.eth, c.caps.hype) = (5_000_000e6, 3_000_000e6, 1_000_000e6);
+        (c.caps.btc, c.caps.eth, c.caps.stk1) = (5_000_000e6, 3_000_000e6, 1_000_000e6);
+        c.stockMarkets = m7.stockMarkets7(); // STK1, bound to the session rule (the production shape)
     }
 
     function setUp() public {
         vm.chainId(31337);
-        _set(1_794_182_400);
+        // Tuesday 2026-11-10 15:00 UTC = 10:00 New York, in the regular session: STK1 is a stock market bound to the
+        // session rule (RH4), so its first mark needs the session (law 2)
+        _set(1_794_182_400 + 39 hours);
         for (uint256 i; i < 5; ++i) {
             safePks[i] = 0xA000 + i;
         }
@@ -153,13 +160,16 @@ contract DeployM7Test is SafeHelpers {
         address pool = address(_pool());
         address tl = address(d7.gov.timelock);
         address receipts = address(d7.receipts);
+        address calendar = address(d7.m1.calendar);
+        address covers = address(d7.m6.m4.covers);
+        address gate = address(d7.hedgeGate);
         // rebuild every holder set from the events
         for (uint256 i; i < deployLogs.length; ++i) {
             Vm.Log memory l = deployLogs[i];
             if (l.topics.length < 3 || (l.topics[0] != ROLE_GRANTED && l.topics[0] != ROLE_REVOKED)) continue;
             assertTrue(
                 l.emitter == board || l.emitter == router || l.emitter == engine || l.emitter == pool || l.emitter == tl
-                    || l.emitter == receipts,
+                    || l.emitter == receipts || l.emitter == calendar || l.emitter == covers || l.emitter == gate,
                 "no other contract has roles"
             );
             address who = address(uint160(uint256(l.topics[2])));
@@ -185,6 +195,8 @@ contract DeployM7Test is SafeHelpers {
         // the role map, exactly
         _exactly(board, admin, _one(tl), "board admin = the timelock");
         _exactly(router, admin, _one(tl), "router admin = the timelock");
+        _exactly(calendar, admin, _one(tl), "SessionCalendar admin = the timelock");
+        _exactly(covers, admin, _one(tl), "CoveringAssets admin = the timelock (listings, Backend section 5)");
         _exactly(engine, admin, _one(tl), "Engine admin = the timelock");
         _exactly(engine, e.PAUSER_ROLE(), _one(guardian), "Engine pauser = the guardian");
         _exactly(engine, e.UNPAUSER_ROLE(), _one(safe), "Engine unpauser = the Safe");
@@ -193,6 +205,12 @@ contract DeployM7Test is SafeHelpers {
         _exactly(pool, p.RISK_PAUSER_ROLE(), _two(guardian, RISK), "market pause = the guardian and E1");
         _exactly(pool, p.UNPAUSER_ROLE(), _one(safe), "pool unpauser = the Safe");
         _exactly(pool, p.TREASURER_ROLE(), _one(safe), "treasurer = the Safe");
+        _exactly(pool, p.HEDGER_ROLE(), _one(gate), "the hedge keeper role = the gate, never a key (C63)");
+        _exactly(gate, admin, _one(tl), "gate admin (the hedger key) = the timelock");
+        _exactly(gate, d7.hedgeGate.FREEZER_ROLE(), _one(guardian), "the guardian freezes hedging");
+        _exactly(gate, d7.hedgeGate.UNFREEZER_ROLE(), _one(safe), "only the Safe unfreezes");
+        assertEq(d7.hedgeGate.hedger(), address(0), "no hedger key until the timelock sets one");
+        assertGt(gate.code.length, 0);
         _exactly(tl, admin, _one(tl), "the timelock administers itself");
         _exactly(tl, t.PROPOSER_ROLE(), _one(safe), "only the Safe proposes");
         _exactly(tl, t.CANCELLER_ROLE(), _one(safe), "only the Safe cancels");
@@ -207,8 +225,8 @@ contract DeployM7Test is SafeHelpers {
         assertEq(RISK.code.length, 0, "E1 is a key");
         assertEq(POSTER.code.length, 0, "the poster is a key that can only post roots (G10)");
         // the deployer holds nothing anywhere, and the views agree with the events
-        address[6] memory roleContracts = [board, router, engine, pool, tl, receipts];
-        for (uint256 i; i < 6; ++i) {
+        address[9] memory roleContracts = [board, router, engine, pool, tl, receipts, calendar, covers, gate];
+        for (uint256 i; i < 9; ++i) {
             assertFalse(QuorumBoard(roleContracts[i]).hasRole(admin, address(m7)), "the deployer kept no admin");
         }
         assertTrue(p.hasRole(p.RISK_PAUSER_ROLE(), RISK));
@@ -318,11 +336,109 @@ contract DeployM7Test is SafeHelpers {
         vm.stopPrank();
     }
 
-    function test_delayRuleRefusesOneHourOffAnvilAndTheElysiumTestnet() public {
+    /// RH8b (C63): the hedge keeper gate under governance. The hedger key is set only through the timelock; the
+    /// guardian freezes at once but cannot unfreeze or change the key; the Safe unfreezes directly; nobody else acts.
+    function test_hedgeGateFreezeAndKeyThroughGovernance() public {
+        HedgeKeeperGate g = d7.hedgeGate;
+        address key = address(0x4ED6E);
+        bytes memory setKey = abi.encodeCall(HedgeKeeperGate.setHedger, (key));
+        // the Safe directly, the guardian, the deployer: refused
+        vm.expectRevert(bytes("GS013"));
+        this.execExternal(_safe(), _keys(3, false), address(g), setKey);
+        vm.expectRevert(bytes("GS013"));
+        this.execExternal(_guardian(), _keys(2, true), address(g), setKey);
+        vm.prank(address(m7));
+        vm.expectRevert();
+        g.setHedger(key);
+        // through the timelock, after the delay
+        _schedule(address(g), setKey, bytes32("gate-key"));
+        _set(nowT + Governance.TESTNET_DELAY);
+        vm.prank(ANYONE);
+        d7.gov.timelock.execute(address(g), 0, setKey, bytes32(0), bytes32("gate-key"));
+        assertEq(g.hedger(), key);
+        // the guardian freezes at once; it cannot unfreeze; the Safe unfreezes directly
+        assertTrue(_exec(_guardian(), _keys(2, true), address(g), abi.encodeCall(HedgeKeeperGate.freeze, ())));
+        assertTrue(g.frozen());
+        vm.expectRevert(bytes("GS013"));
+        this.execExternal(_guardian(), _keys(2, true), address(g), abi.encodeCall(HedgeKeeperGate.unfreeze, ()));
+        vm.prank(key);
+        vm.expectRevert(HedgeKeeperGate.Frozen.selector);
+        g.hedgeSwap("STK1", true, 1e6, 1);
+        assertTrue(_exec(_safe(), _keys(3, false), address(g), abi.encodeCall(HedgeKeeperGate.unfreeze, ())));
+        assertFalse(g.frozen());
+        // E1 and the key itself can neither freeze nor unfreeze
+        vm.prank(RISK);
+        vm.expectRevert();
+        g.freeze();
+        vm.prank(key);
+        vm.expectRevert();
+        g.unfreeze();
+    }
+
+    function test_runRefusesMainnetAndOldChains() public {
+        DeployM7 other = new DeployM7();
+        uint256[2] memory refused = [uint256(4663), 99801]; // Robinhood Chain mainnet, the old Elysium testnet
+        for (uint256 i; i < refused.length; ++i) {
+            vm.chainId(refused[i]);
+            vm.expectRevert(abi.encodeWithSelector(DeployM3.WrongChain.selector, refused[i]));
+            other.run();
+        }
+    }
+
+    /// RH7b (owner D1): the settlement token is a deploy setting. USDG (the mock) by default on anvil; a configured
+    /// token (here a USDC) is used as given with its own symbol; a token without 6 decimals is refused; a real chain
+    /// without SETTLEMENT_TOKEN is refused.
+    function test_settlementTokenIsADeploySetting() public {
+        assertEq(d7.m6.m4.m3.settlementAdapter.symbol(), "USDG");
+        assertEq(address(_pool().asset()), address(d7.m6.m4.m3.settlement));
         DeployM7 other = new DeployM7();
         DeployM7.Config7 memory c = _config();
-        vm.chainId(1);
-        vm.expectRevert(abi.encodeWithSelector(Governance.DelayTooShort.selector, 1, 1 hours, 48 hours));
+        MockSettlementToken settlementLike = new MockSettlementToken("USD Coin", "USDC", 6);
+        c.settlement = IERC20(address(settlementLike));
+        DeployM7.Deployed7 memory d = other.deploy7(c, address(other));
+        assertEq(address(d.m6.m4.m3.settlement), address(settlementLike), "the configured token, not a mock");
+        assertEq(d.m6.m4.m3.settlementAdapter.symbol(), "USDC");
+        assertEq(address(d.agents.settlement()), address(settlementLike));
+        DeployM7 third = new DeployM7();
+        MockSettlementToken eighteen = new MockSettlementToken("Eighteen", "E18", 18);
+        c.settlement = IERC20(address(eighteen));
+        vm.expectRevert(abi.encodeWithSelector(SettlementAdapter.WrongDecimals.selector, uint8(18)));
+        third.deploy7(c, address(third));
+        // a real chain: SETTLEMENT_TOKEN is required
+        vm.chainId(46630);
+        vm.setEnv("SAFE_OWNERS", "0x0000000000000000000000000000000000000a01,0x0000000000000000000000000000000000000a02,0x0000000000000000000000000000000000000a03");
+        vm.setEnv("GUARDIAN_OWNERS", "0x0000000000000000000000000000000000000b01");
+        vm.setEnv("RISK_PAUSER", "0x0000000000000000000000000000000000000c01");
+        vm.setEnv("RECEIPTS_POSTER", "0x0000000000000000000000000000000000000c02");
+        vm.setEnv("PROTOCOL_RECIPIENT", "0x0000000000000000000000000000000000000c03");
+        vm.setEnv("SIGNERS", "0x0000000000000000000000000000000000000d01");
+        vm.setEnv("SETTLEMENT_TOKEN", "0x0000000000000000000000000000000000000000");
+        vm.expectRevert(abi.encodeWithSelector(DeployM3.BadConfig.selector, "SETTLEMENT_TOKEN"));
+        other.config7FromEnv();
+        vm.setEnv("SETTLEMENT_TOKEN", vm.toString(address(settlementLike)));
+        assertEq(address(other.config7FromEnv().settlement), address(settlementLike));
+        vm.chainId(31337);
+    }
+
+    /// RH7b (Q4): with a v4 PoolManager given, the Uniswap v4 hedge router is deployed, administered by the timelock
+    /// only; without one, none.
+    function test_uniswapV4RouterDeployedUnderTheTimelock() public {
+        assertEq(address(d7.hedgeRouter), address(0));
+        DeployM7 other = new DeployM7();
+        DeployM7.Config7 memory c = _config();
+        c.poolManager = address(new MockPoolManagerV4());
+        DeployM7.Deployed7 memory d = other.deploy7(c, address(other));
+        assertEq(address(d.hedgeRouter.poolManager()), c.poolManager);
+        assertTrue(d.hedgeRouter.hasRole(bytes32(0), address(d.gov.timelock)));
+        assertFalse(d.hedgeRouter.hasRole(bytes32(0), address(other)), "the deployer holds nothing");
+        assertFalse(d.hedgeRouter.hasRole(bytes32(0), d.gov.safe));
+    }
+
+    function test_delayRuleRefusesOneHourOffAnvilAndTheRobinhoodTestnet() public {
+        DeployM7 other = new DeployM7();
+        DeployM7.Config7 memory c = _config();
+        vm.chainId(4663); // Robinhood Chain mainnet
+        vm.expectRevert(abi.encodeWithSelector(Governance.DelayTooShort.selector, 4663, 1 hours, 48 hours));
         other.deploy7(c, address(other));
         c.delay = 48 hours;
         DeployM7.Deployed7 memory d = other.deploy7(c, address(other));
@@ -346,7 +462,7 @@ contract DeployM7Test is SafeHelpers {
     function _live() internal {
         QuorumBoard b = d7.m1.board;
         _set(nowT + 1 hours); // the router's own delay for the first routes
-        bytes32[3] memory ms = [bytes32("BTC"), "ETH", "HYPE"];
+        bytes32[3] memory ms = [bytes32("BTC"), "ETH", "STK1"];
         uint256[3] memory px = [uint256(74_000e18), 2_000e18, 70e18];
         for (uint256 i; i < 3; ++i) {
             d7.m1.router.applyRoute(ms[i]);
@@ -355,9 +471,9 @@ contract DeployM7Test is SafeHelpers {
         }
         d7.m6.m4.m3.book.poke("BTC");
         MainspringPool p = _pool();
-        d7.m6.m4.m3.usdc.mint(LP, 2_000_000e6);
+        d7.m6.m4.m3.settlement.mint(LP, 2_000_000e6);
         vm.startPrank(LP);
-        d7.m6.m4.m3.usdc.approve(address(p), type(uint256).max);
+        d7.m6.m4.m3.settlement.approve(address(p), type(uint256).max);
         p.deposit(2_000_000e6);
         vm.stopPrank();
         p.startEpoch();
@@ -377,9 +493,9 @@ contract DeployM7Test is SafeHelpers {
         _live();
         MainspringPool p = _pool();
         Engine e = _engine();
-        d7.m6.m4.m3.usdc.mint(TRADER, 100_000e6);
+        d7.m6.m4.m3.settlement.mint(TRADER, 100_000e6);
         vm.prank(TRADER);
-        d7.m6.m4.m3.usdc.approve(address(e), type(uint256).max);
+        d7.m6.m4.m3.settlement.approve(address(e), type(uint256).max);
         VolQuote.Quote[] memory noQ = new VolQuote.Quote[](0);
         vm.prank(TRADER);
         (uint256 id,,) = d7.m6.openBook
@@ -425,12 +541,12 @@ contract DeployM7Test is SafeHelpers {
         _voteAll(b, eq, p.EQUITY_OFFSET());
         _set(nowT + 1 hours);
         _voteAll(b, eq, p.EQUITY_OFFSET());
-        uint256 before = IERC20(address(d7.m6.m4.m3.usdc)).balanceOf(TREASURY);
+        uint256 before = IERC20(address(d7.m6.m4.m3.settlement)).balanceOf(TREASURY);
         assertTrue(
             _exec(_safe(), _keys(3, false), address(p), abi.encodeCall(MainspringPool.sendToTreasury, (10_000e6)))
         );
-        assertEq(IERC20(address(d7.m6.m4.m3.usdc)).balanceOf(TREASURY) - before, 10_000e6);
-        // nobody else moves treasury funds
+        assertEq(IERC20(address(d7.m6.m4.m3.settlement)).balanceOf(TREASURY) - before, 10_000e6);
+        // nobody else moves treasury USDC
         vm.prank(ANYONE);
         vm.expectRevert();
         p.sendToTreasury(1);

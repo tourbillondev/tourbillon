@@ -3,6 +3,7 @@ import { resolve } from "node:path";
 import { createWalletClient, http, parseAbi, type Hex } from "viem";
 import { foundry } from "viem/chains";
 import { haveFoundry, startLocalM7, type LocalM7 } from "@tourbillon/common/localM7.ts";
+import { TEARDOWN_MS, hookLimit, within } from "@tourbillon/common/hooks.ts";
 
 // On a local anvil with DeployM7, through the MCP process itself: the read tools answer; build_mandate gives typed
 // data the owner signs (anvil eth_signTypedData_v4, no key) and whose hash equals the contract's; build_buy gives the
@@ -28,7 +29,7 @@ async function call(name: string, args: Record<string, unknown>): Promise<Record
   return r.structuredContent!;
 }
 
-beforeAll(async () => {
+beforeAll(within(import.meta.path, "setup", 240_000, async () => {
   if (!haveFoundry()) return;
   L = await startLocalM7(PORT);
   proc = Bun.spawn(["bun", "src/main.ts", "--deployment", L.m7File, "--rpc", L.rpc], { cwd: resolve(import.meta.dir, ".."), stdin: "pipe", stdout: "pipe", stderr: "pipe" });
@@ -44,11 +45,11 @@ beforeAll(async () => {
       }
     }
   })();
-}, 240_000);
-afterAll(() => {
+}), hookLimit(240_000));
+afterAll(within(import.meta.path, "teardown", TEARDOWN_MS, () => {
   proc?.kill();
   L?.stop();
-});
+}), hookLimit(TEARDOWN_MS));
 
 test.skipIf(!haveFoundry())(
   "reads, then a mandate signed by the owner, an agent buy built by the tools, the owner's exit",
@@ -69,9 +70,9 @@ test.skipIf(!haveFoundry())(
     const legs = [{ isCall: true, strike: 74000, qty: 1 }, { isCall: true, strike: 76000, qty: -1 }];
     expect((await call("shapes", { legs })).family).toBe("callSpread");
 
-    // the owner funds its wallet, allows the router, signs the mandate the tool built
-    await send(owner, m7.MockUSDC!, tokenAbi, "mint", [owner, 100_000n * 10n ** 6n]);
-    await send(owner, m7.MockUSDC!, tokenAbi, "approve", [m7.AgentRouter!, 2n ** 256n - 1n]);
+    // the owner tops up its wallet, allows the router, signs the mandate the tool built
+    await send(owner, m7.SettlementToken!, tokenAbi, "mint", [owner, 100_000n * 10n ** 6n]);
+    await send(owner, m7.SettlementToken!, tokenAbi, "approve", [m7.AgentRouter!, 2n ** 256n - 1n]);
     const expiry = Number((await client.getBlock()).timestamp) + 86_400;
     const built = await call("build_mandate", { owner, agent, markets: ["BTC"], families: ["callSpread", "putSpread"], maxPremiumPerTrade: "10000", maxPremiumTotal: "20000", deltaBudgetUsd: "500000", vegaBudgetUsd: "unlimited", expiry, nonce: 1 });
     const td = built.typedData as Record<string, unknown>;
@@ -92,7 +93,8 @@ test.skipIf(!haveFoundry())(
     expect(pos.length).toBe(1);
     expect(pos[0]!.held).toBe("agentRouter");
     const usage = await call("mandates", { mandate: message });
-    expect(Number(usage.premiumUsedUsdc)).toBeGreaterThan(0);
+    expect(Number(usage.premiumUsed)).toBeGreaterThan(0);
+    expect(usage.symbol).toBe("USDG");
     expect(Number(usage.deltaUsedUsd)).toBeGreaterThan(0);
 
     // the owner's exit, built by build_sell

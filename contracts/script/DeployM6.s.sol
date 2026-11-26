@@ -26,7 +26,7 @@ import {RiskAuction, IAuctionPool, IAuctionRouter} from "../src/RiskAuction.sol"
 ///         Then every role goes to its owner, as in DeployM3. The deployer is the admin of the vault, the MatchBook and
 ///         the VolFeed (immutable), whose only admin powers are those one-time setters, all spent here.
 /// @dev    LOCAL ONLY (anvil, chain 31337). Same settings (environment) as DeployM3, plus:
-///           OPEN_BOOK_CAP_BTC / _ETH / _HYPE  matched notional allowed per market, USDC (6 decimals); local defaults
+///           OPEN_BOOK_CAP_BTC / _ETH / _STK1  matched notional allowed per market, USDC (6 decimals); local defaults
 ///                                             are the pool's notional caps ($5M / $3M / $1M). Not a spec value: the
 ///                                             testnet figure is the owner's.
 ///         Writes deployments/<chainId>-m6.json: every key of the M4 file plus the six M6 contracts.
@@ -44,7 +44,7 @@ contract DeployM6 is DeployM4 {
     struct Caps6 {
         uint256 btc;
         uint256 eth;
-        uint256 hype;
+        uint256 stk1;
     }
 
     function run() external virtual override returns (Deployed memory d) {
@@ -57,7 +57,7 @@ contract DeployM6 is DeployM4 {
         vm.stopBroadcast();
         d = d6.m4.m3;
         _write6(c, d6, deployer);
-        console.log("MockUSDC        ", address(d.usdc));
+        console.log("SettlementToken ", address(d.settlement));
         console.log("MainspringPool  ", address(d.pool));
         console.log("Engine          ", address(d.engine));
         console.log("MakerVault      ", address(d6.vault));
@@ -71,13 +71,14 @@ contract DeployM6 is DeployM4 {
     function capsFromEnv() public view returns (Caps6 memory caps) {
         caps.btc = vm.envOr("OPEN_BOOK_CAP_BTC", uint256(5_000_000e6));
         caps.eth = vm.envOr("OPEN_BOOK_CAP_ETH", uint256(3_000_000e6));
-        caps.hype = vm.envOr("OPEN_BOOK_CAP_HYPE", uint256(1_000_000e6));
+        caps.stk1 = vm.envOr("OPEN_BOOK_CAP_STK1", uint256(1_000_000e6));
     }
 
-    /// @notice Deploys M4, then the six M6 contracts, wires them, then hands every role over.
+    /// @notice Deploys M4, then the six M6 contracts, wires them, lists STK1, then hands every role over.
     function deploy6(Config memory c, Caps6 memory caps, address deployer) public returns (Deployed6 memory d6) {
         d6 = deployCore6(c, caps, deployer);
         handOver(c, d6.m4.m3, deployer);
+        handOverCovers(d6.m4.covers, c.admin, deployer);
     }
 
     /// @notice As deploy6, keeping the admin roles (DeployM7 hands them to the Safe, guardian and timelock).
@@ -87,7 +88,7 @@ contract DeployM6 is DeployM4 {
         Deployed memory d = d4.m3;
         IEngineConfig cfg = IEngineConfig(address(d.engine));
 
-        d6.vault = new MakerVault(deployer, IERC20(address(d.usdc)), IERC20(address(d4.whype)));
+        d6.vault = new MakerVault(deployer, IERC20(address(d.settlement)), d4.covers);
         d6.matchBook = new MatchBook(deployer, d.book, cfg, d6.vault, c.router, c.board);
         // the quote book's filler is the OpenBook, deployed next
         address openBookAt = vm.computeCreateAddress(deployer, vm.getNonce(deployer) + 1);
@@ -109,10 +110,15 @@ contract DeployM6 is DeployM4 {
         d.pool.setAuction(address(d6.auction));
         d.pool.setOpenBookCap("BTC", caps.btc);
         d.pool.setOpenBookCap("ETH", caps.eth);
-        d.pool.setOpenBookCap("HYPE", caps.hype);
+        d.pool.setOpenBookCap("STK1", caps.stk1);
         d6.volFeed.setRecorder(address(d6.openBook));
         d6.openBook.setVolFeed(d6.volFeed);
         d6.openBook.setAuction(address(d6.auction));
+        // STK1's covering token, checked between every holder: the books, the vault and the pool
+        address[] memory holders = new address[](4);
+        (holders[0], holders[1], holders[2], holders[3]) =
+            (address(d4.writerBook), address(d6.matchBook), address(d6.vault), address(d.pool));
+        d4.covers.list("STK1", d4.stock, holders);
     }
 
     function _write6(Config memory c, Deployed6 memory d6, address deployer) internal {
@@ -125,8 +131,9 @@ contract DeployM6 is DeployM4 {
         vm.serializeAddress(k, "protocolRecipient", c.protocolRecipient);
         vm.serializeAddress(k, "MarkRouter", address(c.router));
         vm.serializeAddress(k, "QuorumBoard", address(c.board));
-        vm.serializeAddress(k, "MockUSDC", address(d.usdc));
-        vm.serializeAddress(k, "MockWHYPE", address(d6.m4.whype));
+        writeSettlement(k, d);
+        vm.serializeAddress(k, "MockStockToken", address(d6.m4.stock));
+        vm.serializeAddress(k, "CoveringAssets", address(d6.m4.covers));
         vm.serializeAddress(k, "MainspringPool", address(d.pool));
         vm.serializeAddress(k, "PathFundingBook", address(d.book));
         vm.serializeAddress(k, "WriterBook", address(d6.m4.writerBook));
@@ -138,7 +145,7 @@ contract DeployM6 is DeployM4 {
         vm.serializeAddress(k, "RiskAuction", address(d6.auction));
         vm.serializeBytes32(k, "equityKey", d.pool.equityKey());
         string[] memory markets = new string[](3);
-        (markets[0], markets[1], markets[2]) = ("BTC", "ETH", "HYPE");
+        (markets[0], markets[1], markets[2]) = ("BTC", "ETH", "STK1");
         vm.serializeString(k, "markets", markets);
         vm.serializeUint(k, "deployBlock", block.number);
         string memory json = vm.serializeAddress(k, "Engine", address(d.engine));

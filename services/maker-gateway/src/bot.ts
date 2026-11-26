@@ -6,9 +6,9 @@ import { domainFor, quoteTypes, SIDE_BOTH, MIN_SIGMA_BPS, MAX_SIGMA_BPS, toJson,
 
 /// A reference maker bot for the local run (LOCAL ONLY, anvil 31337). It quotes one market around the board's vol and
 /// posts each quote to the gateway. It signs through the node's unlocked account (eth_signTypedData_v4), so no private
-/// key appears anywhere. With --fund it first mints mock USDC to itself and deposits it in its MakerVault.
+/// key appears anywhere. With --deposit it first mints the mock settlement token to itself and deposits it in its MakerVault.
 ///   bun src/bot.ts --deployment <m6.json> --maker <anvil account> --market BTC [--rpc <url>] [--gateway <url>]
-///     [--sigma-offset-bps -300] [--max-units 50] [--ttl-seconds 600] [--every-seconds 60] [--fund 100000] [--once]
+///     [--sigma-offset-bps -300] [--max-units 50] [--ttl-seconds 600] [--every-seconds 60] [--deposit 100000] [--once]
 
 export type BotParams = {
   maker: Address;
@@ -51,8 +51,8 @@ const mintAbi = [
   { type: "function", name: "approve", stateMutability: "nonpayable", inputs: [{ type: "address" }, { type: "uint256" }], outputs: [{ type: "bool" }] },
 ] as const;
 
-/// Local only: mints mock USDC to the maker and deposits it in the vault.
-export async function fund(client: PublicClient, wallet: WalletClient, d: M6Deployment, maker: Address, usdc: bigint): Promise<void> {
+/// Local only: mints the mock settlement token to the maker and deposits it in the vault.
+export async function depositToVault(client: PublicClient, wallet: WalletClient, d: M6Deployment, maker: Address, usdc: bigint): Promise<void> {
   const send = async (address: Address, abi: readonly unknown[], functionName: string, args: readonly unknown[]) => {
     const hash = await wallet.writeContract({ address, abi, functionName, args, account: maker, chain: wallet.chain } as never);
     const r = await client.waitForTransactionReceipt({ hash });
@@ -63,7 +63,7 @@ export async function fund(client: PublicClient, wallet: WalletClient, d: M6Depl
   await send(d.vault, vaultAbi, "deposit", [d.usdc, usdc]);
 }
 
-/// One round: read the mark and the board, sign a fresh quote, post it. Returns the quote, or null when the market is
+/// One round: read the mark and the board, sign a fresh quote, post it. Gives the quote, or null when the market is
 /// stale (no quote: nothing would fill anyway, law 2).
 export async function quoteOnce(client: PublicClient, wallet: WalletClient, d: M6Deployment, p: BotParams, gateway: string, nonce: bigint): Promise<Quote | null> {
   const name = stringToHex(p.market, { size: 32 });
@@ -100,7 +100,7 @@ function parseArgs(argv: string[]) {
       a.set(k.slice(2), v);
     }
   }
-  const known = ["deployment", "rpc", "gateway", "maker", "market", "sigma-offset-bps", "max-units", "ttl-seconds", "every-seconds", "fund", "band-pct", "once"];
+  const known = ["deployment", "rpc", "gateway", "maker", "market", "sigma-offset-bps", "max-units", "ttl-seconds", "every-seconds", "deposit", "band-pct", "once"];
   for (const k of a.keys()) if (!known.includes(k)) throw new Error(`unknown flag --${k}`);
   const s = (k: string) => (typeof a.get(k) === "string" ? (a.get(k) as string) : undefined);
   for (const k of ["deployment", "maker", "market"]) if (!s(k)) throw new Error(`--${k} is required`);
@@ -109,7 +109,7 @@ function parseArgs(argv: string[]) {
     rpc: s("rpc"),
     gateway: s("gateway") ?? "http://127.0.0.1:8547",
     everySeconds: Math.max(1, Number(s("every-seconds") ?? 60)),
-    fund: s("fund") ? parseUnits(s("fund")!, 6) : 0n,
+    deposit: s("deposit") ? parseUnits(s("deposit")!, 6) : 0n,
     once: a.has("once"),
     p: {
       maker: getAddress(s("maker")!),
@@ -130,9 +130,9 @@ async function main(): Promise<void> {
   const client = createPublicClient({ chain, transport: http(cfg.rpc) }) as PublicClient;
   if ((await client.getChainId()) !== LOCAL_CHAIN_ID) throw new Error("the RPC is not a local anvil (31337)");
   const wallet = createWalletClient({ chain, transport: http(cfg.rpc), account: cfg.p.maker });
-  if (cfg.fund > 0n) {
-    await fund(client, wallet, d, cfg.p.maker, cfg.fund);
-    log("info", "funded the vault", { maker: cfg.p.maker, usdc: cfg.fund });
+  if (cfg.deposit > 0n) {
+    await depositToVault(client, wallet, d, cfg.p.maker, cfg.deposit);
+    log("info", "deposited in the vault", { maker: cfg.p.maker, usdc: cfg.deposit });
   }
   let nonce = BigInt(Date.now());
   let stopping = false;

@@ -177,8 +177,14 @@ contract GovernanceTest is SafeHelpers {
 
     // ---------------------------------------------------------------- 3. the delay rule (G19)
 
-    function test_delayRuleOneHourOnlyOnAnvilAndTheElysiumTestnet() public {
+    function test_delayRuleOneHourOnlyOnAnvilAndTheRobinhoodTestnet() public {
         dep.check(31337, 1 hours);
+        dep.check(46630, 1 hours);
+        dep.check(4663, 48 hours);
+        // Robinhood Chain mainnet, and the old Elysium testnet, need the full 48 h
+        vm.expectRevert(abi.encodeWithSelector(Governance.DelayTooShort.selector, 4663, 1 hours, 48 hours));
+        dep.check(4663, 1 hours);
+        vm.expectRevert(abi.encodeWithSelector(Governance.DelayTooShort.selector, 99801, 1 hours, 48 hours));
         dep.check(99801, 1 hours);
         dep.check(1, 48 hours);
         dep.check(999_999, 72 hours);
@@ -192,7 +198,7 @@ contract GovernanceTest is SafeHelpers {
         dep.timelock(address(admin), 1 hours);
         TimelockController main = dep.timelock(address(admin), 48 hours);
         assertEq(main.getMinDelay(), 48 hours);
-        vm.chainId(99801);
+        vm.chainId(46630);
         assertEq(dep.timelock(address(admin), 1 hours).getMinDelay(), 1 hours);
     }
 

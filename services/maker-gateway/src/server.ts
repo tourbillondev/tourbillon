@@ -10,7 +10,7 @@ import { QuoteStore, type QuoteState } from "./store.ts";
 ///   GET  /health                                 → 200 { quotes, chainId, quoteBook }
 ///
 /// A quote is accepted when: its terms are sound, it is signed by its maker for this chain and VolQuoteBook, it has not
-/// expired (chain time), its nonce is not cancelled and has room left, and the maker's vault holds some free USDC.
+/// expired (chain time), its nonce is not cancelled and has room left, and the maker's vault holds some free settlement token.
 
 export type Chain = QuoteState & {
   chainId: number;
@@ -33,7 +33,7 @@ export function makeHandler(chain: Chain, store = new QuoteStore()) {
     const [filled, cancelled, free] = await Promise.all([chain.filled(quote.maker, quote.nonce), chain.cancelled(quote.maker, quote.nonce), chain.freeUsdc(quote.maker)]);
     if (cancelled) return bad("nonce cancelled");
     if (filled >= quote.maxUnits) return bad("fully filled");
-    if (free === 0n) return bad("the maker's vault has no free USDC");
+    if (free === 0n) return bad("the maker's vault has no free settlement token");
     store.add({ quote, sig, receivedAt: Date.now() });
     return json({ accepted: true });
   }

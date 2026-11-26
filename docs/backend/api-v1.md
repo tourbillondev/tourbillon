@@ -3,8 +3,10 @@
 Read-only, open, no keys. Each IP may make 120 requests a minute (a `429` answer means wait a minute). Every answer is
 JSON. The machine-readable description is `services/api/openapi.json`.
 
-**Units.** USDC amounts are decimal strings with 6 decimals (`"1234.567891"`). Strikes, marks and units are decimal
-strings. Times are Unix seconds. Markets at launch: `BTC`, `ETH`, `HYPE`.
+**Units.** Amounts are in the settlement token (USDG on Robinhood Chain; its symbol and decimals are in
+`/v1/status`), as decimal strings (`"1234.567891"`). Strikes, marks and units are decimal strings. Times are Unix
+seconds. Markets at launch: two or three tokenized stocks and `BTC`, `ETH` (`STK1` stands for a stock until the
+listings are confirmed).
 
 **Prices.** `/v1/chains` values are indicative (the closed form at the board's vol, before the spread and fee).
 `/v1/quote/buy` is the exact cost a buy would pay at the current block. A buy itself always sets a `maxCost`.
@@ -14,7 +16,8 @@ Whether opens are running, the pool's state, and the freshness of each market's 
 
 ```json
 {
-  "chainId": 99801, "block": "1234567", "blockTime": 1795000000,
+  "chainId": 46630, "settlement": { "token": "0x…", "symbol": "USDG", "decimals": 6 },
+  "block": "1234567", "blockTime": 1795000000,
   "opens": { "buysPaused": false, "drawdownPaused": false, "depositsPaused": false },
   "pool": { "nav": "5000000", "navPerShare": "1", "lastSettlement": 1794996400, "available": "4990000", "stressedLiability": "12000", "covered": true },
   "markets": [{ "market": "BTC", "markFresh": true, "volFresh": true, "opensPaused": false }],
@@ -23,16 +26,21 @@ Whether opens are running, the pool's state, and the freshness of each market's 
 ```
 - `opens.buysPaused`: all opens paused (the guardian). `drawdownPaused`: opens paused after a 15% drawdown in 30 days.
   `depositsPaused`: new pool deposits paused. **Sells and withdrawals are never paused.**
+- `settlement`: the settlement token, its symbol and decimals as the deployment read them from the token. Every
+  amount in this API is in this token.
 - A market whose mark or vol is not fresh accepts no opens; sells use the last good sample.
-- `pool.covered`: USDC on Elysium covers the stressed liability. NAV moves with the book and can fall.
+- `pool.covered`: the pool's available settlement token covers the stressed liability. NAV moves with the book and can
+  fall.
 
 ## GET /v1/markets
-Each market's listing, spread (basis points of the option price), strike step, mark, vol, caps and their use.
+Each market's kind, listing, spread (basis points of the option price), strike step, mark, vol, caps and their use.
 
 ```json
-{ "markets": [{ "market": "BTC", "listed": true, "spreadBps": 200, "strikeStep": "100", "mark": "74000", "volBps": 4500,
+{ "markets": [{ "market": "BTC", "kind": "crypto", "listed": true, "spreadBps": 200, "strikeStep": "100", "mark": "74000", "volBps": 4500,
   "opensPaused": false, "caps": { "notional": "5000000", "notionalUsed": "120000", "directional": "1000000", "directionalUsed": "40000" } }] }
 ```
+- `kind`: `stock` (a tokenized stock, listed in the covering-asset table and hedged on Robinhood Chain) or `crypto`.
+  Stock markets' open caps are a quarter of these on US market holidays and weekends; sells are never capped.
 
 ## GET /v1/chains/{market}?tempos=3600,86400&strikes=3
 Indicative call and put values per unit around the mark, for each tempo (seconds, 3,600 to 2,592,000), at the board's
@@ -44,12 +52,12 @@ vol. `strikes` (1 to 10) is how many strikes on each side of the money.
 ```
 
 ## GET /v1/quote/buy?market=BTC&legs=call:74000:1,call:76000:-1&tempo=86400&units=2
-The exact cost (premium plus fee, USDC) of buying `units` of a shape now, from the cheapest of the pool and the makers'
+The exact cost (premium plus fee, in the settlement token) of buying `units` of a shape now, from the cheapest of the pool and the makers'
 signed quotes. `legs` are the buyer's side, `call|put:strike:amount`, comma-separated, 1 to 4 legs. Only shapes a buyer
 can hold (the payoff never goes below 0) can be quoted.
 
 ```json
-{ "market": "BTC", "quoted": true, "cost": "1903.443120", "source": "pool", "makerQuotesConsidered": 2 }
+{ "market": "BTC", "quoted": true, "cost": "1903.443120", "symbol": "USDG", "source": "pool", "makerQuotesConsidered": 2 }
 ```
 If the buy would not go through (a stale mark, a paused market, a shape a buyer cannot hold, a cap), the answer is
 `{ "quoted": false, "reason": "…" }`.
@@ -66,7 +74,7 @@ mandate. `units` are at the series' current norm (`raw × norm`).
 
 ## GET /v1/receipts/proof?tx=0x…&logIndex=N
 The Merkle proof of a receipt: a trade, a vol final or a NAV snapshot. Every hour's receipts are committed in one root
-on Elysium (`ReceiptRoots`); anyone can check a receipt with `ReceiptRoots.verify(epoch, leaf, proof)` or rebuild the
+on Robinhood Chain (`ReceiptRoots`); anyone can check a receipt with `ReceiptRoots.verify(epoch, leaf, proof)` or rebuild the
 root from the chain's events.
 
 ```json

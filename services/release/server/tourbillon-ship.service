@@ -1,0 +1,14 @@
+# The release system (runs all the time; does nothing until armed with: tourbillon-release arm "<UTC time>")
+[Unit]
+Description=Tourbillon release system (the 62 tech updates)
+After=network-online.target
+
+[Service]
+User=tourbillon
+WorkingDirectory=/home/tourbillon/tourbillon-ship/services/release
+ExecStart=/home/tourbillon/.bun/bin/bun src/main.ts --config /home/tourbillon/.tourbillon-release/release.json
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

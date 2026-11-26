@@ -1,15 +1,23 @@
 # risk-monitor
 
 Watches the venue, the Mainspring pool's risk state and the services' liveness, and writes **alarm lines** in a stable
-shape. Its only on-chain action: after 15 minutes of continuous venue outage on a market it pauses opens there with
-the pause-only `RISK_PAUSER` key. It can never unpause (only the admin can).
+shape. Its only on-chain action: pausing opens on one market with the pause-only `RISK_PAUSER` key, after 15 minutes
+of continuous venue outage there, or at once on a split. It can never unpause (only the Safe can). Alarm names are the
+playbook's: lower-dash, posted with the market joined (`mark-stale-STK1`).
 
 ## Every pass (60 s)
-- **Venue outage, per market:** down while Hyperliquid's info API fails, the market is missing or has no mark, its
-  mark differs from the router's by more than 1%, or the hedger's status file says hedging is failing there. After
-  15 minutes continuous: `pauseMarket` (once), then `VENUE_RECOVERED` when healthy again.
-- **Hourly equity check:** the board's EQUITY against an independent recompute from Hyperliquid's API; alarm above
-  max(1% of the account value, $1,000). `EQUITY_NOT_READY` while capital is outside Elysium.
+- **Venue outage, per market** (Backend §6): a crypto market is down while the crypto hedge exchange fails, lists no
+  mark for it, or its mark differs from the router's by more than 1%; any market is down while its hedger's status
+  file says hedging is failing there (for a stock market: hedger-onchain, which also reports a missing router). After
+  15 minutes continuous: `pauseMarket` (once), then `venue-recovered` when healthy again.
+- **Hourly equity check:** the board's EQUITY against an independent recompute from the exchange account (read-only
+  key); alarm above max(1% of the account value, $1,000). `equity-not-ready` while capital is at the exchange.
+- **Stock markets** (`src/rh.ts`): `split-mismatch` (a stock MARK round whose quorum median is a split ratio away from
+  the published value: opens on that market pause at once), `session-anchored` (information: outside the session the
+  mark was held in its band), `transfer-stuck` (a covering token could not move; the pool paused that market),
+  `quarter-cap-high` (a closed-day quarter cap nearly used), `inventory-mismatch` (the pool's stock holding off
+  hedger-onchain's target by more than twice the band), `dex-down` / `cex-down` (a venue down 5 minutes, before the
+  15-minute pause); `hedger-silent` per hedger.
 - **Alarms only:** every treasury send and return; coverage headroom under 10% or breached; cap use over 90%; the
   drawdown pause; stale mark or vol (signers); no sample for 15 min (poker); no settlement for 2 h (keeper); hedger
   status older than 5 min.
@@ -26,11 +34,12 @@ The shape is made for a staff alert bot (Telegram) to post later.
 ## Run
 ```
 bun src/main.ts --deployment ../../contracts/deployments/<chainId>-m3.json --keystore <risk pauser> \
-  --hl-user <pool's Hyperliquid address> [--hedger-status <hedger's --status-file>]
+  [--exchange <name> [--exchange-url <url>]] [--hedger-status <cex status file>,<onchain status file>]
 ```
-`--watch <address>` raises the same alarms without pausing. `--local-unlocked` and `--hl-api` are anvil only.
+`--watch <address>` raises the same alarms without pausing. `--local-unlocked` and `--exchange sim` are anvil only;
+any other exchange is refused until the owner picks it (Q5).
 `--outage-minutes`, `--tick-seconds` and `--equity-every-seconds` change the defaults (15, 60, 3600).
 
 ## Test
-`bun test`: units, plus an anvil run (DeployM1 + DeployM3, a simulated Hyperliquid venue) when anvil and forge are
-installed.
+`bun test`: units, plus an anvil run (DeployM1 + DeployM3, the simulated crypto hedge exchange) when anvil and forge
+are installed.

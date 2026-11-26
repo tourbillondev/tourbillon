@@ -55,10 +55,10 @@ contract PausesTest is MainspringPoolBase {
         vm.prank(B);
         pool.claimShares(queuedRound);
         assertGt(pool.balanceOf(B), 0, "the queued deposit settled into shares");
-        uint256 usdcA = usdc.balanceOf(A);
+        uint256 settlementA = settlement.balanceOf(A);
         vm.prank(A);
         pool.withdraw(queuedRound);
-        assertGt(usdc.balanceOf(A), usdcA, "withdrawals are never paused");
+        assertGt(settlement.balanceOf(A), settlementA, "withdrawals are never paused");
         _sell(id, ALL); // sells are never paused
         vm.prank(A);
         pool.requestWithdraw(1e18);

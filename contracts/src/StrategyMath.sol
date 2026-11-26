@@ -10,15 +10,14 @@ import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 ///         time, so it always lies between the payoff's minimum and maximum over all prices. Locking
 ///         max(0, −min payoff) therefore covers the writer at any moment, not just at a date.
 /// @dev    Legs are calls and puts with a signed quantity (WAD units; + long, − short), at most four.
-///         A writer may also lock covering units: WHYPE, counted only on the HYPE market, worth S each.
+///         A writer may also lock covering units: the market's own tokenized stock (CoveringAssets), worth S each;
+///         a market without a covering asset (crypto) takes none.
 ///         Payoffs are piecewise linear in S with kinks at the strikes, so the bounds are exact: evaluate
 ///         at 0 and at every strike, plus the slope above the top strike, at WAD × WAD scale with no per-term
-///         division; results are WAD USDC rounded against the writer (M4 step 8).
+///         division; results are WAD settlement token rounded against the writer (M4 step 8).
 library StrategyMath {
     uint256 internal constant WAD = 1e18;
     uint256 internal constant MAX_LEGS = 4;
-    /// @dev The only market on which covering units (WHYPE) count. kHYPE waits for a rate source.
-    bytes32 internal constant COVER_MARKET = "HYPE";
 
     struct Leg {
         bool isCall;
@@ -29,7 +28,7 @@ library StrategyMath {
     error TooManyLegs();
     error Unbounded();
     error NegativeCover();
-    error CoverNotAllowed(bytes32 market);
+    error CoverNotAllowed();
 
     /// @notice Payoff of the legs plus `coverQty` covering units worth S each, at price S, at WAD × WAD scale: exact,
     ///         with no per-term division (M4 step 8 fix: dividing each term truncated it towards zero, so a minimum
@@ -43,12 +42,12 @@ library StrategyMath {
         }
     }
 
-    /// @notice Payoff (WAD USDC) at price S, rounded towards −∞ (never above the true payoff).
+    /// @notice Payoff (WAD settlement token) at price S, rounded towards −∞ (never above the true payoff).
     function payoffAt(Leg[] memory legs, int256 coverQty, uint256 sWad) internal pure returns (int256) {
         return _floorWad(payoffAtScaled(legs, coverQty, sWad));
     }
 
-    /// @notice Minimum and maximum of the payoff over S in [0, ∞) (WAD USDC; the minimum rounded towards −∞ and the
+    /// @notice Minimum and maximum of the payoff over S in [0, ∞) (WAD settlement token; the minimum rounded towards −∞ and the
     ///         maximum towards +∞, so each bound holds exactly). `minUnbounded` / `maxUnbounded` flag a non-zero slope
     ///         above the highest strike (calls and covering units have slope there; puts do not).
     function bounds(Leg[] memory legs, int256 coverQty)
@@ -89,12 +88,13 @@ library StrategyMath {
         if (x % int256(WAD) != 0 && x < 0) q -= 1;
     }
 
-    /// @notice USDC a writer must lock for the legs they sell (legs from the writer's side: short = negative),
-    ///         given `coverQty` WHYPE units locked alongside. Covering units count only on the HYPE market.
+    /// @notice settlement token a writer must lock for the legs they sell (legs from the writer's side: short = negative),
+    ///         given `coverQty` covering units locked alongside. Covering units count only where the market has a
+    ///         covering asset (`coverAllowed`, from CoveringAssets: a stock covers Rises on its own market only).
     ///         Reverts if the liability is unbounded (a naked short call).
-    function writerCollateral(bytes32 market, Leg[] memory legs, int256 coverQty) internal pure returns (uint256) {
+    function writerCollateral(bool coverAllowed, Leg[] memory legs, int256 coverQty) internal pure returns (uint256) {
         if (coverQty < 0) revert NegativeCover();
-        if (coverQty > 0 && market != COVER_MARKET) revert CoverNotAllowed(market);
+        if (coverQty > 0 && !coverAllowed) revert CoverNotAllowed();
         (int256 minS,, bool minUnbounded,) = _boundsScaled(legs, coverQty);
         if (minUnbounded) revert Unbounded();
         // Covering units are worth 0 at S = 0, so they never count as cash; they only offset the upside

@@ -78,7 +78,7 @@ async function tick(ctx: Ctx, lastMissed: Map<string, number>): Promise<void> {
   }
 }
 
-/// Returns the market's latest sample time after this pass (0 if none).
+/// Gives the market's latest sample time after this pass (0 if none).
 async function pokeMarket(ctx: Ctx, market: string, now: number, gasPaused: boolean, lastMissed: Map<string, number>): Promise<number> {
   const { client, dep, signer, cfg } = ctx;
   const name = stringToHex(market, { size: 32 });

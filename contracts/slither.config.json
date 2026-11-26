@@ -1,0 +1,4 @@
+{
+  "filter_paths": "test/|script/|lib/",
+  "triage_database": "slither.db.json"
+}

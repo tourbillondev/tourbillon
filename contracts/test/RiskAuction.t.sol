@@ -15,7 +15,9 @@ import {MatchBook} from "../src/MatchBook.sol";
 import {OpenBook, IEngineOpenFor} from "../src/OpenBook.sol";
 import {RiskAuction, IAuctionPool, IAuctionRouter} from "../src/RiskAuction.sol";
 import {IEngineConfig} from "../src/WriterBook.sol";
-import {MockWHYPE} from "./mocks/MockWHYPE.sol";
+import {MockStockToken} from "./mocks/MockStockToken.sol";
+import {CoverFixture} from "./mocks/CoverFixture.sol";
+import {CoveringAssets} from "../src/CoveringAssets.sol";
 import {MockMarks} from "./Engine.t.sol";
 
 /// Pricing in its own call frame (keeps the tests' stacks shallow).
@@ -34,7 +36,7 @@ contract SlicePricer {
 /// M6 step 9: the weekly sealed risk auction, on the full stack.
 contract RiskAuctionTest is MainspringPoolBase {
     uint256 constant S = 70_000e18;
-    MockWHYPE whype;
+    MockStockToken stock;
     MakerVault vault;
     MatchBook mb;
     OpenBook ob;
@@ -44,8 +46,8 @@ contract RiskAuctionTest is MainspringPoolBase {
     function setUp() public override {
         super.setUp();
         _seed(10_000_000e6);
-        whype = new MockWHYPE();
-        vault = new MakerVault(address(this), IERC20(address(usdc)), IERC20(address(whype)));
+        stock = new MockStockToken("Mock Stock One", "STK1", 18);
+        vault = new MakerVault(address(this), IERC20(address(settlement)), CoverFixture.listed(address(this), address(marks), IERC20(address(stock))));
         mb = new MatchBook(address(this), book, IEngineConfig(address(engine)), vault, marks, vols);
         address obAt = vm.computeCreateAddress(address(this), vm.getNonce(address(this)) + 1);
         VolQuoteBook qb = new VolQuoteBook(obAt);
@@ -65,10 +67,10 @@ contract RiskAuctionTest is MainspringPoolBase {
         ob.setAuction(address(ra));
         pool.setOpenBookCap(BTC, 1e15);
         for (uint256 i; i < 3; ++i) {
-            usdc.mint(mk[i], 50_000_000e6);
+            settlement.mint(mk[i], 50_000_000e6);
             vm.startPrank(mk[i]);
-            usdc.approve(address(vault), type(uint256).max);
-            vault.deposit(IERC20(address(usdc)), 20_000_000e6);
+            settlement.approve(address(vault), type(uint256).max);
+            vault.deposit(IERC20(address(settlement)), 20_000_000e6);
             vm.stopPrank();
         }
     }
@@ -106,7 +108,7 @@ contract RiskAuctionTest is MainspringPoolBase {
     }
 
     function _locked(uint256 i) internal view returns (uint256) {
-        return vault.lockedOf(mk[i], IERC20(address(usdc)));
+        return vault.lockedOf(mk[i], IERC20(address(settlement)));
     }
 
     SlicePricer pricer;
@@ -176,17 +178,17 @@ contract RiskAuctionTest is MainspringPoolBase {
         book.accrue(id, type(uint256).max);
         uint256 units = Math.mulDiv(10e18, book.normNow(id), 1e18);
         uint256 price = _price(legs, units, 3500, false);
-        uint256 poolBefore = usdc.balanceOf(address(pool));
-        uint256 winnerBefore = usdc.balanceOf(mk[1]);
+        uint256 poolBefore = settlement.balanceOf(address(pool));
+        uint256 winnerBefore = settlement.balanceOf(mk[1]);
         ra.settle(lotId);
         RiskAuction.Lot memory l = ra.lot(lotId);
         assertEq(l.winner, mk[1], "the lowest revealed sigma");
         assertEq(l.price, price);
-        assertEq(usdc.balanceOf(mk[1]) - winnerBefore, price, "the pool pays the winner its price");
+        assertEq(settlement.balanceOf(mk[1]) - winnerBefore, price, "the pool pays the winner its price");
         // bonds: the loser's released, the unrevealed one paid to the pool, the winner's replaced by exact collateral
         assertEq(_locked(0), 0);
         assertEq(_locked(2), 0);
-        assertEq(usdc.balanceOf(address(pool)), poolBefore - price + bond, "the unrevealed bond went to the pool");
+        assertEq(settlement.balanceOf(address(pool)), poolBefore - price + bond, "the unrevealed bond went to the pool");
         bytes32 key = keccak256(abi.encode(uint8(1), mk[1], uint256(0)));
         (uint256 raw,,, uint256 lockedU,,) = mb.entries(key, id);
         assertEq(raw, 10e18);
@@ -265,18 +267,18 @@ contract RiskAuctionTest is MainspringPoolBase {
         _set(nowT + 3 days + 1);
         _reveal(lotId, 0, 3500);
         _reveal(lotId, 1, 4000);
-        uint256 free0 = vault.freeOf(mk[0], IERC20(address(usdc)));
+        uint256 free0 = vault.freeOf(mk[0], IERC20(address(settlement)));
         vm.prank(mk[0]);
-        vault.withdraw(IERC20(address(usdc)), free0);
+        vault.withdraw(IERC20(address(settlement)), free0);
         _set(nowT + 1 days);
         marks.set(BTC, S);
         book.record(BTC, S, 4500);
-        uint256 poolBefore = usdc.balanceOf(address(pool));
+        uint256 poolBefore = settlement.balanceOf(address(pool));
         ra.settle(lotId);
         assertEq(ra.lot(lotId).winner, mk[1], "the next revealed bid, within the reserve");
         assertEq(_locked(0), 0);
-        assertEq(vault.freeOf(mk[0], IERC20(address(usdc))), 0, "maker 0's bond went to the pool");
-        assertEq(usdc.balanceOf(address(pool)), poolBefore + bond - ra.lot(lotId).price);
+        assertEq(vault.freeOf(mk[0], IERC20(address(settlement))), 0, "maker 0's bond went to the pool");
+        assertEq(settlement.balanceOf(address(pool)), poolBefore + bond - ra.lot(lotId).price);
 
         // the same, but the next bid is above the reserve: no fill
         _set(nowT + 7 days);
@@ -285,15 +287,15 @@ contract RiskAuctionTest is MainspringPoolBase {
         _poolSells(_spread(70_000e18, 76_000e18), 20e18); // a new largest carried series
         lotId = ra.start(BTC);
         vm.prank(mk[0]);
-        vault.deposit(IERC20(address(usdc)), 1_000_000e6); // maker 0 funds its vault again
+        vault.deposit(IERC20(address(settlement)), 1_000_000e6); // maker 0 deposits into its vault again
         _commit(lotId, 2, 3500);
         _commit(lotId, 0, 30_000);
         _set(nowT + 3 days + 1);
         _reveal(lotId, 2, 3500);
         _reveal(lotId, 0, 30_000);
-        uint256 free2 = vault.freeOf(mk[2], IERC20(address(usdc)));
+        uint256 free2 = vault.freeOf(mk[2], IERC20(address(settlement)));
         vm.prank(mk[2]);
-        vault.withdraw(IERC20(address(usdc)), free2);
+        vault.withdraw(IERC20(address(settlement)), free2);
         _set(nowT + 1 days);
         marks.set(BTC, S);
         book.record(BTC, S, 4500);

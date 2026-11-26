@@ -6,6 +6,7 @@ import { connect, migrate, type Db } from "../../indexer/src/db.ts";
 import { indexOnce, loadDep as loadIndexerDep } from "../../indexer/src/main.ts";
 import { loadDep, makeReads } from "../src/chain.ts";
 import { makeApi, type PositionRow } from "../src/server.ts";
+import { TEARDOWN_MS, hookLimit, within } from "@tourbillon/common/hooks.ts";
 
 // On a local anvil with DeployM7 and a throwaway Postgres fed by the indexer: the API's status and markets reflect the
 // chain; the buy quote equals the cost of the real buy that follows; positions equal the book's balances with live
@@ -29,18 +30,18 @@ const abi = parseAbi([
 ]);
 const W = 10n ** 18n;
 
-beforeAll(async () => {
+beforeAll(within(import.meta.path, "setup", 240_000, async () => {
   if (!ok) return;
   L = await startLocalM7(PORT);
   P = await startLocalPg(PORT + 1000);
   db = connect(P.url);
   await migrate(db);
-}, 240_000);
-afterAll(async () => {
+}), hookLimit(240_000));
+afterAll(within(import.meta.path, "teardown", TEARDOWN_MS, async () => {
   await db?.close();
   P?.stop();
   L?.stop();
-});
+}), hookLimit(TEARDOWN_MS));
 
 test.skipIf(!ok)(
   "status, markets, chains; the quote equals the real buy's cost; positions with live units",
@@ -62,9 +63,12 @@ test.skipIf(!ok)(
     expect(st.status).toBe(200);
     expect((st.body.pool as Record<string, unknown>).nav).toBe("5000000");
     expect((st.body.pool as Record<string, unknown>).covered).toBe(true);
+    expect(st.body.settlement).toMatchObject({ symbol: "USDG", decimals: 6 }); // from the deployment file (owner D1)
     expect((st.body.markets as { markFresh: boolean }[]).every((m) => m.markFresh)).toBe(true);
     const mk = await get("/v1/markets");
     const btc = (mk.body.markets as Record<string, unknown>[]).find((m) => m.market === "BTC")!;
+    expect(btc.kind).toBe("crypto");
+    expect((mk.body.markets as Record<string, unknown>[]).find((m) => m.market === "STK1")!.kind).toBe("stock"); // listed in the covering-asset table
     expect(btc.mark).toBe("74000");
     expect(btc.spreadBps).toBe(200);
     const ch = await get("/v1/chains/BTC?strikes=2&tempos=86400");
@@ -75,8 +79,8 @@ test.skipIf(!ok)(
     if (q.body.quoted !== true) throw new Error(`quote: ${JSON.stringify(q.body)}`);
     expect(q.body.source).toBe("pool");
     const T = acc[16]!;
-    await send(T, m7.MockUSDC!, abi, "mint", [T, 1_000_000n * 10n ** 6n]);
-    await send(T, m7.MockUSDC!, abi, "approve", [m7.Engine!, 1_000_000n * 10n ** 6n]);
+    await send(T, m7.SettlementToken!, abi, "mint", [T, 1_000_000n * 10n ** 6n]);
+    await send(T, m7.SettlementToken!, abi, "approve", [m7.Engine!, 1_000_000n * 10n ** 6n]);
     const legs = [
       { isCall: true, kWad: 74_000n * W, qty: W },
       { isCall: true, kWad: 76_000n * W, qty: -W },

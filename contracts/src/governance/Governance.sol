@@ -29,7 +29,8 @@ interface ISafeSetup {
 ///         action goes through (M7 decisions G1, G2, G3, G19).
 ///         - Timelock: OpenZeppelin TimelockController. The Safe proposes and cancels; anyone executes once the delay
 ///           has passed; no admin (the timelock administers itself).
-///         - Delay (owner, G19): 1 h on anvil (31337) and the Elysium testnet (99801); at least 48 h on any other chain.
+///         - Delay (owner, G19): 1 h on anvil (31337) and the Robinhood Chain testnet (46630, (U)); at least 48 h on any
+///           other chain, Robinhood Chain mainnet (4663) included.
 /// @dev    Internal functions only: they run inside the deploying contract or script, so the deployer holds no role in
 ///         anything they create.
 library Governance {
@@ -40,14 +41,14 @@ library Governance {
     uint256 internal constant MAINNET_MIN_DELAY = 48 hours;
     uint256 internal constant TESTNET_DELAY = 1 hours;
     uint256 internal constant ANVIL = 31337;
-    uint256 internal constant ELYSIUM_TESTNET = 99801;
+    uint256 internal constant ROBINHOOD_TESTNET = 46630; // from the studio's record, not the spec: (U) until probed
 
     error DelayTooShort(uint256 chainId, uint256 delay, uint256 minimum);
     error BadOwners(uint256 given, uint256 expected);
 
-    /// @notice Reverts unless `delay` is allowed on `chainId`: at least 48 h, except on anvil and the Elysium testnet.
+    /// @notice Reverts unless `delay` is allowed on `chainId`: at least 48 h, except on anvil and the Robinhood Chain testnet.
     function checkDelay(uint256 chainId, uint256 delay) internal pure {
-        if (chainId == ANVIL || chainId == ELYSIUM_TESTNET) return;
+        if (chainId == ANVIL || chainId == ROBINHOOD_TESTNET) return;
         if (delay < MAINNET_MIN_DELAY) revert DelayTooShort(chainId, delay, MAINNET_MIN_DELAY);
     }
 

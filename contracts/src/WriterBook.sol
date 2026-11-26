@@ -3,13 +3,14 @@ pragma solidity 0.8.28;
 
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
-import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 import {PathFundingBook, IMarkRouter, IVolSource} from "./PathFundingBook.sol";
 import {TempoBlend} from "./TempoBlend.sol";
 import {EnginePricing} from "./EnginePricing.sol";
 import {StrategyMath} from "./StrategyMath.sol";
 import {IWriteCounterparty} from "./IWriteCounterparty.sol";
+import {ICoveringAssets} from "./CoveringAssets.sol";
+import {CoverLedger, ICoverOutage} from "./CoverLedger.sol";
 
 interface IEngineConfig {
     function markets(bytes32 market) external view returns (bool listed, uint16 spreadBps, uint128 strikeStepWad);
@@ -18,24 +19,29 @@ interface IEngineConfig {
 
 /// @title WriterBook
 /// @notice Writing any shape against exact collateral (M4). The writer locks the exact worst case of what they sell:
-///         USDC, and on HYPE optionally WHYPE covering short calls. The pool takes the other side at its bid (D1).
+///         settlement token, and on a tokenized-stock market optionally that stock covering short calls (CoveringAssets: a stock
+///         covers Rises on its own market only). The pool takes the other side at its bid (D1).
 /// @dev    - Legs are the writer's own position (+ long, − short). The book series is the pool's side (the legs
 ///           negated), opened through the book's `openShape` (one spelling per shape, the complexity cap).
-///         - Collateral per shape unit is StrategyMath's exact worst case: `usdcPerUnit` (WAD USDC) given
-///           `coverPerUnit` WHYPE (WAD), which is exactly the net short calls when the writer asks for cover.
-///           Locked = units × per unit, rounded up (law 4).
+///         - Collateral per shape unit is StrategyMath's exact worst case: `settlementPerUnit` (WAD settlement token) given
+///           `coverPerUnit` covering units (WAD of the stock), which is exactly the net short calls when the writer asks
+///           for cover. Locked = units × per unit, rounded up, in the token's own units (law 4).
+///         - Covering tokens move through CoverLedger: a pull must arrive exactly; at write time the token must not be
+///           paused and its restriction check (where it has one) must allow writer → book and book → pool. A covering
+///           token that cannot move later is kept owed (anyone settles it once transfers work) and opens on that
+///           market pause (owner D3); settlement token payments go on.
 ///         - A write's obligation is raw × the series' shared decay factor. The factor never rises (D2), so the
-///           obligation only shrinks; `claim` returns what is no longer required (the funding received).
+///           obligation only shrinks; `claim` sends back what is no longer required (the funding received).
 ///         - `unwrite` buys back at the pool's ask, capped at the collateral's value at the unwrite's mark, paid from
-///           locked USDC, then locked WHYPE at that mark, then the writer's wallet. Never paused; the last recorded
+///           locked settlement token, then the locked cover at that mark, then the writer's wallet. Never paused; the last recorded
 ///           sample prices it when the mark or vol is stale (as a sell).
 ///         - Writes follow the Engine's markets, spreads and buy pause; the pool refuses writes while opens or the
 ///           market are paused.
-contract WriterBook is ReentrancyGuard {
+contract WriterBook is CoverLedger {
     using SafeERC20 for IERC20;
 
     uint256 internal constant WAD = 1e18;
-    uint256 internal constant WAD_PER_USDC_UNIT = 1e12;
+    uint256 internal constant WAD_PER_SETTLEMENT_UNIT = 1e12;
     uint256 public constant TRADE_MAX_STEPS = 16;
 
     struct Write {
@@ -43,10 +49,10 @@ contract WriterBook is ReentrancyGuard {
         bytes32 market;
         uint256 seriesId;
         uint256 raw;
-        uint256 usdcPerUnit; // WAD USDC per shape unit
-        uint256 coverPerUnit; // WAD WHYPE per shape unit
-        uint256 usdcLocked; // USDC (6 decimals)
-        uint256 whypeLocked; // WHYPE (18 decimals)
+        uint256 settlementPerUnit; // WAD settlement token per shape unit
+        uint256 coverPerUnit; // WAD covering units (of the stock) per shape unit
+        uint256 settlementLocked; // settlement token (6 decimals)
+        uint256 coverLocked; // the market's covering token, in its own units
     }
 
     PathFundingBook public immutable book;
@@ -54,13 +60,13 @@ contract WriterBook is ReentrancyGuard {
     IWriteCounterparty public immutable pool;
     IMarkRouter public immutable marks;
     IVolSource public immutable vols;
-    IERC20 public immutable usdc;
-    IERC20 public immutable whype;
+    IERC20 public immutable settlement;
+    ICoveringAssets public immutable covers;
 
     mapping(uint256 => Write) public writes;
     uint256 public nextWriteId = 1;
-    uint256 public totalUsdcLocked;
-    uint256 public totalWhypeLocked;
+    uint256 public totalSettlementLocked;
+    mapping(IERC20 => uint256) public totalCoverLocked;
 
     event Written(
         address indexed writer,
@@ -71,12 +77,12 @@ contract WriterBook is ReentrancyGuard {
         uint256 raw,
         uint256 sWad,
         uint256 sigmaBps,
-        uint256 usdcLocked,
-        uint256 whypeLocked,
+        uint256 settlementLocked,
+        uint256 coverLocked,
         int256 credit,
         uint256 fee
     );
-    event Claimed(uint256 indexed writeId, uint256 usdcReleased, uint256 whypeReleased);
+    event Claimed(uint256 indexed writeId, uint256 settlementReleased, uint256 coverReleased);
     event Unwritten(
         uint256 indexed writeId,
         uint256 units,
@@ -85,8 +91,8 @@ contract WriterBook is ReentrancyGuard {
         uint256 sigmaBps,
         int256 cost,
         uint256 fee,
-        uint256 usdcPaid,
-        uint256 whypePaid,
+        uint256 settlementPaid,
+        uint256 coverPaid,
         uint256 walletPaid,
         bool capped,
         bool markFromSample,
@@ -112,21 +118,21 @@ contract WriterBook is ReentrancyGuard {
         IWriteCounterparty pool_,
         IMarkRouter marks_,
         IVolSource vols_,
-        IERC20 usdc_,
-        IERC20 whype_
+        IERC20 settlement_,
+        ICoveringAssets covers_
     ) {
         if (
             address(book_) == address(0) || address(engine_) == address(0) || address(pool_) == address(0)
-                || address(marks_) == address(0) || address(vols_) == address(0) || address(usdc_) == address(0)
-                || address(whype_) == address(0)
+                || address(marks_) == address(0) || address(vols_) == address(0) || address(settlement_) == address(0)
+                || address(covers_) == address(0)
         ) revert ZeroAddress();
         book = book_;
         engine = engine_;
         pool = pool_;
         marks = marks_;
         vols = vols_;
-        usdc = usdc_;
-        whype = whype_;
+        settlement = settlement_;
+        covers = covers_;
     }
 
     // ---------------------------------------------------------------- write
@@ -139,13 +145,16 @@ contract WriterBook is ReentrancyGuard {
         uint256 raw;
         int256 credit;
         uint256 fee;
-        uint256 usdcPerUnit;
+        uint256 settlementPerUnit;
         uint256 coverPerUnit;
+        IERC20 coverToken;
+        uint256 coverScale;
     }
 
     /// @notice Writes `units` (WAD) of a shape on `market`: `legs` from the writer's side, spelled the book's one way,
-    ///         with `movement`. With `useCover` (HYPE only) the writer locks WHYPE for exactly the net short calls.
-    ///         Receives at least `minCredit` USDC (signed: negative = the writer pays at most −minCredit).
+    ///         with `movement`. With `useCover` (a market with a covering asset) the writer locks the market's stock
+    ///         for exactly the net short calls.
+    ///         Receives at least `minCredit` settlement token (signed: negative = the writer pays at most −minCredit).
     function write(
         bytes32 market,
         StrategyMath.Leg[] calldata legs,
@@ -168,12 +177,16 @@ contract WriterBook is ReentrancyGuard {
         w.market = market;
         w.seriesId = c.seriesId;
         w.raw = c.raw;
-        w.usdcPerUnit = c.usdcPerUnit;
+        w.settlementPerUnit = c.settlementPerUnit;
         w.coverPerUnit = c.coverPerUnit;
-        w.usdcLocked = _usdcFor(units, c.usdcPerUnit);
-        w.whypeLocked = Math.mulDiv(units, c.coverPerUnit, WAD, Math.Rounding.Ceil);
-        totalUsdcLocked += w.usdcLocked;
-        totalWhypeLocked += w.whypeLocked;
+        w.settlementLocked = _settlementFor(units, c.settlementPerUnit);
+        w.coverLocked = _coverFor(units, c.coverPerUnit, c.coverScale);
+        totalSettlementLocked += w.settlementLocked;
+        if (w.coverLocked > 0) {
+            totalCoverLocked[c.coverToken] += w.coverLocked;
+            covers.checkCover(market, msg.sender, address(this), w.coverLocked);
+            covers.checkCover(market, address(this), address(pool), w.coverLocked);
+        }
         emit Written(
             msg.sender,
             writeId,
@@ -183,15 +196,15 @@ contract WriterBook is ReentrancyGuard {
             c.raw,
             c.s,
             c.sigma,
-            w.usdcLocked,
-            w.whypeLocked,
+            w.settlementLocked,
+            w.coverLocked,
             c.credit,
             c.fee
         );
 
-        if (w.usdcLocked > 0) usdc.safeTransferFrom(msg.sender, address(this), w.usdcLocked);
-        if (w.whypeLocked > 0) whype.safeTransferFrom(msg.sender, address(this), w.whypeLocked);
-        if (c.credit < 0) usdc.safeTransferFrom(msg.sender, address(pool), uint256(-c.credit));
+        if (w.settlementLocked > 0) settlement.safeTransferFrom(msg.sender, address(this), w.settlementLocked);
+        _pullCoverExact(c.coverToken, msg.sender, w.coverLocked);
+        if (c.credit < 0) settlement.safeTransferFrom(msg.sender, address(pool), uint256(-c.credit));
         pool.onWrite(market, c.seriesId, writeId, units, c.raw, c.s, c.sigma, c.credit, c.fee, msg.sender);
     }
 
@@ -214,9 +227,10 @@ contract WriterBook is ReentrancyGuard {
         EnginePricing.checkShapeStrikes(legs, c.s, step);
 
         // Law 4: the exact worst case of what is sold, per shape unit.
+        (c.coverToken, c.coverScale) = covers.coverOf(market);
         c.coverPerUnit = useCover ? _netShortCalls(legs) : 0;
         if (useCover && c.coverPerUnit == 0) revert NoCoverNeeded();
-        c.usdcPerUnit = StrategyMath.writerCollateral(market, legs, int256(c.coverPerUnit));
+        c.settlementPerUnit = StrategyMath.writerCollateral(address(c.coverToken) != address(0), legs, int256(c.coverPerUnit));
 
         StrategyMath.Leg[] memory poolLegs = _negate(legs);
         c.seriesId = _openAndWalk(market, poolLegs, movement);
@@ -247,34 +261,41 @@ contract WriterBook is ReentrancyGuard {
 
     // ---------------------------------------------------------------- claim
 
-    /// @notice Returns to the writer the collateral no longer required as the shape decays (the funding received).
+    /// @notice Sends back to the writer the collateral no longer required as the shape decays (the funding received).
     ///         Required = units now (raw × the series' factor, rounded up) × the per-unit worst case. While the series
     ///         is behind the latest sample the factor where its last walk stopped is used: higher, so conservative.
-    function claim(uint256 writeId) external nonReentrant returns (uint256 usdcOut, uint256 whypeOut) {
+    function claim(uint256 writeId) external nonReentrant returns (uint256 settlementOut, uint256 coverOut) {
         Write storage w = writes[writeId];
         if (msg.sender != w.writer) revert NotWriter(writeId);
-        (uint256 usdcReq, uint256 whypeReq) = required(writeId);
-        if (w.usdcLocked > usdcReq) usdcOut = w.usdcLocked - usdcReq;
-        if (w.whypeLocked > whypeReq) whypeOut = w.whypeLocked - whypeReq;
-        w.usdcLocked -= usdcOut;
-        w.whypeLocked -= whypeOut;
-        totalUsdcLocked -= usdcOut;
-        totalWhypeLocked -= whypeOut;
-        emit Claimed(writeId, usdcOut, whypeOut);
-        if (usdcOut > 0) usdc.safeTransfer(w.writer, usdcOut);
-        if (whypeOut > 0) whype.safeTransfer(w.writer, whypeOut);
+        (uint256 settlementReq, uint256 coverReq) = required(writeId);
+        if (w.settlementLocked > settlementReq) settlementOut = w.settlementLocked - settlementReq;
+        if (w.coverLocked > coverReq) coverOut = w.coverLocked - coverReq;
+        w.settlementLocked -= settlementOut;
+        w.coverLocked -= coverOut;
+        totalSettlementLocked -= settlementOut;
+        emit Claimed(writeId, settlementOut, coverOut);
+        if (settlementOut > 0) settlement.safeTransfer(w.writer, settlementOut);
+        if (coverOut > 0) {
+            (IERC20 t,) = covers.coverOf(w.market);
+            totalCoverLocked[t] -= coverOut;
+            _coverOut(w.market, t, w.writer, coverOut);
+        }
     }
 
-    /// @notice The collateral write `writeId` requires now: USDC (6 decimals) and WHYPE (18), both rounded up.
-    function required(uint256 writeId) public view returns (uint256 usdcReq, uint256 whypeReq) {
+    /// @notice The collateral write `writeId` requires now: settlement token (6 decimals) and the covering token (its own units),
+    ///         both rounded up.
+    function required(uint256 writeId) public view returns (uint256 settlementReq, uint256 coverReq) {
         Write storage w = writes[writeId];
         if (w.raw == 0) return (0, 0);
         uint256 unitsNow = Math.mulDiv(w.raw, book.normNow(w.seriesId), WAD, Math.Rounding.Ceil);
-        usdcReq = _usdcFor(unitsNow, w.usdcPerUnit);
-        whypeReq = Math.mulDiv(unitsNow, w.coverPerUnit, WAD, Math.Rounding.Ceil);
+        settlementReq = _settlementFor(unitsNow, w.settlementPerUnit);
+        if (w.coverPerUnit > 0) {
+            (, uint256 scale) = covers.coverOf(w.market);
+            coverReq = _coverFor(unitsNow, w.coverPerUnit, scale);
+        }
         // never more than what was locked for the units written (rounding)
-        if (usdcReq > w.usdcLocked) usdcReq = w.usdcLocked;
-        if (whypeReq > w.whypeLocked) whypeReq = w.whypeLocked;
+        if (settlementReq > w.settlementLocked) settlementReq = w.settlementLocked;
+        if (coverReq > w.coverLocked) coverReq = w.coverLocked;
     }
 
     // ---------------------------------------------------------------- unwrite
@@ -288,16 +309,18 @@ contract WriterBook is ReentrancyGuard {
         uint256 units;
         int256 cost;
         uint256 fee;
-        uint256 usdcPart;
-        uint256 whypePart;
+        uint256 settlementPart;
+        uint256 coverPart;
         bool capped;
-        uint256 fromUsdc;
-        uint256 fromWhype;
+        uint256 fromSettlement;
+        uint256 fromCover;
         uint256 fromWallet;
+        IERC20 coverToken;
+        uint256 coverScale;
     }
 
     /// @notice Buys back `units` (WAD; `type(uint256).max` = all) of write `writeId` at the pool's ask, paying at most
-    ///         `maxCost` USDC (signed). Never paused (law 3 for writers).
+    ///         `maxCost` settlement token (signed). Never paused (law 3 for writers).
     function unwrite(uint256 writeId, uint256 units, int256 maxCost, uint256 deadline)
         external
         nonReentrant
@@ -326,35 +349,36 @@ contract WriterBook is ReentrancyGuard {
         int256 v = EnginePricing.shapeValue(poolLegs, c.s, c.sigma, mv, true);
         (c.cost, c.fee) = EnginePricing.shapeUnwriteQuote(v, c.units, poolLegs, c.s, spreadBps);
         bool all = c.raw == w.raw;
-        c.usdcPart = all ? w.usdcLocked : Math.mulDiv(w.usdcLocked, c.raw, w.raw);
-        c.whypePart = all ? w.whypeLocked : Math.mulDiv(w.whypeLocked, c.raw, w.raw);
-        uint256 cap = c.usdcPart + _whypeToUsdc(c.whypePart, c.s);
+        c.settlementPart = all ? w.settlementLocked : Math.mulDiv(w.settlementLocked, c.raw, w.raw);
+        c.coverPart = all ? w.coverLocked : Math.mulDiv(w.coverLocked, c.raw, w.raw);
+        (c.coverToken, c.coverScale) = covers.coverOf(w.market);
+        uint256 cap = c.settlementPart + _coverToSettlement(c.coverPart, c.coverScale, c.s);
         if (c.cost > int256(cap)) {
             c.cost = int256(cap);
             c.capped = true;
         }
     }
 
-    /// @dev Pays the buyback from locked USDC, then locked WHYPE at the unwrite's mark, then the wallet; returns the
-    ///      rest of the released collateral to the writer.
+    /// @dev Pays the buyback from locked settlement token, then the locked cover at the unwrite's mark, then the wallet; sends the
+    ///      rest of the released collateral back to the writer. Cover that cannot move is kept owed (CoverLedger).
     function _settleUnwrite(uint256 writeId, Write storage w, UnwriteCtx memory c) internal {
         if (c.cost > 0) {
             uint256 due = uint256(c.cost);
-            c.fromUsdc = due < c.usdcPart ? due : c.usdcPart;
-            due -= c.fromUsdc;
-            if (due > 0 && c.whypePart > 0) {
-                c.fromWhype = _usdcToWhype(due, c.s);
-                if (c.fromWhype > c.whypePart) c.fromWhype = c.whypePart;
-                uint256 covered = _whypeToUsdc(c.fromWhype, c.s);
+            c.fromSettlement = due < c.settlementPart ? due : c.settlementPart;
+            due -= c.fromSettlement;
+            if (due > 0 && c.coverPart > 0) {
+                c.fromCover = _settlementToCover(due, c.coverScale, c.s);
+                if (c.fromCover > c.coverPart) c.fromCover = c.coverPart;
+                uint256 covered = _coverToSettlement(c.fromCover, c.coverScale, c.s);
                 due = covered >= due ? 0 : due - covered;
             }
             c.fromWallet = due;
         }
         w.raw -= c.raw;
-        w.usdcLocked -= c.usdcPart;
-        w.whypeLocked -= c.whypePart;
-        totalUsdcLocked -= c.usdcPart;
-        totalWhypeLocked -= c.whypePart;
+        w.settlementLocked -= c.settlementPart;
+        w.coverLocked -= c.coverPart;
+        totalSettlementLocked -= c.settlementPart;
+        if (c.coverPart > 0) totalCoverLocked[c.coverToken] -= c.coverPart;
         emit Unwritten(
             writeId,
             c.units,
@@ -363,19 +387,19 @@ contract WriterBook is ReentrancyGuard {
             c.sigma,
             c.cost,
             c.fee,
-            c.fromUsdc,
-            c.fromWhype,
+            c.fromSettlement,
+            c.fromCover,
             c.fromWallet,
             c.capped,
             c.markFromSample,
             c.volFromSample
         );
 
-        if (c.fromUsdc > 0) usdc.safeTransfer(address(pool), c.fromUsdc);
-        if (c.fromWhype > 0) whype.safeTransfer(address(pool), c.fromWhype);
-        if (c.fromWallet > 0) usdc.safeTransferFrom(w.writer, address(pool), c.fromWallet);
-        if (c.usdcPart > c.fromUsdc) usdc.safeTransfer(w.writer, c.usdcPart - c.fromUsdc);
-        if (c.whypePart > c.fromWhype) whype.safeTransfer(w.writer, c.whypePart - c.fromWhype);
+        if (c.fromSettlement > 0) settlement.safeTransfer(address(pool), c.fromSettlement);
+        _coverOut(w.market, c.coverToken, address(pool), c.fromCover);
+        if (c.fromWallet > 0) settlement.safeTransferFrom(w.writer, address(pool), c.fromWallet);
+        if (c.settlementPart > c.fromSettlement) settlement.safeTransfer(w.writer, c.settlementPart - c.fromSettlement);
+        _coverOut(w.market, c.coverToken, w.writer, c.coverPart - c.fromCover);
         pool.onUnwrite(
             w.market,
             w.seriesId,
@@ -386,8 +410,8 @@ contract WriterBook is ReentrancyGuard {
             c.sigma,
             c.cost,
             c.fee,
-            c.fromUsdc + c.fromWallet,
-            c.fromWhype,
+            c.fromSettlement + c.fromWallet,
+            c.fromCover,
             w.writer
         );
     }
@@ -418,7 +442,12 @@ contract WriterBook is ReentrancyGuard {
 
     // ---------------------------------------------------------------- maths
 
-    /// @dev WHYPE that exactly covers the net short calls (Σ short − Σ long call amounts), 0 if none.
+    /// @dev Sends cover out; if it cannot move, it stays owed here and opens on the market pause (owner D3).
+    function _coverOut(bytes32 market, IERC20 token, address to, uint256 amount) internal {
+        if (!_sendCover(token, to, amount)) ICoverOutage(address(pool)).onCoverStuck(market);
+    }
+
+    /// @dev Covering units that exactly cover the net short calls (Σ short − Σ long call amounts), 0 if none.
     function _netShortCalls(StrategyMath.Leg[] calldata legs) internal pure returns (uint256) {
         int256 slope;
         for (uint256 j; j < legs.length; ++j) {
@@ -434,18 +463,24 @@ contract WriterBook is ReentrancyGuard {
         }
     }
 
-    /// @dev USDC (6 decimals) for `units` at `perUnit` WAD USDC, rounded up.
-    function _usdcFor(uint256 units, uint256 perUnit) internal pure returns (uint256) {
-        return Math.ceilDiv(Math.mulDiv(units, perUnit, WAD, Math.Rounding.Ceil), WAD_PER_USDC_UNIT);
+    /// @dev settlement token (6 decimals) for `units` at `perUnit` WAD settlement token, rounded up.
+    function _settlementFor(uint256 units, uint256 perUnit) internal pure returns (uint256) {
+        return Math.ceilDiv(Math.mulDiv(units, perUnit, WAD, Math.Rounding.Ceil), WAD_PER_SETTLEMENT_UNIT);
     }
 
-    /// @dev Value of `amount` WHYPE at mark `s` in USDC, rounded down.
-    function _whypeToUsdc(uint256 amount, uint256 s) internal pure returns (uint256) {
-        return Math.mulDiv(amount, s, WAD) / WAD_PER_USDC_UNIT;
+    /// @dev Covering tokens (own units) for `units` at `perUnit` WAD covering units, rounded up.
+    function _coverFor(uint256 units, uint256 perUnit, uint256 scale) internal pure returns (uint256) {
+        if (perUnit == 0) return 0;
+        return Math.ceilDiv(Math.mulDiv(units, perUnit, WAD, Math.Rounding.Ceil), scale);
     }
 
-    /// @dev WHYPE worth `usdcAmount` at mark `s`, rounded up.
-    function _usdcToWhype(uint256 usdcAmount, uint256 s) internal pure returns (uint256) {
-        return Math.mulDiv(usdcAmount * WAD_PER_USDC_UNIT, WAD, s, Math.Rounding.Ceil);
+    /// @dev Value of `amount` covering tokens (own units) at mark `s` in settlement token, rounded down.
+    function _coverToSettlement(uint256 amount, uint256 scale, uint256 s) internal pure returns (uint256) {
+        return Math.mulDiv(amount * scale, s, WAD) / WAD_PER_SETTLEMENT_UNIT;
+    }
+
+    /// @dev Covering tokens (own units) worth `settlementAmount` at mark `s`, rounded up.
+    function _settlementToCover(uint256 settlementAmount, uint256 scale, uint256 s) internal pure returns (uint256) {
+        return Math.ceilDiv(Math.mulDiv(settlementAmount * WAD_PER_SETTLEMENT_UNIT, WAD, s, Math.Rounding.Ceil), scale);
     }
 }

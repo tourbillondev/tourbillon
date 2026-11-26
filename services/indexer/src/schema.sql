@@ -65,3 +65,35 @@ CREATE TABLE IF NOT EXISTS positions (
   PRIMARY KEY (id, owner, held)
 );
 CREATE INDEX IF NOT EXISTS positions_owner ON positions (owner) WHERE raw > 0;
+
+-- marks(market, ts, source, px, accepted): the audit trail of marks by source (Backend §8). RH7: one row per MARK
+-- final of the quorum (source 'quorum'); px is the published value; accepted is true when it equals the quorum's
+-- median, false when the board's step clamp or the out-of-session band held it back. The native source adds rows
+-- once Robinhood Chain publishes its mark interface (the adapter is a stub today).
+CREATE TABLE IF NOT EXISTS marks (
+  market    text    NOT NULL,
+  ts        bigint  NOT NULL,
+  source    text    NOT NULL,
+  round     bigint  NOT NULL,              -- the board round (quorum), for idempotency
+  px        numeric(78,0) NOT NULL,        -- WAD
+  median    numeric(78,0) NOT NULL,        -- the quorum's median before the clamp, WAD
+  accepted  boolean NOT NULL,
+  PRIMARY KEY (market, source, round)
+);
+
+-- hedges(id, market, side, sz, px, sent_at, reconciled_at, filled_sz, via) (Backend §8). RH6/RH7: the pool's on-chain
+-- stock hedge swaps (via 'onchain_dex'), one row per HedgeSwapped event; id is the transaction hash and log index;
+-- sz and filled_sz are the token amount in its own units, px the router mark (WAD) the pool checked against; settlement_amount is
+-- the USDC side. Exchange hedges (via 'cex_api') are off-chain: hedger-cex logs them in the same shape.
+CREATE TABLE IF NOT EXISTS hedges (
+  id             text    PRIMARY KEY,
+  market         text    NOT NULL,
+  side           text    NOT NULL,       -- buy | sell (of the stock)
+  sz             numeric(78,0) NOT NULL,
+  px             numeric(78,0) NOT NULL,
+  settlement_amount numeric(78,0) NOT NULL,
+  sent_at        bigint  NOT NULL,
+  reconciled_at  bigint  NOT NULL,
+  filled_sz      numeric(78,0) NOT NULL,
+  via            text    NOT NULL
+);

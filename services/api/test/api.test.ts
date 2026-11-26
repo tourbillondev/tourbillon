@@ -34,6 +34,9 @@ describe("API v1 basics", () => {
     expect(ok.status).toBe(200);
     expect(ok.headers.get("access-control-allow-origin")).toBe("*");
     expect((await get("/v1/nope")).status).toBe(404);
+    const h = await get("/healthz"); // the release system's live check (RH9)
+    expect(h.status).toBe(200);
+    expect(await h.json()).toEqual({ ok: true });
     expect(await (await get("/v1/chains/DOGE")).json()).toEqual({ error: "market: one of BTC" });
     expect((await get("/v1/status")).status).toBe(429);
     expect(reached).toBe(1);

@@ -1,7 +1,9 @@
 import type { Kind, Reading } from "./decide.ts";
 import { formatEther } from "viem";
-import { fetchCandles, fetchMetaAndAssetCtxs, HL_API, parseCandles, parseMarks, TIMEOUT_MS, type MarkResult } from "./hyperliquid.ts";
-import { bpsToWad, EwmaVol, STEP_S } from "./vol.ts";
+import { overlapsRegularSession, isRegularSession } from "@tourbillon/common/session.ts";
+import type { Price, PriceFeed } from "./feeds.ts";
+import { cryptoMark, stockMark, type MarkCheck } from "./marks.ts";
+import { bpsToWad, VolTracker } from "./vol.ts";
 import { log } from "@tourbillon/common/log.ts";
 
 /// Where a signer's values come from. MARK values are WAD prices; VOL values are WAD fractions (0.5e18 = 50%).
@@ -40,130 +42,88 @@ export class SplitSource implements ValueSource {
   }
 }
 
-/// Alarm after this many failed fetches in a row (one fetch per tick, so about one minute).
+/// Alarm after this many refused or failed reads in a row for one market (one read per tick, so about one minute).
 export const ALARM_AFTER_FAILURES = 3;
-/// A snapshot younger than this serves every market of the same tick.
-const SNAPSHOT_REUSE_MS = 5_000;
-/// Vol start-up: 7 days of 5-minute candles (owner decision); at least 1 day is required (vol.ts).
-export const START_WINDOW_MS = 7 * 86_400_000;
-/// A failed start-up is retried at most this often (about 160 request weight per attempt for three markets).
-export const START_RETRY_MS = 60_000;
+/// A market's checked mark younger than this serves every key of the same tick (MARK and VOL).
+const REUSE_MS = 5_000;
 
-type VolState = {
-  est: EwmaVol | null;
-  lastPointMs: number; // wall-clock time of the last price absorbed
-  lastAttemptMs: number;
-  starting: Promise<void> | null;
-};
+/// The feeds of one market (from the signer's feeds file; providers are owner queue Q4, Q6, Q7).
+export type MarketFeeds =
+  | { kind: "stock"; onchain: PriceFeed; reference: PriceFeed }
+  | { kind: "crypto"; exchanges: PriceFeed[]; pyth: PriceFeed };
 
-/// MARK = Hyperliquid's markPx (the HyperCore mark). VOL = realised vol (vol.ts), started from 7 days of
-/// 5-minute candles, then fed the first markPx reading of each 5-minute boundary. State is in memory only:
-/// every start begins again from candles.
-export class HyperliquidSource implements ValueSource {
-  readonly name = "hyperliquid";
-  failures = 0;
-  private snap: { localMs: number; marks: Map<string, MarkResult> } | null = null;
-  private inflight: Promise<void> | null = null;
-  readonly vols = new Map<string, VolState>();
+type MarketState = { feeds: MarketFeeds; vol: VolTracker; last: { localMs: number; check: MarkCheck } | null; inflight: Promise<MarkCheck> | null; failures: number };
+
+async function readOrNull(f: PriceFeed, market: string): Promise<Price | null> {
+  try {
+    return await f.read();
+  } catch (e) {
+    log("info", "feed: no reading", { market, feed: f.name, error: (e as Error).message });
+    return null;
+  }
+}
+
+/// MARK: each market's two-source check (marks.ts). VOL: realised vol from this signer's own accepted marks
+/// (VolTracker), session-aware for stocks. State is in memory only: a restart warms up again (one day of steps).
+export class FeedSource implements ValueSource {
+  readonly name = "feeds";
+  readonly markets = new Map<string, MarketState>();
 
   constructor(
-    private readonly markets: string[],
-    private readonly base = HL_API,
-    private readonly timeoutMs = TIMEOUT_MS,
+    feeds: Map<string, MarketFeeds>,
     private readonly clock: () => number = Date.now,
+    private readonly inSession: (ms: number) => boolean = isRegularSession,
+    overlaps: (fromMs: number, toMs: number) => boolean = overlapsRegularSession,
   ) {
-    for (const m of markets) this.vols.set(m, { est: null, lastPointMs: 0, lastAttemptMs: -Infinity, starting: null });
+    for (const [m, f] of feeds) this.markets.set(m, { feeds: f, vol: new VolTracker(f.kind === "stock", overlaps), last: null, inflight: null, failures: 0 });
   }
 
-  private async refresh(): Promise<void> {
-    try {
-      const body = await fetchMetaAndAssetCtxs(this.base, this.timeoutMs);
-      const marks = parseMarks(body, this.markets);
-      const localMs = this.clock();
-      this.snap = { localMs, marks };
-      if (this.failures >= ALARM_AFTER_FAILURES) log("info", "hyperliquid recovered", { after: this.failures });
-      this.failures = 0;
-      for (const [market, r] of marks) {
-        if (!r.ok) {
-          log(r.reason === "oracle-deviation" ? "warn" : "info", "hyperliquid: no mark", { market, reason: r.reason, detail: r.detail });
-          continue;
-        }
-        this.sample(market, r.mark, localMs);
-      }
-    } catch (e) {
-      this.snap = null;
-      this.failures++;
-      const fields = { failures: this.failures, error: (e as Error).message };
-      if (this.failures >= ALARM_AFTER_FAILURES) log("alarm", "hyperliquid unreachable", fields);
-      else log("warn", "hyperliquid fetch failed", fields);
-    }
-  }
-
-  /// The first mark of each 5-minute boundary feeds the vol estimator.
-  private sample(market: string, markWad: bigint, localMs: number): void {
-    const v = this.vols.get(market);
-    if (!v?.est) return;
-    const t = Math.floor(localMs / 1000 / STEP_S) * STEP_S;
-    const res = v.est.update({ t, px: Number(formatEther(markWad)) });
-    if (res === "ok") {
-      v.lastPointMs = localMs;
-    } else if (res === "gap-too-long") {
-      log("warn", "vol: gap over 1 h, starting again from candles", { market, lastT: v.est.lastT, t });
-      v.est = null;
-      v.lastAttemptMs = -Infinity;
-    }
-  }
-
-  private async start(market: string): Promise<void> {
-    const v = this.vols.get(market)!;
+  private async check(market: string, st: MarketState): Promise<MarkCheck> {
     const nowMs = this.clock();
-    v.lastAttemptMs = nowMs;
-    try {
-      const body = await fetchCandles(market, nowMs - START_WINDOW_MS, nowMs, this.base, this.timeoutMs);
-      const points = parseCandles(body, market, nowMs);
-      const est = EwmaVol.start(points);
-      const last = points.at(-1)!;
-      if (nowMs - last.t * 1000 > 2 * STEP_S * 1000) throw new Error("latest candle too old");
-      v.est = est;
-      v.lastPointMs = last.t * 1000;
-      log("info", "vol started from candles", { market, candles: points.length, sigmaBps: est.sigmaBps(), capped: est.capped });
-    } catch (e) {
-      log("warn", "vol start-up failed", { market, error: (e as Error).message });
+    let c: MarkCheck;
+    if (st.feeds.kind === "stock") {
+      const [onchain, reference] = await Promise.all([readOrNull(st.feeds.onchain, market), readOrNull(st.feeds.reference, market)]);
+      c = stockMark(onchain, reference, this.clock(), this.inSession(nowMs));
+    } else {
+      const [pyth, ...ex] = await Promise.all([readOrNull(st.feeds.pyth, market), ...st.feeds.exchanges.map((f) => readOrNull(f, market))]);
+      c = cryptoMark(ex, pyth, this.clock());
     }
+    if (c.ok) {
+      if (st.failures >= ALARM_AFTER_FAILURES) log("info", "mark: votes again", { market, after: st.failures });
+      st.failures = 0;
+      st.vol.sample(Number(formatEther(c.px)), c.atMs);
+    } else {
+      st.failures++;
+      const fields = { market, reason: c.reason, inARow: st.failures };
+      log(st.failures >= ALARM_AFTER_FAILURES ? "alarm" : "warn", "mark: refused, no vote", fields);
+    }
+    st.last = { localMs: this.clock(), check: c };
+    return c;
   }
 
-  private async ensureSnapshot(): Promise<void> {
-    if (!this.snap || this.clock() - this.snap.localMs > SNAPSHOT_REUSE_MS) {
-      this.inflight ??= this.refresh().finally(() => (this.inflight = null));
-      await this.inflight;
-    }
+  private async current(market: string, st: MarketState): Promise<MarkCheck> {
+    if (st.last && this.clock() - st.last.localMs <= REUSE_MS) return st.last.check;
+    st.inflight ??= this.check(market, st).finally(() => (st.inflight = null));
+    return st.inflight;
   }
 
   async read(market: string, kind: Kind, now: number): Promise<Reading> {
     if (kind === "EQUITY") return null;
-    if (kind === "VOL") return this.readVol(market, now);
-    await this.ensureSnapshot();
-    const r = this.snap?.marks.get(market);
-    if (!this.snap || !r || !r.ok) return null;
-    // The reply has no timestamp: its age is measured on this machine's clock, then expressed in chain time,
-    // so clock drift between this machine and the chain cannot make an old reading look fresh.
-    return { value: r.mark, at: now - ageSeconds(this.clock(), this.snap.localMs) };
-  }
-
-  private async readVol(market: string, now: number): Promise<Reading> {
-    const v = this.vols.get(market);
-    if (!v) return null;
-    if (!v.est && !v.starting && this.clock() - v.lastAttemptMs >= START_RETRY_MS) {
-      v.starting = this.start(market).finally(() => (v.starting = null));
+    const st = this.markets.get(market);
+    if (!st) return null;
+    const c = await this.current(market, st); // VOL reads keep the 5-minute samples flowing too
+    if (kind === "MARK") {
+      if (!c.ok) return null;
+      // Age measured on this machine's clock, then expressed in chain time, so clock drift cannot make an old
+      // reading look fresh.
+      return { value: c.px, at: now - ageSeconds(this.clock(), c.atMs) };
     }
-    if (v.starting) await v.starting;
-    await this.ensureSnapshot(); // keeps the 5-minute samples flowing even when only VOL is read
-    if (!v.est) return null;
-    const raw = v.est.sigma() * 10_000;
-    const bps = v.est.sigmaBps();
-    if (Math.round(raw) !== bps) log("warn", "vol clipped", { market, sigmaBps: Math.round(raw), voted: bps });
-    // Age = time since the last price absorbed (local clock), so a vol that stops updating stops being voted.
-    return { value: bpsToWad(bps), at: now - ageSeconds(this.clock(), v.lastPointMs) };
+    const bps = st.vol.sigmaBps();
+    if (bps === null) return null;
+    const raw = st.vol.rawBps()!;
+    if (raw !== bps) log("warn", "vol clipped", { market, sigmaBps: raw, voted: bps });
+    // Age = time since the last price kept, so a vol that stops updating stops being voted.
+    return { value: bpsToWad(bps), at: now - ageSeconds(this.clock(), st.vol.lastPointMs) };
   }
 }
 

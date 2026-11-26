@@ -4,11 +4,13 @@ import { join, resolve } from "node:path";
 import { createPublicClient, createWalletClient, decodeErrorResult, decodeEventLog, formatUnits, http, parseEther, stringToHex, type Address, type PublicClient } from "viem";
 import { foundry } from "viem/chains";
 import { revertName } from "@tourbillon/common/tx.ts";
-import { SimVenue } from "../../hedger/src/simvenue.ts";
+import { SimExchange } from "../../hedger/src/simexchange.ts";
 import { blendDelta } from "../../hedger/src/tempo.ts";
 
+/// Superseded (RH7): kept for the record of its milestone, not run. Since RH3 the signers read feeds files, and since
+/// RH6 STK1 is hedged on-chain; the local end-to-end run is scripts/local-m7-run.ts, rebuilt for Robinhood Chain.
 /// M4 step 10: the whole M4 system on anvil for about 20 minutes: shapes bought and sold, shapes written against
-/// exact collateral (USDC and WHYPE), claims, partial and full unwrites, a shock with writers, pauses, a wind-down.
+/// exact collateral (USDC and STK1 stock), claims, partial and full unwrites, a shock with writers, pauses, a wind-down.
 /// Every service runs as a real process. Prices come from the simulated venue's path (signers read them there; vol
 /// fixed at 50%); the chain clock moves forward an hour at set points for epochs and decay. No venue outage (M3
 /// step 11 covered it). No key: anvil's unlocked accounts. Raw logs and the report go to a temp folder outside the repo.
@@ -20,10 +22,9 @@ const SERVICES = resolve(import.meta.dir, "../..");
 const CONTRACTS = resolve(SERVICES, "../contracts");
 const PORT = 31545;
 const RPC = `http://127.0.0.1:${PORT}`;
-const MARKETS = ["BTC", "ETH", "HYPE"];
-const STEP: Record<string, number> = { BTC: 100, ETH: 5, HYPE: 0.1 };
-const SZ: Record<string, number> = { BTC: 5, ETH: 4, HYPE: 2 };
-const POOL_HL = "0x00000000000000000000000000000000000000E1" as Address;
+const MARKETS = ["BTC", "ETH", "STK1"];
+const STEP: Record<string, number> = { BTC: 100, ETH: 5, STK1: 0.1 };
+const SZ: Record<string, number> = { BTC: 5, ETH: 4, STK1: 2 };
 const USDC = 10n ** 6n;
 const WAD = 10n ** 18n;
 const MAX = 2n ** 256n - 1n;
@@ -63,7 +64,7 @@ const abi = [
   { type: "function", name: "navNow", stateMutability: "view", inputs: [], outputs: [{ type: "uint256" }] },
   { type: "function", name: "available", stateMutability: "view", inputs: [], outputs: [{ type: "uint256" }] },
   { type: "function", name: "equityTerm", stateMutability: "view", inputs: [], outputs: [{ type: "uint256" }] },
-  { type: "function", name: "whypeTerm", stateMutability: "view", inputs: [], outputs: [{ type: "uint256" }] },
+  { type: "function", name: "coverTerm", stateMutability: "view", inputs: [], outputs: [{ type: "uint256" }] },
   { type: "function", name: "protocolFeeBps", stateMutability: "view", inputs: [], outputs: [{ type: "uint16" }] },
   { type: "function", name: "opensPaused", stateMutability: "view", inputs: [], outputs: [{ type: "bool" }] },
   { type: "function", name: "seriesRaw", stateMutability: "view", inputs: [{ type: "uint256" }], outputs: [{ type: "uint256" }] },
@@ -83,8 +84,8 @@ const abi = [
   { type: "function", name: "claim", stateMutability: "nonpayable", inputs: [{ type: "uint256" }], outputs: [{ type: "uint256" }, { type: "uint256" }] },
   { type: "function", name: "unwrite", stateMutability: "nonpayable", inputs: [{ type: "uint256" }, { type: "uint256" }, { type: "int256" }, { type: "uint256" }], outputs: [{ type: "uint256" }, { type: "int256" }] },
   { type: "function", name: "required", stateMutability: "view", inputs: [{ type: "uint256" }], outputs: [{ type: "uint256" }, { type: "uint256" }] },
-  { type: "function", name: "totalUsdcLocked", stateMutability: "view", inputs: [], outputs: [{ type: "uint256" }] },
-  { type: "function", name: "totalWhypeLocked", stateMutability: "view", inputs: [], outputs: [{ type: "uint256" }] },
+  { type: "function", name: "totalSettlementLocked", stateMutability: "view", inputs: [], outputs: [{ type: "uint256" }] },
+  { type: "function", name: "totalCoverLocked", stateMutability: "view", inputs: [{ type: "address" }], outputs: [{ type: "uint256" }] },
   {
     type: "function",
     name: "writes",
@@ -145,18 +146,18 @@ const events = [
     inputs: [
       { type: "address", name: "writer", indexed: true }, { type: "uint256", name: "writeId", indexed: true }, { type: "uint256", name: "seriesId", indexed: true },
       { type: "bytes32", name: "market" }, { type: "uint256", name: "units" }, { type: "uint256", name: "raw" }, { type: "uint256", name: "sWad" },
-      { type: "uint256", name: "sigmaBps" }, { type: "uint256", name: "usdcLocked" }, { type: "uint256", name: "whypeLocked" }, { type: "int256", name: "credit" },
+      { type: "uint256", name: "sigmaBps" }, { type: "uint256", name: "settlementLocked" }, { type: "uint256", name: "coverLocked" }, { type: "int256", name: "credit" },
       { type: "uint256", name: "fee" },
     ],
   },
-  { type: "event", name: "Claimed", inputs: [{ type: "uint256", name: "writeId", indexed: true }, { type: "uint256", name: "usdcReleased" }, { type: "uint256", name: "whypeReleased" }] },
+  { type: "event", name: "Claimed", inputs: [{ type: "uint256", name: "writeId", indexed: true }, { type: "uint256", name: "settlementReleased" }, { type: "uint256", name: "coverReleased" }] },
   {
     type: "event",
     name: "Unwritten",
     inputs: [
       { type: "uint256", name: "writeId", indexed: true }, { type: "uint256", name: "units" }, { type: "uint256", name: "raw" }, { type: "uint256", name: "sWad" },
-      { type: "uint256", name: "sigmaBps" }, { type: "int256", name: "cost" }, { type: "uint256", name: "fee" }, { type: "uint256", name: "usdcPaid" },
-      { type: "uint256", name: "whypePaid" }, { type: "uint256", name: "walletPaid" }, { type: "bool", name: "capped" }, { type: "bool", name: "markFromSample" },
+      { type: "uint256", name: "sigmaBps" }, { type: "int256", name: "cost" }, { type: "uint256", name: "fee" }, { type: "uint256", name: "settlementPaid" },
+      { type: "uint256", name: "coverPaid" }, { type: "uint256", name: "walletPaid" }, { type: "bool", name: "capped" }, { type: "bool", name: "markFromSample" },
       { type: "bool", name: "volFromSample" },
     ],
   },
@@ -200,8 +201,8 @@ const POOL = m4.MainspringPool!;
 const ENGINE = m4.Engine!;
 const BOOK = m4.PathFundingBook!;
 const WB = m4.WriterBook!;
-const MUSDC = m4.MockUSDC!;
-const MWHYPE = m4.MockWHYPE!;
+const MUSDC = m4.SettlementToken!;
+const MSTOCK = m4.MockStockToken!;
 await rpc("evm_increaseTime", [3600]);
 await rpc("evm_mine");
 
@@ -264,18 +265,18 @@ for (const w of [...LPS, ...TRADERS, W1!, W2!]) {
 await must(BROKE!, MUSDC, "mint", [BROKE!, 100n * USDC]); // a covered writer: a little USDC for small debits, later none
 await must(BROKE!, MUSDC, "approve", [WB, 10n ** 30n]);
 for (const w of WRITERS) {
-  await must(w, MWHYPE, "mint", [w, 100_000n * WAD]);
-  await must(w, MWHYPE, "approve", [WB, 10n ** 30n]);
+  await must(w, MSTOCK, "mint", [w, 100_000n * WAD]);
+  await must(w, MSTOCK, "approve", [WB, 10n ** 30n]);
 }
 say(`deployed; pool ${POOL}; WriterBook ${WB}`);
 
 // ---------------------------------------------------------------- the simulated venue and the price path
 
-const PRICE: Record<string, number> = { BTC: 100_000, ETH: 3_000, HYPE: 40 };
-const sim = new SimVenue(MARKETS.map((n) => ({ name: n, szDecimals: SZ[n]!, mid: PRICE[n]! })));
+const PRICE: Record<string, number> = { BTC: 100_000, ETH: 3_000, STK1: 40 };
+const sim = new SimExchange(MARKETS.map((n) => ({ name: n, szDecimals: SZ[n]!, mid: PRICE[n]! })));
 sim.deposit(1_000_000);
 let walking = true;
-const shock: Record<string, number | null> = { BTC: null, HYPE: null };
+const shock: Record<string, number | null> = { BTC: null, STK1: null };
 const pricer = (async () => {
   let k = 1;
   while (walking) {
@@ -308,12 +309,12 @@ function service(name: string, cwd: string, args: string[]): Proc {
 const statusFile = join(out, "hedger-status.json");
 const procs: Proc[] = [];
 for (const [i, s] of [S1!, S2!, S3!].entries()) {
-  procs.push(service(`signer-${i + 1}`, join(SERVICES, "quorum-signer"), ["--deployment", m1File, "--rpc", RPC, "--local-unlocked", s, "--hl-api", sim.url, "--test-vol", "0.5", "--equity-pool", POOL, "--equity-hl-user", POOL_HL]));
+  procs.push(service(`signer-${i + 1}`, join(SERVICES, "quorum-signer"), ["--deployment", m1File, "--rpc", RPC, "--local-unlocked", s, "--test-vol", "0.5", "--equity-pool", POOL, "--exchange", "sim", "--exchange-url", sim.url]));
 }
 procs.push(service("poker-primary", join(SERVICES, "poker"), ["--deployment", m4File, "--rpc", RPC, "--local-unlocked", POKER1!, "--role", "primary"]));
 procs.push(service("poker-backup", join(SERVICES, "poker"), ["--deployment", m4File, "--rpc", RPC, "--local-unlocked", POKER2!, "--role", "backup"]));
-procs.push(service("hedger", join(SERVICES, "hedger"), ["--deployment", m4File, "--rpc", RPC, "--hl-user", POOL_HL, "--venue", "sim", "--venue-url", sim.url, "--status-file", statusFile, "--tick-seconds", "15"]));
-procs.push(service("risk-monitor", join(SERVICES, "risk-monitor"), ["--deployment", m4File, "--rpc", RPC, "--local-unlocked", RISK!, "--hl-api", sim.url, "--hl-user", POOL_HL, "--hedger-status", statusFile, "--equity-every-seconds", "300"]));
+procs.push(service("hedger", join(SERVICES, "hedger"), ["--deployment", m4File, "--rpc", RPC, "--exchange", "sim", "--exchange-url", sim.url, "--status-file", statusFile, "--tick-seconds", "15"]));
+procs.push(service("risk-monitor", join(SERVICES, "risk-monitor"), ["--deployment", m4File, "--rpc", RPC, "--local-unlocked", RISK!, "--exchange", "sim", "--exchange-url", sim.url, "--hedger-status", statusFile, "--equity-every-seconds", "300"]));
 
 // ---------------------------------------------------------------- shapes, ledgers and checks
 
@@ -363,14 +364,14 @@ function buyerShape(m: string, mark: number, kind: number): Leg[] {
   return [{ isCall: true, k: K - 2 * w, qty: 1 }, { isCall: true, k: K - w, qty: -1 }, { isCall: true, k: K + w, qty: -1 }, { isCall: true, k: K + 2 * w, qty: 1 }];
 }
 
-/// Writer shapes (the writer's side) and whether WHYPE covers them.
+/// Writer shapes (the writer's side) and whether STK1 stock covers them.
 function writerShape(m: string, mark: number, kind: number): { legs: Leg[]; cover: boolean } {
   const K = kAt(m, mark);
   const w = Math.max(STEP[m]!, kAt(m, mark * 0.02));
   if (kind === 0) return { legs: [{ isCall: true, k: K, qty: -1 }, { isCall: true, k: K + w, qty: 1 }], cover: false }; // written call spread
   if (kind === 1) return { legs: [{ isCall: false, k: K - 2 * w, qty: 1 }, { isCall: false, k: K - w, qty: -1 }, { isCall: true, k: K + w, qty: -1 }, { isCall: true, k: K + 2 * w, qty: 1 }], cover: false }; // Band
   if (kind === 2) return { legs: [{ isCall: true, k: K - w, qty: -1 }, { isCall: true, k: K, qty: 2 }, { isCall: true, k: K + w, qty: -1 }], cover: false }; // written butterfly
-  if (kind === 3) return { legs: [{ isCall: true, k: kAt(m, mark * 1.1), qty: -1 }], cover: true }; // covered HYPE Rise
+  if (kind === 3) return { legs: [{ isCall: true, k: kAt(m, mark * 1.1), qty: -1 }], cover: true }; // covered STK1 Rise
   return { legs: [{ isCall: false, k: kAt(m, mark * 0.9), qty: 1 }, { isCall: true, k: kAt(m, mark * 1.1), qty: -1 }], cover: true }; // Guard
 }
 
@@ -429,7 +430,7 @@ async function sellAll(who: Address): Promise<void> {
 async function write(who: Address, m: string, kind: number): Promise<W | null> {
   const mark = (await routerMark(m)) ?? PRICE[m]!;
   const { legs, cover } = writerShape(m, mark, kind);
-  const units = m === "HYPE" ? 50 + Math.floor(rand() * 150) : (10_000 + rand() * 20_000) / PRICE[m]!;
+  const units = m === "STK1" ? 50 + Math.floor(rand() * 150) : (10_000 + rand() * 20_000) / PRICE[m]!;
   const r = await tx(who, WB, "write", [b32(m), legArgs(legs), tempoArg(DAY), wadStr(units), cover, -(2n ** 200n), 99_999_999_999n]);
   attempts.push({ kind: "write", who, ok: r.ok, reason: r.ok ? undefined : r.reason, gas: r.ok ? r.receipt.gasUsed : undefined, phase, legs: legs.length });
   if (!r.ok) return null;
@@ -443,7 +444,7 @@ async function write(who: Address, m: string, kind: number): Promise<W | null> {
     legs,
     cover: wadStr(Math.max(0, coverQty)),
     seriesId: ev.args.seriesId as bigint,
-    lockedAtWrite: [ev.args.usdcLocked as bigint, ev.args.whypeLocked as bigint],
+    lockedAtWrite: [ev.args.settlementLocked as bigint, ev.args.coverLocked as bigint],
     claimed: [0n, 0n],
     released: [0n, 0n],
   };
@@ -452,10 +453,10 @@ async function write(who: Address, m: string, kind: number): Promise<W | null> {
   return w;
 }
 
-type WState = { writer: Address; raw: bigint; usdcL: bigint; whypeL: bigint };
+type WState = { writer: Address; raw: bigint; usdcL: bigint; coverL: bigint };
 async function wstate(wid: bigint): Promise<WState> {
   const r = await read<readonly [Address, string, bigint, bigint, bigint, bigint, bigint, bigint]>(WB, "writes", [wid]);
-  return { writer: r[0], raw: r[3], usdcL: r[6], whypeL: r[7] };
+  return { writer: r[0], raw: r[3], usdcL: r[6], coverL: r[7] };
 }
 
 async function claim(w: W): Promise<void> {
@@ -463,7 +464,7 @@ async function claim(w: W): Promise<void> {
   attempts.push({ kind: "claim", who: w.writer, ok: r.ok, reason: r.ok ? undefined : r.reason, gas: r.ok ? r.receipt.gasUsed : undefined, phase });
   if (r.ok) {
     const ev = decoded(r.receipt).find((e) => e.eventName === "Claimed")!;
-    w.claimed = [w.claimed[0] + (ev.args.usdcReleased as bigint), w.claimed[1] + (ev.args.whypeReleased as bigint)];
+    w.claimed = [w.claimed[0] + (ev.args.settlementReleased as bigint), w.claimed[1] + (ev.args.coverReleased as bigint)];
   }
 }
 
@@ -482,11 +483,11 @@ async function unwrite(w: W, frac: number): Promise<void> {
   if (!r.ok) return;
   const ev = decoded(r.receipt).find((e) => e.eventName === "Unwritten")!;
   const after = await wstate(w.wid);
-  const usdcPart = before.usdcL - after.usdcL;
-  const whypePart = before.whypeL - after.whypeL;
-  w.released = [w.released[0] + usdcPart, w.released[1] + whypePart];
+  const settlementPart = before.usdcL - after.usdcL;
+  const coverPart = before.coverL - after.coverL;
+  w.released = [w.released[0] + settlementPart, w.released[1] + coverPart];
   const s = ev.args.sWad as bigint;
-  const cap = usdcPart + (whypePart * s) / WAD / 10n ** 12n;
+  const cap = settlementPart + (coverPart * s) / WAD / 10n ** 12n;
   const cost = ev.args.cost as bigint;
   if (cost > cap) violations.push(`gate: unwrite ${w.wid} cost ${cost} above the collateral's value ${cap}`);
   if (ev.args.capped as boolean) {
@@ -522,7 +523,7 @@ async function checkWrites(label: string): Promise<void> {
       if (p < min) min = p;
     }
     if (min < 0n && st.usdcL * 10n ** 12n * WAD < ((-min) * unitsNow) / WAD) violations.push(`${label}: write ${w.wid} USDC below the exact worst case`);
-    if (st.whypeL < (w.cover * unitsNow) / WAD) violations.push(`${label}: write ${w.wid} WHYPE below the cover`);
+    if (st.coverL < (w.cover * unitsNow) / WAD) violations.push(`${label}: write ${w.wid} STK1 stock below the cover`);
     // the obligation only shrinks
     const obligation = min < 0n ? ((-min) * unitsNow) / WAD : 0n;
     const key = w.wid.toString();
@@ -530,7 +531,7 @@ async function checkWrites(label: string): Promise<void> {
     if (last !== undefined && obligation > last) obligationRose++;
     lastObligation.set(key, obligation);
   }
-  const [tu, th, bu, bh] = await Promise.all([read<bigint>(WB, "totalUsdcLocked"), read<bigint>(WB, "totalWhypeLocked"), read<bigint>(MUSDC, "balanceOf", [WB]), read<bigint>(MWHYPE, "balanceOf", [WB])]);
+  const [tu, th, bu, bh] = await Promise.all([read<bigint>(WB, "totalSettlementLocked"), read<bigint>(WB, "totalCoverLocked", [MSTOCK]), read<bigint>(MUSDC, "balanceOf", [WB]), read<bigint>(MSTOCK, "balanceOf", [WB])]);
   if (tu !== bu || th !== bh) violations.push(`${label}: the WriterBook holds ${bu}/${bh}, locked ${tu}/${th}`);
 }
 
@@ -610,11 +611,11 @@ const lines = (name: string) =>
     : [];
 
 /// NAV checkpoint (owner's rule from step 7b): with nothing else moving, a write changes NAV only by the pool's share
-/// of the fee. NAV is compared without the equity and WHYPE terms, which move with the venue and the HYPE mark.
+/// of the fee. NAV is compared without the equity and STK1 stock terms, which move with the venue and the STK1 mark.
 const navChecks: { label: string; d: bigint; expected: bigint; ok: boolean }[] = [];
 async function navCheckpoint(label: string, who: Address, m: string, kind: number) {
   await hush();
-  const core = async () => (await read<bigint>(POOL, "navNow")) - (await read<bigint>(POOL, "equityTerm")) - (await read<bigint>(POOL, "whypeTerm"));
+  const core = async () => (await read<bigint>(POOL, "navNow")) - (await read<bigint>(POOL, "equityTerm")) - (await read<bigint>(POOL, "coverTerm"));
   for (let attempt = 0; attempt < 3; attempt++) {
     const e0 = await read<bigint>(POOL, "epoch");
     const n0 = await core();
@@ -642,7 +643,7 @@ async function navCheckpoint(label: string, who: Address, m: string, kind: numbe
 }
 
 /// Hedger checkpoint: with nothing else moving, the hedger's next target for each market equals an independent delta
-/// from the run's own ledger of legs, the pool's raw and written raw, the walked norm and the pool's WHYPE.
+/// from the run's own ledger of legs, the pool's raw and written raw, the walked norm and the pool's STK1 stock.
 const hedgeChecks: { label: string; market: string; target: number; expected: number; ok: boolean }[] = [];
 async function hedgerCheckpoint(label: string) {
   await hush();
@@ -663,7 +664,7 @@ async function hedgerCheckpoint(label: string) {
       const ud = terms.legs.reduce((a, l) => a + l.qty * blendDelta(l.isCall, s, l.k, sig, [{ tempo: terms.tempo, weight: 1 }]), 0);
       sum += units * ud;
     }
-    const heldCoins = m === "HYPE" ? Number(formatUnits(await read<bigint>(MWHYPE, "balanceOf", [POOL]), 18)) : 0;
+    const heldCoins = m === "STK1" ? Number(formatUnits(await read<bigint>(MSTOCK, "balanceOf", [POOL]), 18)) : 0;
     const expected = sum - heldCoins; // target = −(pool delta) = Σ units × delta − held coins
     const target = Number(plan.target);
     const ok = Math.abs(target - expected) <= Math.max(0.01, Math.abs(expected) * 0.01);
@@ -696,15 +697,15 @@ mark("B writing");
 await marksFresh();
 await navCheckpoint("written BTC call spread", W1!, "BTC", 0);
 await navCheckpoint("written BTC Band", W2!, "BTC", 1);
-await navCheckpoint("covered HYPE Rise", BROKE!, "HYPE", 3);
+await navCheckpoint("covered STK1 Rise", BROKE!, "STK1", 3);
 for (let i = 0; i < 8; i++) {
   const who = pick([W1!, W2!]);
-  const m = pick(["BTC", "ETH", "HYPE"]);
-  const kind = m === "HYPE" ? pick([3, 4]) : pick([0, 1, 2]);
+  const m = pick(["BTC", "ETH", "STK1"]);
+  const kind = m === "STK1" ? pick([3, 4]) : pick([0, 1, 2]);
   await write(who, m, kind);
   await sleep(10_000 * scale);
 }
-for (let i = 0; i < 3; i++) await write(BROKE!, "HYPE", 3); // more covered Rises for the WHYPE-only writer
+for (let i = 0; i < 3; i++) await write(BROKE!, "STK1", 3); // more covered Rises for the stock-only writer
 await checkWrites("after the writes");
 await hedgerCheckpoint("after the writes");
 for (const h of [2, 3]) {
@@ -720,25 +721,25 @@ await checkWrites("after the partial unwrites");
 
 mark("C shock");
 shock.BTC = PRICE.BTC! * 1.15;
-shock.HYPE = PRICE.HYPE! * 1.25;
-say(`shock: BTC to ${shock.BTC.toFixed(0)} (+15%), HYPE to ${shock.HYPE.toFixed(2)} (+25%) in 1.5% steps`);
-await waitFor("router at the shock prices", async () => ((await routerMark("BTC")) ?? 0) >= shock.BTC! * 0.995 && ((await routerMark("HYPE")) ?? 0) >= shock.HYPE! * 0.995, 900_000);
+shock.STK1 = PRICE.STK1! * 1.25;
+say(`shock: BTC to ${shock.BTC.toFixed(0)} (+15%), STK1 to ${shock.STK1.toFixed(2)} (+25%) in 1.5% steps`);
+await waitFor("router at the shock prices", async () => ((await routerMark("BTC")) ?? 0) >= shock.BTC! * 0.995 && ((await routerMark("STK1")) ?? 0) >= shock.STK1! * 0.995, 900_000);
 await checkWrites("at the shock");
 const shockStart = attempts.length;
 for (const w of writesMade.filter((x) => x.market === "BTC" && x.legs.length === 2)) await unwrite(w, 1); // written call spreads, deep in the money
-// the WHYPE-only writer keeps no USDC and closes every covered Rise
+// the stock-only writer keeps no USDC and closes every covered Rise
 const brokeUsdc = await read<bigint>(MUSDC, "balanceOf", [BROKE!]);
 if (brokeUsdc > 0n) await must(BROKE!, MUSDC, "transfer", [ANYONE!, brokeUsdc]);
 for (const w of writesMade.filter((x) => x.writer === BROKE)) await unwrite(w, 1);
 const brokeAfter = await read<bigint>(MUSDC, "balanceOf", [BROKE!]);
 for (const t of TRADERS) await sellAll(t);
 const shockActs = attempts.slice(shockStart);
-const poolWhype = await read<bigint>(MWHYPE, "balanceOf", [POOL]);
-say(`shock: ${shockActs.filter((a) => a.ok).length}/${shockActs.length} unwrites and sells ok; ${capped} capped; the WHYPE-only writer ends with ${usd(brokeAfter)} USDC; the pool holds ${formatUnits(poolWhype, 18)} WHYPE (NAV term ${usd(await read<bigint>(POOL, "whypeTerm"))})`);
+const poolCover = await read<bigint>(MSTOCK, "balanceOf", [POOL]);
+say(`shock: ${shockActs.filter((a) => a.ok).length}/${shockActs.length} unwrites and sells ok; ${capped} capped; the stock-only writer ends with ${usd(brokeAfter)} USDC; the pool holds ${formatUnits(poolCover, 18)} STK1 stock (NAV term ${usd(await read<bigint>(POOL, "coverTerm"))})`);
 await checkWrites("after the shock unwrites");
-await hedgerCheckpoint("after the shock (pool WHYPE)");
+await hedgerCheckpoint("after the shock (pool's covering stock)");
 shock.BTC = null;
-shock.HYPE = null;
+shock.STK1 = null;
 
 mark("D pauses");
 await warp("hour 4");
@@ -833,13 +834,13 @@ for (const w of writesMade) {
   const st = await wstate(w.wid);
   const inU = w.lockedAtWrite[0];
   const inH = w.lockedAtWrite[1];
-  if (w.claimed[0] + w.released[0] + st.usdcL !== inU || w.claimed[1] + w.released[1] + st.whypeL !== inH) claimMismatch++;
+  if (w.claimed[0] + w.released[0] + st.usdcL !== inU || w.claimed[1] + w.released[1] + st.coverL !== inH) claimMismatch++;
 }
 const claims = of("claim");
 const claimedUsdc = writesMade.reduce((a, w) => a + w.claimed[0], 0n);
-const claimedWhype = writesMade.reduce((a, w) => a + w.claimed[1], 0n);
-report.push(`claims ${claims.filter((a) => a.ok).length}/${claims.length}: funding received ${usd(claimedUsdc).toFixed(2)} USDC and ${formatUnits(claimedWhype, 18)} WHYPE released by decay`);
-check(claimMismatch === 0 && obligationRose === 0 && claimedUsdc + claimedWhype > 0n, `claims and obligations: per write, claimed + released + still locked = locked at the write (${claimMismatch} mismatches); no obligation rose (${obligationRose}); claims released only what decay freed (law 4 held after every claim)`);
+const claimedCover = writesMade.reduce((a, w) => a + w.claimed[1], 0n);
+report.push(`claims ${claims.filter((a) => a.ok).length}/${claims.length}: funding received ${usd(claimedUsdc).toFixed(2)} USDC and ${formatUnits(claimedCover, 18)} STK1 stock released by decay`);
+check(claimMismatch === 0 && obligationRose === 0 && claimedUsdc + claimedCover > 0n, `claims and obligations: per write, claimed + released + still locked = locked at the write (${claimMismatch} mismatches); no obligation rose (${obligationRose}); claims released only what decay freed (law 4 held after every claim)`);
 
 // 7. hedger
 const hedger = lines("hedger");
@@ -848,7 +849,7 @@ const inBand = plans.filter((l) => l.reason === "in-band").length;
 const hedgeRows = hedger.filter((l) => l.msg === "hedge");
 const hedgeErrors = hedgeRows.filter((l) => l.status === "error");
 report.push(`hedger: ${hedgeRows.length} hedge rows (${hedgeRows.filter((l) => l.status === "filled").length} filled), ${plans.length} plans, ${inBand} in band; checkpoints: ${hedgeChecks.map((c) => `${c.label} ${c.market} ${c.target.toFixed(3)} vs ${c.expected.toFixed(3)}`).join("; ")}`);
-check(hedgeErrors.length === 0 && inBand / Math.max(1, plans.length) >= 0.8 && hedgeChecks.length >= 9 && hedgeChecks.every((c) => c.ok), `hedger: no venue errors, ≥80% of passes in band (${((100 * inBand) / Math.max(1, plans.length)).toFixed(0)}%), every checkpoint target = the independent delta incl. shapes, writes and the pool's WHYPE (${hedgeChecks.filter((c) => c.ok).length}/${hedgeChecks.length})`);
+check(hedgeErrors.length === 0 && inBand / Math.max(1, plans.length) >= 0.8 && hedgeChecks.length >= 9 && hedgeChecks.every((c) => c.ok), `hedger: no venue errors, ≥80% of passes in band (${((100 * inBand) / Math.max(1, plans.length)).toFixed(0)}%), every checkpoint target = the independent delta incl. shapes, writes and the pool's STK1 stock (${hedgeChecks.filter((c) => c.ok).length}/${hedgeChecks.length})`);
 
 // 8. walker
 walkerMisses = attempts.filter((a) => (a.kind === "buyShape" || a.kind === "buy" || a.kind === "write") && !a.ok && (a.reason ?? "").includes("NotCaughtUp")).length;
@@ -861,9 +862,9 @@ const engineUsdc = await read<bigint>(MUSDC, "balanceOf", [ENGINE]).catch(() => 
 let onchain = 0n;
 for (const w of [POOL, WB, PROTO!, ANYONE!, DEPLOYER!, ADMIN!, ...LPS, ...TRADERS, ...WRITERS]) onchain += await read<bigint>(MUSDC, "balanceOf", [w]).catch(() => 0n);
 const supply = await read<bigint>(MUSDC, "totalSupply").catch(() => 0n);
-let whypeOn = 0n;
-for (const w of [POOL, WB, ...WRITERS]) whypeOn += await read<bigint>(MWHYPE, "balanceOf", [w]).catch(() => 0n);
-const whypeSupply = await read<bigint>(MWHYPE, "totalSupply").catch(() => 0n);
+let coverOn = 0n;
+for (const w of [POOL, WB, ...WRITERS]) coverOn += await read<bigint>(MSTOCK, "balanceOf", [w]).catch(() => 0n);
+const coverSupply = await read<bigint>(MSTOCK, "totalSupply").catch(() => 0n);
 const bps = BigInt(await read<number>(POOL, "protocolFeeBps"));
 let protoExpected = 0n;
 for (const addr of [ENGINE, WB]) {
@@ -883,15 +884,15 @@ for (const w of writesMade) {
   bySeries.set(w.seriesId.toString(), (bySeries.get(w.seriesId.toString()) ?? 0n) + st.raw);
 }
 for (const [id, raw] of bySeries) if ((await read<bigint>(POOL, "writtenRaw", [BigInt(id)])) !== raw) writtenMismatch++;
-report.push(`accounting: engine ${usd(engineUsdc)}; USDC ${usd(onchain)} of supply ${usd(supply)}; WHYPE ${formatUnits(whypeOn, 18)} of ${formatUnits(whypeSupply, 18)}; protocol ${usd(protoGot)} vs 10% of every fee ${usd(protoExpected)}; written raw mismatches ${writtenMismatch}`);
-check(engineUsdc === 0n && onchain === supply && whypeOn === whypeSupply && protoGot === protoExpected && writtenMismatch === 0, "accounting: Engine 0; USDC and WHYPE conserved; the pool's written raw = the WriterBook's; the protocol got exactly 10% of every fee (buys, sells, writes, unwrites)");
+report.push(`accounting: engine ${usd(engineUsdc)}; USDC ${usd(onchain)} of supply ${usd(supply)}; STK1 stock ${formatUnits(coverOn, 18)} of ${formatUnits(coverSupply, 18)}; protocol ${usd(protoGot)} vs 10% of every fee ${usd(protoExpected)}; written raw mismatches ${writtenMismatch}`);
+check(engineUsdc === 0n && onchain === supply && coverOn === coverSupply && protoGot === protoExpected && writtenMismatch === 0, "accounting: Engine 0; USDC and STK1 stock conserved; the pool's written raw = the WriterBook's; the protocol got exactly 10% of every fee (buys, sells, writes, unwrites)");
 
 // 10. keeper, poker, logs
 const settles = lines("poker-primary").concat(lines("poker-backup")).filter((l) => l.msg === "keeper: settled");
 const risk = lines("risk-monitor").filter((l) => l.msg === "alarm");
-const settleStale = risk.filter((l) => l.name === "SETTLEMENT_STALE" && l.state === "raised");
+const settleStale = risk.filter((l) => l.name === "settlement-stale" && l.state === "raised");
 const nearWarp = (t: number) => warps.some((w) => t >= w && t <= w + 180_000);
-const sampleStale = risk.filter((l) => l.name === "SAMPLE_STALE" && l.state === "raised" && !nearWarp(Date.parse(String(l.t))));
+const sampleStale = risk.filter((l) => l.name === "sample-stale" && l.state === "raised" && !nearWarp(Date.parse(String(l.t))));
 let errorLines = 0;
 const samples: string[] = [];
 for (const f of ["signer-1", "signer-2", "signer-3", "poker-primary", "poker-backup", "hedger", "risk-monitor"]) {
@@ -902,7 +903,7 @@ for (const f of ["signer-1", "signer-2", "signer-3", "poker-primary", "poker-bac
     }
   }
 }
-report.push(`keeper: ${settles.length} settlements; SETTLEMENT_STALE ${settleStale.length}; SAMPLE_STALE outside clock jumps ${sampleStale.length}; error lines ${errorLines}`);
+report.push(`keeper: ${settles.length} settlements; settlement-stale ${settleStale.length}; sample-stale outside clock jumps ${sampleStale.length}; error lines ${errorLines}`);
 check(settles.length >= warps.length && settleStale.length === 0 && sampleStale.length === 0 && errorLines === 0, `keeper and poker: every hour settled, no stale alarms, no error lines${samples.length ? " (" + samples.join(" | ") + ")" : ""}`);
 
 // 11. gas

@@ -1,17 +1,28 @@
 import { expect, test } from "bun:test";
-import { checkForChain, parseArgs } from "../src/config.ts";
+import { checkCexForChain, checkOnchainForChain, parseCexArgs, parseOnchainArgs } from "../src/config.ts";
 
-const BASE = ["--deployment", "d.json", "--hl-user", "0x00000000000000000000000000000000000000E1"];
+test("hedger-cex: an exchange or fixed positions (a dry run); the sim only on anvil", () => {
+  expect(() => parseCexArgs(["--deployment", "d.json"])).toThrow("exactly one of");
+  const dry = parseCexArgs(["--deployment", "d.json", "--positions", "BTC=0,ETH=1.5"]);
+  expect(dry.dryRun).toBe(true);
+  expect(dry.positions!.get("ETH")).toBe(1.5);
+  expect(() => parseCexArgs(["--deployment", "d.json", "--exchange", "sim"])).toThrow("--exchange-url");
+  const sim = parseCexArgs(["--deployment", "d.json", "--exchange", "sim", "--exchange-url", "http://127.0.0.1:1"]);
+  expect(sim.dryRun).toBe(false);
+  expect(() => checkCexForChain(sim, 46630)).toThrow("local anvil");
+  checkCexForChain(sim, 31337);
+  expect(() => parseCexArgs(["--deployment", "d.json", "--exchange", "sim", "--exchange-url", "u", "--positions", "BTC=0"])).toThrow("exactly one of");
+  expect(() => parseCexArgs(["--deployment", "d.json", "--positions", "BTC=0", "--hl-user", "0x1"])).toThrow("unknown flag");
+  expect(parseCexArgs(["--deployment", "d.json", "--positions", "BTC=0", "--delta-cap", "BTC=1000"]).deltaCapUsd.BTC).toBe(1000);
+});
 
-test("dry run by default; the sim needs a local URL on anvil; testnet needs a keystore and the explicit approval flag", () => {
-  expect(parseArgs(BASE).venue).toBe("none");
-  expect(() => parseArgs([...BASE, "--venue", "sim"])).toThrow("--venue-url");
-  const sim = parseArgs([...BASE, "--venue", "sim", "--venue-url", "http://127.0.0.1:1"]);
-  expect(() => checkForChain(sim, 99801)).toThrow("local anvil");
-  checkForChain(sim, 31337);
-  expect(() => parseArgs([...BASE, "--venue", "hl-testnet"])).toThrow("owner's yes");
-  expect(() => parseArgs([...BASE, "--venue", "hl-testnet", "--agent-keystore", "tourbillon-hedger-agent"])).toThrow("owner's yes");
-  expect(parseArgs([...BASE, "--venue", "hl-testnet", "--agent-keystore", "x", "--testnet-orders-approved"]).venue).toBe("hl-testnet");
-  expect(() => parseArgs([...BASE, "--venue", "mainnet"])).toThrow("sim or hl-testnet");
-  expect(() => parseArgs(["--deployment", "d.json", "--positions", "BTC=0", "--venue", "sim", "--venue-url", "http://127.0.0.1:1"])).toThrow();
+test("hedger-onchain: no key is a dry run; a local key only on anvil; slippage at most 3%", () => {
+  expect(parseOnchainArgs(["--deployment", "d.json"]).dryRun).toBe(true);
+  const k = parseOnchainArgs(["--deployment", "d.json", "--local-unlocked", "0x00000000000000000000000000000000000000E1"]);
+  expect(k.dryRun).toBe(false);
+  expect(k.slippageBps).toBe(50);
+  expect(() => checkOnchainForChain(k, 46630)).toThrow("local anvil");
+  expect(parseOnchainArgs(["--deployment", "d.json", "--keystore", "keeper", "--dry-run"]).dryRun).toBe(true);
+  expect(() => parseOnchainArgs(["--deployment", "d.json", "--slippage-bps", "301"])).toThrow("0 to 300");
+  expect(() => parseOnchainArgs(["--deployment", "d.json", "--keystore", "a", "--local-unlocked", "0x00000000000000000000000000000000000000E1"])).toThrow("at most one");
 });

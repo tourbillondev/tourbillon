@@ -57,7 +57,7 @@ const CHUNK = 2000n;
 export async function indexOnce(client: PublicClient, db: Db, d: Dep, confirmations = 0n): Promise<{ blocks: bigint; ops: number }> {
   const head = (await client.getBlockNumber()) - confirmations;
   let from = (await cursor(db, CURSOR)) ?? d.deployBlock;
-  const watched = [d.book, d.board, d.engine, ...(d.agents ? [d.agents] : [])];
+  const watched = [d.book, d.board, d.engine, d.pool, ...(d.agents ? [d.agents] : [])];
   const known = new Set<string>();
   let ops = 0;
   const start = from;
@@ -68,7 +68,7 @@ export async function indexOnce(client: PublicClient, db: Db, d: Dep, confirmati
     const batch: Op[] = [];
     for (const l of parseEventLogs({ abi: eventsAbi, logs, strict: false }).sort((a, b) => Number(a.blockNumber - b.blockNumber) || a.logIndex - b.logIndex)) {
       if (!ts.has(l.blockNumber)) ts.set(l.blockNumber, (await client.getBlock({ blockNumber: l.blockNumber })).timestamp);
-      batch.push(...opsFor({ eventName: l.eventName, args: l.args as Record<string, unknown> }, ts.get(l.blockNumber)!, d.agents));
+      batch.push(...opsFor({ eventName: l.eventName, args: l.args as Record<string, unknown> }, ts.get(l.blockNumber)!, d.agents, `${l.transactionHash}:${l.logIndex}`));
     }
     const terms = new Map<string, SeriesTerms>();
     for (const o of batch) {

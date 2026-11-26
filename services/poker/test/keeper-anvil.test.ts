@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { createPublicClient, createWalletClient, http, parseEther, stringToHex, type Address, type PublicClient } from "viem";
 import { foundry } from "viem/chains";
+import { TEARDOWN_MS, hookLimit, within } from "@tourbillon/common/hooks.ts";
 
 // On a local anvil: DeployM1 + DeployM3, signers' votes sent by the test, an LP deposit, and the real poker process
 // keeping the pool's hourly cycle (start → mark → settle). Skipped without anvil and forge.
@@ -11,7 +12,7 @@ const haveTools = Bun.which("anvil") !== null && Bun.which("forge") !== null;
 const CONTRACTS = resolve(import.meta.dir, "../../../contracts");
 const PORT = 23545 + Math.floor(Math.random() * 1000);
 const RPC = `http://127.0.0.1:${PORT}`;
-const PX: Record<string, string> = { BTC: "100000", ETH: "3000", HYPE: "40" };
+const PX: Record<string, string> = { BTC: "100000", ETH: "3000", STK1: "40" };
 const abi = [
   { type: "function", name: "markKey", stateMutability: "pure", inputs: [{ type: "bytes32" }], outputs: [{ type: "bytes32" }] },
   { type: "function", name: "volKey", stateMutability: "pure", inputs: [{ type: "bytes32" }], outputs: [{ type: "bytes32" }] },
@@ -46,7 +47,7 @@ async function send(from: Address, address: Address, functionName: string, args:
   if (r.status !== "success") throw new Error(`${functionName} reverted`);
 }
 async function vote(): Promise<void> {
-  for (const m of ["BTC", "ETH", "HYPE"]) {
+  for (const m of ["BTC", "ETH", "STK1"]) {
     for (const fn of ["markKey", "volKey"] as const) {
       const key = await client.readContract({ address: m1.QuorumBoard!, abi, functionName: fn, args: [b32(m)] });
       let round = 0n;
@@ -74,7 +75,7 @@ async function advance(s: number) {
   await rpc("evm_mine");
 }
 
-beforeAll(async () => {
+beforeAll(within(import.meta.path, "setup", 300_000, async () => {
   if (!haveTools) return;
   tmp = mkdtempSync(join(tmpdir(), "keeper-anvil-"));
   anvil = Bun.spawn(["anvil", "--port", String(PORT), "--silent"], { stdout: "ignore", stderr: "ignore" });
@@ -98,17 +99,17 @@ beforeAll(async () => {
   m1 = await Bun.file(join(tmp, "31337.json")).json();
   m3 = await Bun.file(m3File).json();
   await advance(3600);
-  for (const m of ["BTC", "ETH", "HYPE"]) await send(acc[5]!, m1.MarkRouter!, "applyRoute", [b32(m)]);
+  for (const m of ["BTC", "ETH", "STK1"]) await send(acc[5]!, m1.MarkRouter!, "applyRoute", [b32(m)]);
   const LP = acc[8]!;
-  await send(LP, m3.MockUSDC!, "mint", [LP, 1_000_000n * 10n ** 6n]);
-  await send(LP, m3.MockUSDC!, "approve", [m3.MainspringPool!, 1_000_000n * 10n ** 6n]);
+  await send(LP, m3.SettlementToken!, "mint", [LP, 1_000_000n * 10n ** 6n]);
+  await send(LP, m3.SettlementToken!, "approve", [m3.MainspringPool!, 1_000_000n * 10n ** 6n]);
   await send(LP, m3.MainspringPool!, "deposit", [1_000_000n * 10n ** 6n]);
-}, 300_000);
+}), hookLimit(300_000));
 
-afterAll(() => {
+afterAll(within(import.meta.path, "teardown", TEARDOWN_MS, () => {
   anvil?.kill();
   if (tmp) rmSync(tmp, { recursive: true, force: true });
-});
+}), hookLimit(TEARDOWN_MS));
 
 test.skipIf(!haveTools)("one pass runs the whole cycle; the LP can claim; the next pass waits", async () => {
   await vote();

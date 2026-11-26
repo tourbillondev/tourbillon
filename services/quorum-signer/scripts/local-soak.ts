@@ -1,14 +1,19 @@
 import { appendFileSync, copyFileSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { createPublicClient, createWalletClient, http, type Address, type PublicClient } from "viem";
+import { readFileSync } from "node:fs";
+import { createPublicClient, createWalletClient, http, keccak256, parseEther, toHex, type Address, type Hex, type PublicClient } from "viem";
+import { standInFeeds, startStandIn } from "../test/standin.ts";
 import { foundry } from "viem/chains";
 import { marketBytes32 } from "../src/board.ts";
 import { loadDeployment } from "../src/deployment.ts";
 import { formatReport, Monitor, type Phase, type PhaseReport } from "../src/monitor.ts";
 
-/// Three signers on live Hyperliquid data against a local anvil, with outages on a schedule (M1 step 7).
-/// No key: anvil's unlocked accounts. Raw logs go to a temporary folder outside the repo.
+/// Three signers against a local anvil, with outages on a schedule (M1 step 7). Marks come from the real feeds path:
+/// one tokenized stock (STK1, from a local mock on-chain price adapter and an equity reference) and BTC and ETH (three
+/// exchanges and Pyth), all served by a local stand-in whose prices walk every few seconds. VOL is fixed at 50%
+/// (--test-vol): the realised vol needs a day of samples first. No key: anvil's unlocked accounts. Raw logs go to a
+/// temporary folder outside the repo.
 ///
 ///   bun scripts/local-soak.ts [--scale 1]      (--scale 0.1 runs the same schedule in a tenth of the time)
 
@@ -57,7 +62,7 @@ const signerAddrs = [acc[2]!, acc[3]!, acc[4]!];
 // Deploy, then move the chain clock past the 1 h router delay and apply the routes from a non-admin account
 const dep0 = Bun.spawnSync(
   ["forge", "script", "script/DeployM1.s.sol:DeployM1", "--rpc-url", RPC, "--unlocked", "--sender", acc[0]!, "--broadcast"],
-  { cwd: CONTRACTS, env: { ...process.env, ADMIN: acc[1]!, SIGNERS: signerAddrs.join(",") } },
+  { cwd: CONTRACTS, env: { ...process.env, ADMIN: acc[1]!, SIGNERS: signerAddrs.join(","), MARKETS: "STK1,BTC,ETH" } },
 );
 if (dep0.exitCode !== 0) throw new Error(`deploy failed: ${dep0.stderr.toString()}`);
 const depFile = join(out, "31337.json");
@@ -73,13 +78,44 @@ for (const m of dep.markets) {
 }
 say(`deployed: board ${dep.board}, router ${dep.router}; routes applied`);
 
+// The stand-in feeds and the mock on-chain price adapter, with prices that walk
+const art = JSON.parse(readFileSync(join(CONTRACTS, "out/MockPriceAdapter.sol/MockPriceAdapter.json"), "utf8")) as { bytecode: { object: Hex } };
+const feeder = createWalletClient({ chain: foundry, transport: http(RPC), account: acc[6]! });
+const adapter = (await client.waitForTransactionReceipt({ hash: await feeder.deployContract({ abi: [], bytecode: art.bytecode.object }) })).contractAddress!;
+const assetId = keccak256(toHex("standin:STK1"));
+const setAbi = [{ type: "function", name: "set", stateMutability: "nonpayable", inputs: [{ type: "bytes32" }, { type: "uint256" }], outputs: [] }] as const;
+const si = startStandIn();
+const level: Record<string, number> = { STK1: 412.3, BTC: 97_120, ETH: 3_050 };
+async function walk() {
+  for (const m of Object.keys(level)) {
+    level[m] = level[m]! * (1 + (Math.random() - 0.5) * 0.002);
+    si.set(m, level[m]!.toFixed(2));
+  }
+  const hash = await feeder.writeContract({ address: adapter, abi: setAbi, functionName: "set", args: [assetId, parseEther(level.STK1!.toFixed(2))] });
+  await client.waitForTransactionReceipt({ hash });
+}
+await walk();
+let walking = true;
+const walker = (async () => {
+  while (walking) {
+    await Bun.sleep(3_000);
+    try {
+      await walk();
+    } catch (e) {
+      say(`price walk failed: ${(e as Error).message.split("\n")[0]}`);
+    }
+  }
+})();
+const feedsFile = join(out, "feeds.json");
+writeFileSync(feedsFile, JSON.stringify(standInFeeds(si.url, [{ name: "STK1", kind: "stock", adapter, assetId }, { name: "BTC", kind: "crypto" }, { name: "ETH", kind: "crypto" }])));
+
 // Signers
 const procs: (ReturnType<typeof Bun.spawn> | null)[] = [null, null, null];
 async function pipeTo(stream: ReadableStream<Uint8Array>, file: string) {
   for await (const chunk of stream) appendFileSync(file, chunk);
 }
 function startSigner(i: number) {
-  const p = Bun.spawn(["bun", "src/main.ts", "--deployment", depFile, "--rpc", RPC, "--local-unlocked", signerAddrs[i]!], {
+  const p = Bun.spawn(["bun", "src/main.ts", "--deployment", depFile, "--rpc", RPC, "--local-unlocked", signerAddrs[i]!, "--feeds", feedsFile, "--test-vol", "0.5"], {
     cwd: ROOT,
     stdout: "pipe",
     stderr: "pipe",
@@ -128,6 +164,9 @@ polling = false;
 await poller;
 await mon.poll();
 for (let i = 0; i < 3; i++) await stopSigner(i);
+walking = false;
+await walker;
+si.stop();
 anvil.kill();
 
 const reports = mon.report(phases);
@@ -141,7 +180,7 @@ for (let i = 0; i < 3; i++) {
   const count = (pred: (l: Record<string, unknown>) => boolean) => lines.map((l) => JSON.parse(l)).filter(pred).length;
   say(
     `signer ${i + 1} log: ${count((l) => l.level === "error")} errors, ${count((l) => l.level === "alarm")} alarms, ` +
-      `${count((l) => l.msg === "voted" && l.status !== "success")} reverted votes, ${count((l) => l.msg === "vol started from candles")} vol start-ups`,
+      `${count((l) => l.msg === "voted" && l.status !== "success")} reverted votes, ${count((l) => l.msg === "mark: refused, no vote")} refused marks`,
   );
 }
 console.log("\n" + text);

@@ -1,6 +1,6 @@
 import { describe, expect, spyOn, test } from "bun:test";
 import { Conditions, emit } from "../src/alarm.ts";
-import { capHigh, coverageState, DEFAULTS, equityMismatch, hlMarketDown } from "../src/checks.ts";
+import { capHigh, coverageState, DEFAULTS, equityMismatch, exchangeMarketDown } from "../src/checks.ts";
 import { OutageTracker } from "../src/outage.ts";
 
 const MIN = 60_000;
@@ -22,7 +22,7 @@ describe("outage timer", () => {
 });
 
 describe("checks", () => {
-  test("coverage, caps, EQUITY tolerance and Hyperliquid health", () => {
+  test("coverage, caps, EQUITY tolerance and the exchange's health", () => {
     expect(coverageState(100, 101, DEFAULTS)).toBe("breached");
     expect(coverageState(109, 100, DEFAULTS)).toBe("low"); // 9% headroom
     expect(coverageState(110, 100, DEFAULTS)).toBe("ok");
@@ -35,10 +35,10 @@ describe("checks", () => {
     expect(equityMismatch(10_000, 11_001, 50_000, DEFAULTS)).toBe(true);
     expect(equityMismatch(10_000, 14_000, 500_000, DEFAULTS)).toBe(false); // 1% of 500k = 5,000
     expect(equityMismatch(10_000, 16_000, 500_000, DEFAULTS)).toBe(true);
-    expect(hlMarketDown(null, 100, DEFAULTS)).toBe(true);
-    expect(hlMarketDown(101.5, 100, DEFAULTS)).toBe(true);
-    expect(hlMarketDown(100.5, 100, DEFAULTS)).toBe(false);
-    expect(hlMarketDown(150, null, DEFAULTS)).toBe(false); // router stale: raised as MARK_STALE instead
+    expect(exchangeMarketDown(null, 100, DEFAULTS)).toBe(true);
+    expect(exchangeMarketDown(101.5, 100, DEFAULTS)).toBe(true);
+    expect(exchangeMarketDown(100.5, 100, DEFAULTS)).toBe(false);
+    expect(exchangeMarketDown(150, null, DEFAULTS)).toBe(false); // router stale: raised as mark-stale instead
   });
 });
 
@@ -51,21 +51,21 @@ describe("alarm lines", () => {
     });
     try {
       const c = new Conditions();
-      const a = { name: "MARK_STALE" as const, level: "alarm" as const, what: "stale", who: "signer operators", market: "BTC", values: { x: 1 } };
+      const a = { name: "mark-stale" as const, level: "alarm" as const, what: "stale", who: "signer operators", market: "BTC", values: { x: 1 } };
       c.set(true, a, "fresh again");
       c.set(true, a, "fresh again");
       c.set(true, { ...a, market: "ETH" }, "fresh again");
       c.set(false, a, "fresh again");
       c.set(false, a, "fresh again");
-      emit({ name: "TREASURY_SENT", state: "event", level: "alarm", what: "sent", who: "treasury operator", market: null, values: { amount: 5 } });
+      emit({ name: "treasury-sent", state: "event", level: "alarm", what: "sent", who: "treasury operator", market: null, values: { amount: 5 } });
     } finally {
       spy.mockRestore();
     }
     expect(lines.map((l) => `${l.name}:${l.market}:${l.state}`)).toEqual([
-      "MARK_STALE:BTC:raised",
-      "MARK_STALE:ETH:raised",
-      "MARK_STALE:BTC:cleared",
-      "TREASURY_SENT:null:event",
+      "mark-stale:BTC:raised",
+      "mark-stale:ETH:raised",
+      "mark-stale:BTC:cleared",
+      "treasury-sent:null:event",
     ]);
     for (const l of lines) {
       expect(l.msg).toBe("alarm");

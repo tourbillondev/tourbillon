@@ -1,0 +1,39 @@
+Tourbillon Alerts: what each post means (part 1 of 2)
+
+Icons: 🔴 most serious · 🟡 needs attention · 🟢 back to normal
+Sells and withdrawals are never paused by any of these.
+Information posts have no "Who" line: worth seeing, nothing to do.
+A market's alarms carry its name: mark-stale-STK1.
+This group gets alarms and information posts only. They never go to the staff group.
+
+PRICES AND DATA
+🟡 mark-stale: the mark or the board vol is stale; opens on that market close until fresh. Who: signer operators.
+🟡 sample-stale: no price sample recorded for too long. Who: keeper (poker) operator.
+🟡 settlement-stale: the pool has not settled a round for too long; deposits and withdrawals wait. Who: keeper operator.
+🟡 equity-not-ready: capital is at the crypto hedge exchange and EQUITY is not ready; NAV leaves it out. Who: signer operators.
+🔴 equity-mismatch: the board's EQUITY differs from the exchange account beyond tolerance. Who: signer operators and admin.
+🟡 receipts-stale: no hourly receipt root posted for 3 hours. Who: receipts operator.
+🟡 key-balance-low: a service key is low on gas. Who: that key's operator.
+
+POOL RISK
+🔴 coverage-breached: available {{SETTLEMENT}} no longer covers the stressed liability; new opens are refused. Who: admin (add or bring back capital).
+🟡 coverage-low: headroom above the stressed liability is low. Who: admin (watch).
+🟡 cap-high: a cap is nearly used up on a market. Who: admin (changes go through the timelock).
+🔴 drawdown-paused: NAV per share fell more than 15% below its 30-day high; all opens paused. Who: the Safe resumes after review.
+
+VENUE AND HEDGING
+🔴 venue-down-paused: the venue was down 15 minutes on a market; the automated key paused opens there. Who: the Safe unpauses after recovery.
+🟢 venue-recovered: the venue is healthy again. Who: the Safe unpauses when satisfied.
+🔴 pause-failed: the venue was down but the automatic pause failed. Who: the guardian, now.
+🔴 hedger-silent: the hedger has not reported for too long. Who: hedger operator.
+🟡 treasury-sent / treasury-returned: {{SETTLEMENT}} moved to or from the treasury. Who: treasury owners confirm.
+🟡 dex-down / cex-down: the on-chain stock hedge or the crypto exchange is down 5 minutes on a market. Who: hedger operator.
+
+STOCKS
+🔴 transfer-stuck: a tokenized stock could not move in a sell or close; kept owed, new opens there paused. Who: admin.
+🔴 split-mismatch: the signers' price moved by a split ratio; opens there paused until reviewed. Who: admin, then the Safe.
+🟡 quarter-cap-high: a closed-day quarter cap is nearly used up. Who: admin if it lasts.
+🟡 inventory-mismatch: the pool's stock holding is off its hedge target. Who: hedger operator.
+🟡 session-anchored (information): outside the session a stock mark was held in its band.
+
+Continued in part 2: open book, auction, governance, and where posts go.

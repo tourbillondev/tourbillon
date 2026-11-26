@@ -1,0 +1,86 @@
+{
+ "_about": "The regular US equity session (owner G2): one data file read by the signers (services/common/src/session.ts) and by DeployCalendar.s.sol for the on-chain SessionCalendar. Times: minutes after midnight New York. Daylight saving starts and ends at 02:00 New York (07:00 and 06:00 UTC). Day numbers count days since 1970-01-01 (New York dates). (U): Robinhood Chain's own hours are owner queue Q11; holidays as published by the US exchanges.",
+ "hours": {
+  "open": 570,
+  "close": 960,
+  "earlyClose": 780
+ },
+ "years": [
+  {
+   "year": 2026,
+   "dstStart": 1772953200,
+   "dstEnd": 1793512800,
+   "holidays": [
+    20454,
+    20472,
+    20500,
+    20546,
+    20598,
+    20623,
+    20637,
+    20703,
+    20783,
+    20812
+   ],
+   "earlyCloses": [
+    20784,
+    20811
+   ],
+   "holidayDates": [
+    "2026-01-01",
+    "2026-01-19",
+    "2026-02-16",
+    "2026-04-03",
+    "2026-05-25",
+    "2026-06-19",
+    "2026-07-03",
+    "2026-09-07",
+    "2026-11-26",
+    "2026-12-25"
+   ],
+   "earlyCloseDates": [
+    "2026-11-27",
+    "2026-12-24"
+   ],
+   "dstStartDate": "2026-03-08",
+   "dstEndDate": "2026-11-01"
+  },
+  {
+   "year": 2027,
+   "dstStart": 1805007600,
+   "dstEnd": 1825567200,
+   "holidays": [
+    20819,
+    20836,
+    20864,
+    20903,
+    20969,
+    20987,
+    21004,
+    21067,
+    21147,
+    21176
+   ],
+   "earlyCloses": [
+    21148
+   ],
+   "holidayDates": [
+    "2027-01-01",
+    "2027-01-18",
+    "2027-02-15",
+    "2027-03-26",
+    "2027-05-31",
+    "2027-06-18",
+    "2027-07-05",
+    "2027-09-06",
+    "2027-11-25",
+    "2027-12-24"
+   ],
+   "earlyCloseDates": [
+    "2027-11-26"
+   ],
+   "dstStartDate": "2027-03-14",
+   "dstEndDate": "2027-11-07"
+  }
+ ]
+}

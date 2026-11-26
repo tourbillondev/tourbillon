@@ -11,7 +11,7 @@ import {TempoBlend} from "../src/TempoBlend.sol";
 import {EnginePricing} from "../src/EnginePricing.sol";
 
 /// DeployM3 on top of a real M1 deployment, then a full local flow: EQUITY feed listed by the board admin, signers
-/// vote marks, vols and EQUITY, anyone pokes, an LP funds the pool through a round, a trader buys and sells.
+/// vote marks, vols and EQUITY, anyone pokes, an LP deposits into the pool through a round, a trader buys and sells.
 contract DeployM3Test is Test {
     address constant ADMIN = address(0xAD);
     address constant RISK = address(0x815C);
@@ -40,7 +40,8 @@ contract DeployM3Test is Test {
         c1.signers = new address[](3);
         (c1.signers[0], c1.signers[1], c1.signers[2]) = (S1, S2, S3);
         c1.markets = new bytes32[](3);
-        (c1.markets[0], c1.markets[1], c1.markets[2]) = (bytes32("BTC"), bytes32("ETH"), bytes32("HYPE"));
+        (c1.markets[0], c1.markets[1], c1.markets[2]) = (bytes32("BTC"), bytes32("ETH"), bytes32("STK1"));
+        c1.calendar = m1Script.loadCalendar(m1Script.CALENDAR_FILE());
         m1 = m1Script.deploy(c1, address(m1Script));
         m3Script = new DeployM3();
     }
@@ -51,6 +52,7 @@ contract DeployM3Test is Test {
         c.protocolRecipient = PROTO;
         c.router = IMarkRouter(address(m1.router));
         c.board = IVolSource(address(m1.board));
+        c.calendar = m1.calendar;
     }
 
     function test_wiringSettingsAndRoles() public {
@@ -63,27 +65,28 @@ contract DeployM3Test is Test {
         assertEq(address(d.engine.book()), address(d.book));
         assertEq(d.pool.engine(), address(d.engine));
         assertEq(address(d.pool.equityFeed()), address(m1.board));
-        assertEq(address(d.pool.asset()), address(d.usdc));
+        assertEq(address(d.pool.sessionCalendar()), address(m1.calendar), "weekend caps read the M1 calendar");
+        assertEq(address(d.pool.asset()), address(d.settlement));
         assertEq(d.pool.protocolRecipient(), PROTO);
         assertEq(d.pool.notionalCap("BTC"), 5_000_000e6);
         assertEq(d.pool.notionalCap("ETH"), 3_000_000e6);
-        assertEq(d.pool.notionalCap("HYPE"), 1_000_000e6);
+        assertEq(d.pool.notionalCap("STK1"), 1_000_000e6);
         assertEq(d.pool.directionalCap("BTC"), 1_000_000e6);
         assertEq(d.pool.directionalCap("ETH"), 600_000e6);
-        assertEq(d.pool.directionalCap("HYPE"), 250_000e6);
+        assertEq(d.pool.directionalCap("STK1"), 250_000e6);
         assertEq(d.pool.hedgerDeltaCap("BTC"), 2_500_000e6);
         assertEq(d.pool.hedgerDeltaCap("ETH"), 1_200_000e6);
-        assertEq(d.pool.hedgerDeltaCap("HYPE"), 357_143e6);
+        assertEq(d.pool.hedgerDeltaCap("STK1"), 625_000e6); // STK1 placeholders (owner queue Q13)
         // the rule directionalCap ≤ hedgerDeltaCap × 2 × shock holds for every deployed market (the pool refuses
         // otherwise, so a deploy with a cap the hedger cannot carry reverts)
         assertEq(d.pool.maxDirectionalCap("BTC"), 1_000_000e6);
         assertEq(d.pool.maxDirectionalCap("ETH"), 600_000e6);
-        assertEq(d.pool.maxDirectionalCap("HYPE"), 250_000_100000);
-        (bool listed, uint16 spread, uint128 step) = d.engine.markets("HYPE");
+        assertEq(d.pool.maxDirectionalCap("STK1"), 250_000e6); // 625,000 × 2 × 20%
+        (bool listed, uint16 spread, uint128 step) = d.engine.markets("STK1");
         assertTrue(listed);
         assertEq(spread, 200);
-        assertEq(step, 0.1e18);
-        assertEq(d.usdc.balanceOf(address(d.pool)), 0, "no funding: LPs fund the pool");
+        assertEq(step, 1e18); // $1 strikes for the placeholder stock
+        assertEq(d.settlement.balanceOf(address(d.pool)), 0, "no seed: LPs deposit into the pool");
         bytes32 admin = d.pool.DEFAULT_ADMIN_ROLE();
         assertTrue(d.pool.hasRole(admin, ADMIN));
         assertTrue(d.engine.hasRole(admin, ADMIN));
@@ -118,8 +121,8 @@ contract DeployM3Test is Test {
         c.router = IMarkRouter(address(0x1234));
         vm.expectRevert(abi.encodeWithSelector(DeployM3.BadConfig.selector, "M1 contracts"));
         m3Script.deploy(c, address(m3Script));
-        vm.chainId(99801);
-        vm.expectRevert(abi.encodeWithSelector(DeployM3.WrongChain.selector, uint256(99801)));
+        vm.chainId(46630); // local only: even the testnet is refused
+        vm.expectRevert(abi.encodeWithSelector(DeployM3.WrongChain.selector, uint256(46630)));
         m3Script.run();
     }
 
@@ -144,10 +147,10 @@ contract DeployM3Test is Test {
         _set(nowT + 1 hours);
         m1.router.applyRoute("BTC");
         m1.router.applyRoute("ETH");
-        m1.router.applyRoute("HYPE");
+        m1.router.applyRoute("STK1");
 
         // signers: marks and vols for every market, EQUITY twice (P&L 0)
-        bytes32[3] memory ms = [bytes32("BTC"), "ETH", "HYPE"];
+        bytes32[3] memory ms = [bytes32("BTC"), "ETH", "STK1"];
         uint256[3] memory px = [uint256(74_000e18), 2_000e18, 70e18];
         for (uint256 i; i < 3; ++i) {
             _voteAll(b, b.markKey(ms[i]), px[i]);
@@ -156,12 +159,12 @@ contract DeployM3Test is Test {
         _voteAll(b, eqKey, d.pool.EQUITY_OFFSET());
         d.book.poke("BTC");
         d.book.poke("ETH");
-        d.book.poke("HYPE");
+        d.book.poke("STK1");
 
-        // an LP funds the pool through a round
-        d.usdc.mint(LP, 2_000_000e6);
+        // an LP deposits into the pool through a round
+        d.settlement.mint(LP, 2_000_000e6);
         vm.startPrank(LP);
-        d.usdc.approve(address(d.pool), type(uint256).max);
+        d.settlement.approve(address(d.pool), type(uint256).max);
         d.pool.deposit(2_000_000e6);
         vm.stopPrank();
         d.pool.startEpoch();
@@ -172,9 +175,9 @@ contract DeployM3Test is Test {
         assertEq(d.pool.balanceOf(LP), 2_000_000e18);
 
         // a trader buys and sells; the protocol receives 10% of each fee
-        d.usdc.mint(TRADER, 100_000e6);
+        d.settlement.mint(TRADER, 100_000e6);
         vm.startPrank(TRADER);
-        d.usdc.approve(address(d.engine), type(uint256).max);
+        d.settlement.approve(address(d.engine), type(uint256).max);
         (uint256 id, uint256 cost) =
             d.engine.buy("BTC", true, 74_000e18, TempoBlend.single(1 days), 0.5e18, type(uint256).max, nowT);
         uint256 v = EnginePricing.unitValue(true, 74_000e18, 74_000e18, 4500, TempoBlend.single(1 days));
@@ -184,8 +187,8 @@ contract DeployM3Test is Test {
         vm.stopPrank();
         (uint256 gross, uint256 sellFee) = EnginePricing.sellQuote(v, 0.5e18, 74_000e18, 200);
         assertEq(net, gross - sellFee);
-        assertEq(d.usdc.balanceOf(PROTO), fee / 10 + sellFee / 10);
-        assertEq(d.usdc.balanceOf(address(d.engine)), 0);
+        assertEq(d.settlement.balanceOf(PROTO), fee / 10 + sellFee / 10);
+        assertEq(d.settlement.balanceOf(address(d.engine)), 0);
         assertEq(d.pool.openNotional("BTC"), 0, "the notional is released");
 
         // EQUITY: a second final makes the equity term ready (P&L 0, nothing sent: 0)

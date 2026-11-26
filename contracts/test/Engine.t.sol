@@ -63,7 +63,7 @@ abstract contract EngineBase is Test {
     address constant PAUSER = address(0x9A05E);
     address constant STRANGER = address(0xBAD);
 
-    MockUSDC usdc;
+    MockUSDC settlement;
     MockMarks marks;
     MockVols vols;
     HousePool pool;
@@ -83,10 +83,10 @@ abstract contract EngineBase is Test {
 
     function setUp() public {
         _set(T0);
-        usdc = new MockUSDC();
+        settlement = new MockUSDC();
         marks = new MockMarks();
         vols = new MockVols();
-        pool = new HousePool(address(this), usdc, FEES);
+        pool = new HousePool(address(this), settlement, FEES);
         // The book stores its engine permanently: predict the engine's address (deployed right after the book).
         address predicted = vm.computeCreateAddress(address(this), vm.getNonce(address(this)) + 1);
         book = new PathFundingBook(predicted, address(this), marks, vols);
@@ -95,8 +95,8 @@ abstract contract EngineBase is Test {
         assertEq(book.engine(), address(engine));
 
         pool.setEngine(address(engine));
-        usdc.mint(address(this), 10_000_000e6);
-        usdc.approve(address(pool), type(uint256).max);
+        settlement.mint(address(this), 10_000_000e6);
+        settlement.approve(address(pool), type(uint256).max);
         pool.deposit(1_000_000e6);
         pool.setCap(BTC, 5_000_000e6);
         pool.setCap(ETH, 5_000_000e6);
@@ -108,9 +108,9 @@ abstract contract EngineBase is Test {
         vols.set(BTC, 5000);
         book.record(BTC, 50_000e18, 5000);
 
-        usdc.mint(BUYER, 1_000_000e6);
+        settlement.mint(BUYER, 1_000_000e6);
         vm.prank(BUYER);
-        usdc.approve(address(engine), type(uint256).max);
+        settlement.approve(address(engine), type(uint256).max);
     }
 
     function _day() internal pure returns (TempoBlend.Part[] memory) {
@@ -140,10 +140,10 @@ contract EngineTest is EngineBase {
 
         assertEq(gotId, id);
         assertEq(cost, premium + fee);
-        assertEq(usdc.balanceOf(BUYER), 1_000_000e6 - cost);
-        assertEq(usdc.balanceOf(address(pool)), 1_000_000e6 + premium);
-        assertEq(usdc.balanceOf(FEES), fee);
-        assertEq(usdc.balanceOf(address(engine)), 0, "the engine holds no money");
+        assertEq(settlement.balanceOf(BUYER), 1_000_000e6 - cost);
+        assertEq(settlement.balanceOf(address(pool)), 1_000_000e6 + premium);
+        assertEq(settlement.balanceOf(FEES), fee);
+        assertEq(settlement.balanceOf(address(engine)), 0, "the engine holds no money");
         assertEq(book.balanceOf(id, BUYER), 2e18); // fresh series: norm 1
         assertEq(pool.openNotional(BTC), 100_000e6); // 2 units × $50,000
         // ATM 1-day call at σ 50% is worth about 0.92525% of S: about $462.6 per unit
@@ -224,8 +224,8 @@ contract EngineTest is EngineBase {
         vm.expectRevert(Engine.ZeroUnits.selector);
         engine.buy(BTC, true, 50_000e18, day, 0, type(uint256).max, nowT);
 
-        vm.expectRevert(abi.encodeWithSelector(Engine.NotListed.selector, bytes32("HYPE")));
-        engine.buy("HYPE", true, 70e18, day, 1e18, type(uint256).max, nowT);
+        vm.expectRevert(abi.encodeWithSelector(Engine.NotListed.selector, bytes32("STK1")));
+        engine.buy("STK1", true, 70e18, day, 1e18, type(uint256).max, nowT);
 
         vm.expectRevert(abi.encodeWithSelector(EnginePricing.StrikeOffStep.selector, 50_050e18, 100e18));
         engine.buy(BTC, true, 50_050e18, day, 1e18, type(uint256).max, nowT);
@@ -253,11 +253,11 @@ contract EngineTest is EngineBase {
 
     function test_overCapRevertsAndMovesNoMoney() public {
         pool.setCap(BTC, 49_999e6);
-        uint256 before = usdc.balanceOf(BUYER);
+        uint256 before = settlement.balanceOf(BUYER);
         vm.expectRevert(abi.encodeWithSelector(HousePool.CapExceeded.selector, BTC, 50_000e6, 49_999e6));
         _buy(true, 50_000e18, _day(), 1e18);
-        assertEq(usdc.balanceOf(BUYER), before);
-        assertEq(usdc.balanceOf(FEES), 0);
+        assertEq(settlement.balanceOf(BUYER), before);
+        assertEq(settlement.balanceOf(FEES), 0);
         assertEq(book.balanceOf(book.idOf(BTC, true, 50_000e18, _day()), BUYER), 0);
     }
 
@@ -298,10 +298,10 @@ contract EngineTest is EngineBase {
 
         uint256 v = EnginePricing.unitValue(isCall, s, k, sigma, _day());
         (uint256 premium, uint256 fee) = EnginePricing.buyQuote(v, units, s, 200);
-        uint256 before = usdc.balanceOf(BUYER);
+        uint256 before = settlement.balanceOf(BUYER);
         (, uint256 cost) = _buy(isCall, k, _day(), units);
         assertEq(cost, premium + fee);
-        assertEq(before - usdc.balanceOf(BUYER), premium + fee);
+        assertEq(before - settlement.balanceOf(BUYER), premium + fee);
     }
 
     // ---------------------------------------------------------------- gas

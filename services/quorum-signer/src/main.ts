@@ -6,11 +6,14 @@ import { loadSigner as loadKey, type Signer } from "@tourbillon/common/signer.ts
 import { estimateOrSkip as estimate } from "@tourbillon/common/tx.ts";
 import { boardAbi, boardErrorName, boardKeys, equityBoardKey, raceReason, readKeyState, type BoardKey } from "./board.ts";
 import { EquitySource, equityKey } from "./equity.ts";
+import { openExchange } from "@tourbillon/common/exchange.ts";
 import type { Kind, Reading } from "./decide.ts";
 import { checkForChain, parseArgs, TICK_SECONDS, type Config } from "./config.ts";
 import { decide } from "./decide.ts";
 import { loadDeployment, type Deployment } from "./deployment.ts";
-import { FixedSource, HyperliquidSource, SplitSource, type ValueSource } from "./source.ts";
+import { FeedSource, FixedSource, SplitSource, type ValueSource } from "./source.ts";
+import { buildFeeds, loadFeeds } from "./feedsConfig.ts";
+import { LOCAL_CHAIN_ID } from "@tourbillon/common/chain.ts";
 
 async function connect(cfg: Config, dep: Deployment): Promise<PublicClient> {
   const chain = chainFor(dep.chainId);
@@ -25,16 +28,19 @@ function loadSigner(cfg: Config, dep: Deployment): Promise<Signer> {
   return loadKey(cfg.key, dep.chainId, cfg.rpc);
 }
 
-/// Hyperliquid marks and vol by default. On anvil, --test-marks / --test-vol replace them. EQUITY readings come from the
-/// pool's Hyperliquid account when --equity-pool / --equity-hl-user are given.
-function sourceFor(cfg: Config, dep: Deployment): ValueSource {
-  const hl = cfg.hlApi ? new HyperliquidSource(dep.markets, cfg.hlApi) : new HyperliquidSource(dep.markets);
-  let base: ValueSource = cfg.testMarks ? new FixedSource(cfg.testMarks, undefined) : hl;
+/// MARK and VOL from the feeds file (each market's two-source check, marks.ts). On anvil, --test-marks / --test-vol
+/// replace them. EQUITY readings come from the pool's account at the crypto hedge exchange (read-only key) when
+/// --equity-pool / --exchange are given (RH6).
+async function sourceFor(cfg: Config, dep: Deployment, client: PublicClient): Promise<ValueSource> {
+  let base: ValueSource = cfg.testMarks
+    ? new FixedSource(cfg.testMarks, undefined)
+    : new FeedSource(buildFeeds(loadFeeds(cfg.feeds!, dep.markets, dep.chainId === LOCAL_CHAIN_ID), client));
   if (cfg.testVol !== undefined) base = new SplitSource(base, new FixedSource(undefined, cfg.testVol));
-  if (!cfg.equityHlUser) return base;
-  const equity = cfg.hlApi ? new EquitySource(cfg.equityHlUser, cfg.hlApi) : new EquitySource(cfg.equityHlUser);
+  if (!cfg.exchange) return base;
+  const ex = await openExchange(cfg.exchange, cfg.exchangeUrl, "read", dep.chainId === LOCAL_CHAIN_ID);
+  const equity = new EquitySource(ex);
   return {
-    name: `${base.name},equity:hyperliquid`,
+    name: `${base.name},equity:${ex.name}`,
     read(market: string, kind: Kind, now: number): Promise<Reading> {
       return kind === "EQUITY" ? equity.read(now) : base.read(market, kind, now);
     },
@@ -45,7 +51,7 @@ async function main(): Promise<void> {
   const cfg = parseArgs(process.argv.slice(2));
   const dep = loadDeployment(cfg.deployment);
   const client = await connect(cfg, dep);
-  const source = sourceFor(cfg, dep);
+  const source = await sourceFor(cfg, dep, client);
   const signer = await loadSigner(cfg, dep);
 
   if (!(await client.readContract({ address: dep.board, abi: boardAbi, functionName: "isSigner", args: [signer.address] }))) {

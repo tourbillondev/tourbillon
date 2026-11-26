@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 import { parseEther } from "viem";
 import { lowKeys, parseKeys } from "../src/keys.ts";
 
-test("the key list (addresses only, min in HYPE, default 0.2) and the keys below their minimum", () => {
+test("the key list (addresses only, min in the gas token, default 0.2) and the keys below their minimum", () => {
   const keys = parseKeys(JSON.stringify([
     { name: "signer-1", address: "0x00000000000000000000000000000000000000a1" },
     { name: "receipts", address: "0x00000000000000000000000000000000000000a2", min: "0.05" },

@@ -1,0 +1,2 @@
+/* live mode only: the progress mark in the transaction dialog */
+.tb-spin{animation:tb-spin 1s linear infinite;vertical-align:-2px}@keyframes tb-spin{to{transform:rotate(360deg)}}@media(prefers-reduced-motion:reduce){.tb-spin{animation:none}}

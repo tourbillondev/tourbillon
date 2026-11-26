@@ -1,7 +1,5 @@
-import { afterAll, beforeAll, describe, expect, spyOn, test } from "bun:test";
+import { describe, expect, test } from "bun:test";
 import { parseEther } from "viem";
-import { parseCandles } from "../src/hyperliquid.ts";
-import { HyperliquidSource, START_RETRY_MS } from "../src/source.ts";
 import {
   ANNUAL_STEPS,
   bpsToWad,
@@ -12,12 +10,11 @@ import {
   MIN_SIGMA_BPS,
   STEP_S,
   type Point,
+  MIN_START_RETURNS,
+  VolTracker,
 } from "../src/vol.ts";
+import { overlapsRegularSession } from "@tourbillon/common/session.ts";
 
-// Real reply, trimmed: the last 400 complete BTC 5-minute candles before 2026-11-11 15:45 UTC.
-const candles = await Bun.file(new URL("./fixtures/candles_BTC_5m.json", import.meta.url)).json();
-const LAST_CLOSE_S = candles.at(-1).t / 1000 + STEP_S;
-const meta = await Bun.file(new URL("./fixtures/metaAndAssetCtxs.json", import.meta.url)).json();
 
 /// Deterministic random numbers (mulberry32) and normal draws (Box-Muller).
 function rng(seed: number) {
@@ -67,7 +64,7 @@ describe("EwmaVol maths", () => {
     const p = path(0.3, 7 * 288, 3);
     const v = EwmaVol.start(p);
     const v0 = v.variance;
-    // feed exactly 288 returns of a fixed size worth 90% annual vol
+    // feed exactly 288 price changes of a fixed size worth 90% annual vol
     const r = 0.9 / Math.sqrt(ANNUAL_STEPS);
     let { t, px } = p.at(-1)!;
     for (let i = 0; i < 288; i++) v.update({ t: (t += STEP_S), px: (px *= Math.exp(i % 2 ? r : -r)) });
@@ -108,7 +105,7 @@ describe("EwmaVol maths", () => {
     expect(v.variance).toBe(variance);
   });
 
-  test("start-up needs at least one day of returns", () => {
+  test("start-up needs at least one day of price changes", () => {
     expect(() => EwmaVol.start(path(0.5, 287, 7))).toThrow("need 289");
     expect(() => EwmaVol.start(path(0.5, 288, 7))).not.toThrow();
   });
@@ -119,154 +116,71 @@ describe("EwmaVol maths", () => {
     expect(EwmaVol.start(path(0.01, 400, 8)).sigmaBps()).toBe(500);
     expect(EwmaVol.start(path(9, 400, 9)).sigmaBps()).toBe(50_000);
     expect(bpsToWad(4321)).toBe(parseEther("0.4321"));
-    expect(bpsToWad(4321) / 10n ** 14n).toBe(4321n); // what QuorumBoard.volBps returns
+    expect(bpsToWad(4321) / 10n ** 14n).toBe(4321n); // what QuorumBoard.volBps gives
     expect(() => bpsToWad(4321.5)).toThrow();
     expect(() => bpsToWad(499)).toThrow();
   });
 });
 
-describe("candles", () => {
-  test("real reply: closes become boundary prices, time-ordered", () => {
-    const pts = parseCandles(candles, "BTC", (LAST_CLOSE_S + 10) * 1000);
-    expect(pts.length).toBe(400);
-    expect(pts[0]!.t).toBe(candles[0].t / 1000 + STEP_S);
-    expect(pts.at(-1)!.px).toBe(Number(candles.at(-1).c));
-    const v = EwmaVol.start(pts);
-    expect(v.sigmaBps()).toBeGreaterThan(MIN_SIGMA_BPS);
-    expect(v.sigmaBps()).toBeLessThan(MAX_SIGMA_BPS);
+describe("VolTracker: this signer's own marks, session-aware for stocks", () => {
+  const FRI_CLOSE = Date.parse("2026-11-20T21:00:00Z"); // Friday 16:00 New York
+  const feed = (v: VolTracker, pts: Point[], offsetMs = 0) => {
+    for (const q of pts) v.sample(q.px, q.t * 1000 + offsetMs);
+  };
+
+  test("warms up for one day of steps, then votes; only the first price of a boundary counts", () => {
+    const v = new VolTracker(false, () => true);
+    const pts = path(0.6, MIN_START_RETURNS, 11);
+    feed(v, pts.slice(0, -1));
+    expect(v.sigmaBps()).toBeNull(); // one step short
+    expect(v.warmSteps).toBe(MIN_START_RETURNS - 1);
+    v.sample(pts.at(-1)!.px, pts.at(-1)!.t * 1000 + 1_000);
+    v.sample(pts.at(-1)!.px * 3, pts.at(-1)!.t * 1000 + 60_000); // same boundary: ignored
+    const est = EwmaVol.start(pts);
+    expect(v.sigmaBps()).toBe(est.sigmaBps());
+    expect(v.lastPointMs).toBe(pts.at(-1)!.t * 1000 + 1_000);
   });
 
-  test("an open candle is dropped; malformed replies are refused", () => {
-    expect(parseCandles(candles, "BTC", candles.at(-1).T).length).toBe(399);
-    expect(() => parseCandles(candles, "ETH", Date.now())).toThrow("wrong coin");
-    expect(() => parseCandles({}, "BTC", Date.now())).toThrow("not a list");
-    const bad = structuredClone(candles);
-    bad[5].c = "1e5";
-    expect(() => parseCandles(bad, "BTC", Date.now())).toThrow();
-    const swapped = structuredClone(candles);
-    [swapped[3], swapped[4]] = [swapped[4], swapped[3]];
-    expect(() => parseCandles(swapped, "BTC", Date.now())).toThrow("time order");
-  });
-});
-
-describe("HyperliquidSource VOL against a local fake server", () => {
-  let mark = "74000.0";
-  let candleMode: "ok" | "500" = "ok";
-  const bodies: string[] = [];
-  let server: ReturnType<typeof Bun.serve>;
-
-  beforeAll(() => {
-    server = Bun.serve({
-      port: 0,
-      async fetch(req) {
-        const body = await req.text();
-        bodies.push(body);
-        if (new URL(req.url).pathname !== "/info") return new Response("no", { status: 404 });
-        const q = JSON.parse(body);
-        if (q.type === "candleSnapshot") {
-          if (candleMode === "500") return new Response("down", { status: 500 });
-          return Response.json(candles);
-        }
-        const m = structuredClone(meta);
-        m[1][0].markPx = mark;
-        m[1][0].oraclePx = mark;
-        return Response.json(m);
-      },
-    });
-  });
-  afterAll(() => server.stop(true));
-
-  test("starts from candles, samples the first mark of each 5-minute boundary, ages correctly", async () => {
-    const quiet = spyOn(process.stdout, "write").mockImplementation(() => true);
-    try {
-      bodies.length = 0;
-      let t = (LAST_CLOSE_S + 10) * 1000; // 10 s after the last candle closed
-      const src = new HyperliquidSource(["BTC"], `http://127.0.0.1:${server.port}`, 3_000, () => t);
-      const chainNow = 1_900_000_000;
-
-      const first = await src.read("BTC", "VOL", chainNow);
-      expect(first).not.toBeNull();
-      const q = JSON.parse(bodies.find((b) => b.includes("candleSnapshot"))!);
-      expect(q.req).toMatchObject({ coin: "BTC", interval: "5m", endTime: t, startTime: t - 7 * 86_400_000 });
-      expect(first!.at).toBe(chainNow - 10); // the last candle close was 10 s ago
-      expect(first!.value % 10n ** 14n).toBe(0n); // whole bps
-      const est = src.vols.get("BTC")!.est!;
-      const steps0 = est.steps;
-
-      // Same boundary as the last candle close: not sampled again
-      await src.read("BTC", "MARK", chainNow);
-      expect(est.steps).toBe(steps0);
-
-      // Next boundary: the first mark is sampled, later marks in the same boundary are not
-      t += 300_000;
-      mark = "74100.0";
-      await src.read("BTC", "MARK", chainNow);
-      expect(est.steps).toBe(steps0 + 1);
-      expect(est.lastPx).toBe(74100);
-      t += 20_000;
-      mark = "80000.0";
-      await src.read("BTC", "MARK", chainNow);
-      expect(est.lastPx).toBe(74100);
-
-      // The reading's age is the time since that sample
-      expect((await src.read("BTC", "VOL", chainNow))!.at).toBe(chainNow - 20);
-    } finally {
-      quiet.mockRestore();
-    }
+  test("stocks: a weekend with no regular minute counts as one step, so Monday keeps voting", () => {
+    const t0 = FRI_CLOSE / 1000 - MIN_START_RETURNS * STEP_S; // a day of 24/5 trading up to Friday's close
+    const v = new VolTracker(true, overlapsRegularSession);
+    feed(v, path(0.5, MIN_START_RETURNS, 3, t0));
+    const before = v.sigmaBps();
+    expect(before).not.toBeNull();
+    const mon = Date.parse("2026-11-22T21:00:00Z"); // Sunday evening, before Monday's open
+    v.sample(100 * 1.01, mon);
+    expect(v.sigmaBps()).not.toBeNull(); // no restart
+    expect(v.restarts).toBe(0);
   });
 
-  test("a failed start-up gives no reading and is retried after a minute, not every tick", async () => {
-    const quiet = spyOn(process.stdout, "write").mockImplementation(() => true);
-    try {
-      let t = (LAST_CLOSE_S + 10) * 1000;
-      const src = new HyperliquidSource(["BTC"], `http://127.0.0.1:${server.port}`, 3_000, () => t);
-      candleMode = "500";
-      bodies.length = 0;
-      expect(await src.read("BTC", "VOL", 1)).toBeNull();
-      t += 20_000;
-      expect(await src.read("BTC", "VOL", 1)).toBeNull();
-      expect(bodies.filter((b) => b.includes("candleSnapshot")).length).toBe(1);
-      candleMode = "ok";
-      t += START_RETRY_MS;
-      // candles are now 80 s older than the clock: still recent enough
-      expect(await src.read("BTC", "VOL", 1)).not.toBeNull();
-    } finally {
-      candleMode = "ok";
-      quiet.mockRestore();
-    }
+  test("stocks: a long gap during regular hours starts again", () => {
+    const tue = Date.parse("2026-11-24T14:30:00Z") / 1000; // Tuesday's open
+    const v = new VolTracker(true, overlapsRegularSession);
+    feed(v, path(0.5, MIN_START_RETURNS, 5, tue - MIN_START_RETURNS * STEP_S));
+    expect(v.sigmaBps()).not.toBeNull();
+    v.sample(101, (tue + 2 * 3600) * 1000); // two silent hours in the session
+    expect(v.sigmaBps()).toBeNull();
+    expect(v.restarts).toBe(1);
   });
 
-  test("a gap over 1 h starts again from candles", async () => {
-    const quiet = spyOn(process.stdout, "write").mockImplementation(() => true);
-    try {
-      let t = (LAST_CLOSE_S + 10) * 1000;
-      const src = new HyperliquidSource(["BTC"], `http://127.0.0.1:${server.port}`, 3_000, () => t);
-      expect(await src.read("BTC", "VOL", 1)).not.toBeNull();
-      t += 2 * 3_600_000; // two hours with no samples
-      await src.read("BTC", "MARK", 1);
-      expect(src.vols.get("BTC")!.est).toBeNull();
-      // the candles on this server are now 2 h old, so the fresh start is refused: no reading, never stale vol
-      expect(await src.read("BTC", "VOL", 1)).toBeNull();
-    } finally {
-      quiet.mockRestore();
-    }
+  test("crypto: any gap over an hour starts again, weekends included", () => {
+    const t0 = FRI_CLOSE / 1000 - MIN_START_RETURNS * STEP_S;
+    const v = new VolTracker(false, overlapsRegularSession);
+    feed(v, path(0.5, MIN_START_RETURNS, 9, t0));
+    expect(v.sigmaBps()).not.toBeNull();
+    v.sample(100, Date.parse("2026-11-22T21:00:00Z"));
+    expect(v.sigmaBps()).toBeNull();
+    expect(v.restarts).toBe(1);
+  });
+
+  test("short gaps count as their own steps; bad prices are ignored", () => {
+    const v = new VolTracker(false, () => true);
+    v.sample(100, 1_800_000_000_000);
+    v.sample(Number.NaN, 1_800_000_300_000);
+    v.sample(-5, 1_800_000_300_000);
+    expect(v.warmSteps).toBe(0);
+    v.sample(101, 1_800_000_000_000 + 11 * STEP_S * 1000); // 11 steps: inside the 1 h limit
+    expect(v.warmSteps).toBe(1);
+    expect(v.restarts).toBe(0);
   });
 });
-
-// Opt-in: HL_LIVE=1 bun test test/vol.test.ts
-test.skipIf(process.env.HL_LIVE !== "1")("live: σ for BTC, ETH and HYPE from 7 days of candles", async () => {
-  const quiet = spyOn(process.stdout, "write").mockImplementation(() => true);
-  const src = new HyperliquidSource(["BTC", "ETH", "HYPE"]);
-  const out: string[] = [];
-  try {
-    for (const m of ["BTC", "ETH", "HYPE"]) {
-      const r = await src.read(m, "VOL", Math.floor(Date.now() / 1000));
-      expect(r).not.toBeNull();
-      const est = src.vols.get(m)!.est!;
-      out.push(`live ${m}: sigma ${(Number(r!.value / 10n ** 14n) / 100).toFixed(2)}% (${r!.value / 10n ** 14n} bps), ${est.steps} steps, ${est.capped} capped`);
-    }
-  } finally {
-    quiet.mockRestore();
-  }
-  for (const l of out) console.log(l);
-}, 30_000);

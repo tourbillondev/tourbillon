@@ -5,7 +5,10 @@ import {Test, console2} from "forge-std/Test.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {MakerVault} from "../src/MakerVault.sol";
 import {MockUSDC} from "./mocks/MockUSDC.sol";
-import {MockWHYPE} from "./mocks/MockWHYPE.sol";
+import {MockStockToken} from "./mocks/MockStockToken.sol";
+import {CoverFixture} from "./mocks/CoverFixture.sol";
+import {CoverLedger as CoverLedgerErrors} from "../src/CoverLedger.sol";
+import {CoveringAssets} from "../src/CoveringAssets.sol";
 
 /// M6 step 3: the MakerVault.
 contract MakerVaultTest is Test {
@@ -17,35 +20,35 @@ contract MakerVaultTest is Test {
     address constant M2 = address(0x4D2);
     address constant M3 = address(0x4D3);
 
-    MockUSDC usdc;
-    MockWHYPE whype;
+    MockUSDC settlement;
+    MockStockToken stock;
     MakerVault vault;
 
     function setUp() public {
-        usdc = new MockUSDC();
-        whype = new MockWHYPE();
-        vault = new MakerVault(ADMIN, IERC20(address(usdc)), IERC20(address(whype)));
+        settlement = new MockUSDC();
+        stock = new MockStockToken("Mock Stock One", "STK1", 18);
+        vault = new MakerVault(ADMIN, IERC20(address(settlement)), CoverFixture.listed(address(this), address(0x4A4B), IERC20(address(stock))));
         vm.startPrank(ADMIN);
         vault.setMatchBook(BOOK);
         vault.setAuction(AUCTION);
         vm.stopPrank();
         address[3] memory ms = [M1, M2, M3];
         for (uint256 i; i < 3; ++i) {
-            usdc.mint(ms[i], 10_000_000e6);
-            whype.mint(ms[i], 1_000_000e18);
+            settlement.mint(ms[i], 10_000_000e6);
+            stock.mint(ms[i], 1_000_000e18);
             vm.startPrank(ms[i]);
-            usdc.approve(address(vault), type(uint256).max);
-            whype.approve(address(vault), type(uint256).max);
+            settlement.approve(address(vault), type(uint256).max);
+            stock.approve(address(vault), type(uint256).max);
             vm.stopPrank();
         }
     }
 
     function _u() internal view returns (IERC20) {
-        return IERC20(address(usdc));
+        return IERC20(address(settlement));
     }
 
     function _h() internal view returns (IERC20) {
-        return IERC20(address(whype));
+        return IERC20(address(stock));
     }
 
     // ---------------------------------------------------------------- 1. deposit and withdraw
@@ -59,21 +62,21 @@ contract MakerVaultTest is Test {
         vm.stopPrank();
         assertEq(vault.freeOf(M1, _u()), 1_000e6);
         assertEq(vault.freeOf(M1, _h()), 50e18);
-        assertEq(usdc.balanceOf(address(vault)), 1_000e6);
+        assertEq(settlement.balanceOf(address(vault)), 1_000e6);
 
-        // lock part: locked funds cannot be withdrawn
+        // lock part: locked balance cannot be withdrawn
         vm.prank(BOOK);
         vault.lock(M1, _u(), 600e6);
         vm.prank(M1);
         vm.expectRevert(abi.encodeWithSelector(MakerVault.InsufficientFree.selector, 401e6, 400e6));
         vault.withdraw(_u(), 401e6);
-        uint256 before = usdc.balanceOf(M1);
+        uint256 before = settlement.balanceOf(M1);
         vm.prank(M1);
         vault.withdraw(_u(), 400e6);
-        assertEq(usdc.balanceOf(M1) - before, 400e6);
+        assertEq(settlement.balanceOf(M1) - before, 400e6);
         assertEq(vault.freeOf(M1, _u()), 0);
         assertEq(vault.lockedOf(M1, _u()), 600e6);
-        // one maker's funds are not another's
+        // one maker's balance is not another's
         vm.prank(M2);
         vm.expectRevert(abi.encodeWithSelector(MakerVault.InsufficientFree.selector, 1, 0));
         vault.withdraw(_u(), 1);
@@ -118,33 +121,34 @@ contract MakerVaultTest is Test {
         assertEq(vault.freeOf(M1, _u()), 400e6);
         assertEq(vault.lockedOf(M1, _u()), 600e6);
 
-        // pay comes out of locked funds and leaves the vault
+        // pay comes out of locked balance and leaves the vault
         vm.expectRevert(abi.encodeWithSelector(MakerVault.InsufficientLocked.selector, 601e6, 600e6));
         vault.pay(M1, _u(), 601e6, POOL);
         vault.pay(M1, _u(), 250e6, POOL);
-        assertEq(usdc.balanceOf(POOL), 250e6);
+        assertEq(settlement.balanceOf(POOL), 250e6);
         assertEq(vault.lockedOf(M1, _u()), 350e6);
-        assertEq(vault.freeOf(M1, _u()), 400e6, "pay never touches free funds");
+        assertEq(vault.freeOf(M1, _u()), 400e6, "pay never touches free balance");
         vm.stopPrank();
 
-        // slash takes free funds only, at most what is there, and says how much
+        // slash takes free balance only, at most what is there, and says how much
         vm.prank(AUCTION); // the second operator
-        uint256 taken = vault.slash(M1, _u(), 150e6, POOL);
+        (uint256 taken,) = vault.slash(M1, _u(), 150e6, POOL);
         assertEq(taken, 150e6);
         vm.prank(BOOK);
-        taken = vault.slash(M1, _u(), 10_000e6, POOL);
+        (taken,) = vault.slash(M1, _u(), 10_000e6, POOL);
         assertEq(taken, 250e6, "only the free balance left");
         assertEq(vault.freeOf(M1, _u()), 0);
-        assertEq(vault.lockedOf(M1, _u()), 350e6, "slash never touches locked funds");
-        assertEq(usdc.balanceOf(POOL), 650e6);
+        assertEq(vault.lockedOf(M1, _u()), 350e6, "slash never touches locked balance");
+        assertEq(settlement.balanceOf(POOL), 650e6);
         vm.prank(BOOK);
-        assertEq(vault.slash(M1, _u(), 1e6, POOL), 0, "nothing free: nothing taken, no revert");
-        assertEq(usdc.balanceOf(address(vault)), 350e6);
+        (taken,) = vault.slash(M1, _u(), 1e6, POOL);
+        assertEq(taken, 0, "nothing free: nothing taken, no revert");
+        assertEq(settlement.balanceOf(address(vault)), 350e6);
     }
 
     // ---------------------------------------------------------------- 4. tokens and setup
 
-    function test_onlyUsdcAndWhypeAndOperatorsSetOnce() public {
+    function test_onlySettlementAndListedCoverAndOperatorsSetOnce() public {
         MockUSDC other = new MockUSDC();
         other.mint(M1, 1e6);
         vm.prank(M1);
@@ -161,7 +165,8 @@ contract MakerVaultTest is Test {
         vault.setAuction(address(0x1234));
         vm.stopPrank();
 
-        MakerVault fresh = new MakerVault(ADMIN, IERC20(address(usdc)), IERC20(address(whype)));
+        CoveringAssets cov = CoverFixture.listed(address(this), address(0x4A4B), IERC20(address(stock)));
+        MakerVault fresh = new MakerVault(ADMIN, IERC20(address(settlement)), cov);
         vm.prank(address(0xBAD));
         vm.expectRevert(MakerVault.NotAdmin.selector);
         fresh.setMatchBook(BOOK);
@@ -173,7 +178,7 @@ contract MakerVaultTest is Test {
         vm.expectRevert(MakerVault.NotOperator.selector);
         fresh.lock(M1, _u(), 0);
         vm.expectRevert(MakerVault.ZeroAddress.selector);
-        new MakerVault(address(0), IERC20(address(usdc)), IERC20(address(whype)));
+        new MakerVault(address(0), IERC20(address(settlement)), cov);
     }
 
     // ---------------------------------------------------------------- 5. conservation fuzz
@@ -260,5 +265,54 @@ contract MakerVaultTest is Test {
         vm.prank(M1);
         vault.withdraw(_u(), 100e6);
         console2.log("withdraw", g - gasleft());
+    }
+
+    // ---------------------------------------------------------------- 5. covering tokens (RH5, owner D3, G9)
+
+    /// A covering token must arrive exactly: a fee-on-transfer (or rebasing-on-transfer) deposit is refused.
+    function test_aCoveringDepositMustArriveExactly() public {
+        stock.setFeeBps(10); // 0.1% kept on the way
+        vm.prank(M1);
+        vm.expectRevert(abi.encodeWithSelector(CoverLedgerErrors.CoverNotExact.selector, 1_000e18, 999e18));
+        vault.deposit(_h(), 1_000e18);
+        stock.setFeeBps(0);
+        vm.prank(M1);
+        vault.deposit(_h(), 1_000e18);
+        assertEq(vault.freeOf(M1, _h()), 1_000e18);
+    }
+
+    /// A covering token that cannot move is not lost and stops nothing: it stays owed to its receiver, `pay` and
+    /// `slash` say it was not sent, and anyone settles it once the token moves again.
+    function test_aStuckCoveringPaymentIsOwedAndSettlesLater() public {
+        vm.prank(M1);
+        vault.deposit(_h(), 1_000e18);
+        vm.startPrank(BOOK);
+        vault.lock(M1, _h(), 600e18);
+        stock.setFrozen(true); // the issuer freezes transfers
+        bool sent = vault.pay(M1, _h(), 200e18, POOL);
+        assertFalse(sent);
+        assertEq(vault.owedCover(_h(), POOL), 200e18);
+        assertEq(vault.lockedOf(M1, _h()), 400e18, "the maker's lock is spent either way");
+        (uint256 taken, bool sent2) = vault.slash(M1, _h(), 50e18, POOL);
+        assertEq(taken, 50e18);
+        assertFalse(sent2);
+        assertEq(vault.owedCover(_h(), POOL), 250e18);
+        vm.stopPrank();
+        // still frozen: settling reverts and changes nothing
+        vm.expectRevert();
+        vault.settleCover(_h(), POOL);
+        assertEq(vault.owedCover(_h(), POOL), 250e18);
+        // unfrozen: anyone settles
+        stock.setFrozen(false);
+        vm.prank(address(0xA11CE));
+        vault.settleCover(_h(), POOL);
+        assertEq(stock.balanceOf(POOL), 250e18);
+        assertEq(vault.owedCover(_h(), POOL), 0);
+        assertEq(vault.owedCoverTotal(_h()), 0);
+        vm.expectRevert(CoverLedgerErrors.NothingOwed.selector);
+        vault.settleCover(_h(), POOL);
+        // USDC never goes through the owed ledger: it moves, or the call reverts
+        vm.prank(BOOK);
+        assertTrue(vault.pay(M1, _u(), 0, POOL));
     }
 }

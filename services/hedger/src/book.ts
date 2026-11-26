@@ -13,8 +13,17 @@ export const poolAbi = [
   { type: "function", name: "seriesRaw", stateMutability: "view", inputs: [{ type: "uint256" }], outputs: [{ type: "uint256" }] },
   { type: "function", name: "writtenRaw", stateMutability: "view", inputs: [{ type: "uint256" }], outputs: [{ type: "uint256" }] },
   { type: "function", name: "matchedRawOf", stateMutability: "view", inputs: [{ type: "uint256" }], outputs: [{ type: "uint256" }] },
-  { type: "function", name: "whype", stateMutability: "view", inputs: [], outputs: [{ type: "address" }] },
-  { type: "function", name: "whypeMarket", stateMutability: "view", inputs: [], outputs: [{ type: "bytes32" }] },
+  { type: "function", name: "coverAssets", stateMutability: "view", inputs: [], outputs: [{ type: "address" }] },
+] as const;
+
+export const coversAbi = [
+  {
+    type: "function",
+    name: "coverOf",
+    stateMutability: "view",
+    inputs: [{ type: "bytes32" }],
+    outputs: [{ type: "address" }, { type: "uint256" }],
+  },
 ] as const;
 
 export const erc20Abi = [
@@ -70,7 +79,7 @@ export async function walkedNorm(client: PublicClient, book: Address, id: bigint
 }
 
 /// Raw of a series matched to outside writers (M6); 0 on a pool without the open book (M3/M4 deployments: the call
-/// returns no data). Any other failure (an RPC error) is thrown, so a pass never hedges matched raw by mistake.
+/// gives no data). Any other failure (an RPC error) is thrown, so a pass never hedges matched raw by mistake.
 export async function matchedRaw(client: PublicClient, pool: Address, id: bigint): Promise<bigint> {
   try {
     return await client.readContract({ address: pool, abi: poolAbi, functionName: "matchedRawOf", args: [id] });
@@ -110,14 +119,16 @@ export async function readPositions(client: PublicClient, pool: Address, book: A
   return out;
 }
 
-/// WHYPE the pool holds outright (received in buybacks), in coins, if `market` is the market whose mark values it
-/// (M4 decision A); 0 otherwise. WHYPE locked in the WriterBook belongs to writers and is not counted.
+export { stockToken } from "@tourbillon/common/covers.ts";
+
+/// The market's covering token the pool holds outright (received in buybacks), in shares (RH5: CoveringAssets lists
+/// at most one token per market; a crypto market has none, so 0). Cover locked in the books belongs to writers and
+/// makers and is not counted.
 export async function poolHeldCoins(client: PublicClient, pool: Address, market: string): Promise<number> {
-  const [token, whypeMarket] = await Promise.all([
-    client.readContract({ address: pool, abi: poolAbi, functionName: "whype" }),
-    client.readContract({ address: pool, abi: poolAbi, functionName: "whypeMarket" }),
-  ]);
-  if (token === zeroAddress || whypeMarket !== stringToHex(market, { size: 32 })) return 0;
+  const covers = await client.readContract({ address: pool, abi: poolAbi, functionName: "coverAssets" });
+  if (covers === zeroAddress) return 0;
+  const [token, scale] = await client.readContract({ address: covers, abi: coversAbi, functionName: "coverOf", args: [stringToHex(market, { size: 32 })] });
+  if (token === zeroAddress) return 0;
   const bal = await client.readContract({ address: token, abi: erc20Abi, functionName: "balanceOf", args: [pool] });
-  return Number(formatEther(bal));
+  return Number(formatEther(bal * scale)); // own units × scale = WAD shares
 }

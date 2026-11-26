@@ -5,21 +5,22 @@ import {Test} from "forge-std/Test.sol";
 import {IAccessControl} from "@openzeppelin/contracts/access/IAccessControl.sol";
 import {QuorumBoard} from "../src/QuorumBoard.sol";
 import {QuorumMarkSource} from "../src/QuorumMarkSource.sol";
-import {CoreReadMarkSource} from "../src/CoreReadMarkSource.sol";
+import {NativeMarkSource, INativeMarkAdapter} from "../src/NativeMarkSource.sol";
 import {MarkRouter} from "../src/MarkRouter.sol";
 import {IMarkSource} from "../src/IMarkSource.sol";
 
-/// Stand-in for the HyperCore read precompile (shape (U)): abi.encode(uint32 index) -> uint64 raw.
-contract MockCorePrecompile {
-    mapping(uint32 => uint64) public raw;
+/// Stand-in for the adapter in front of Robinhood Chain's first-party mark (its interface is (U)).
+contract MockNativeAdapter is INativeMarkAdapter {
+    mapping(bytes32 => uint256) public px;
+    mapping(bytes32 => uint256) public at;
 
-    function set(uint32 index, uint64 value) external {
-        raw[index] = value;
+    function set(bytes32 assetId, uint256 pxWad, uint256 updatedAt) external {
+        px[assetId] = pxWad;
+        at[assetId] = updatedAt;
     }
 
-    fallback(bytes calldata data) external returns (bytes memory) {
-        require(data.length == 32, "shape");
-        return abi.encode(raw[abi.decode(data, (uint32))]);
+    function mark(bytes32 assetId) external view returns (uint256, uint256) {
+        return (px[assetId], at[assetId]);
     }
 }
 
@@ -40,11 +41,11 @@ contract MarkSourcesTest is Test {
     uint32 constant MAX_AGE = 120;
     uint256 constant DELAY = 48 hours;
     bytes32 constant BTC = "BTC";
-    bytes32 constant HYPE = "HYPE";
-    uint32 constant BTC_INDEX = 0;
-    uint32 constant HYPE_INDEX = 159;
-    // Placeholder address for tests only; the Elysium address is unpublished (U)
-    address constant PRECOMPILE = 0x0000000000000000000000000000000000000806;
+    bytes32 constant STK1 = "STK1"; // placeholder for a launch tokenized stock (owner queue Q2)
+    bytes32 constant BTC_ID = keccak256("native:BTC"); // the chain's own asset ids are (U)
+    bytes32 constant STK1_ID = keccak256("native:STK1");
+    // Placeholder address for tests only; the chain's first-party mark interface is unpublished (U)
+    address constant ADAPTER = 0x0000000000000000000000000000000000000806;
 
     address gov = makeAddr("timelock");
     address s1 = makeAddr("signer1");
@@ -54,8 +55,8 @@ contract MarkSourcesTest is Test {
 
     QuorumBoard board;
     QuorumMarkSource quorumSrc;
-    CoreReadMarkSource coreSrc;
-    MockCorePrecompile core;
+    NativeMarkSource nativeSrc;
+    MockNativeAdapter native;
     MarkRouter router;
 
     function setUp() public {
@@ -67,16 +68,16 @@ contract MarkSourcesTest is Test {
         board = new QuorumBoard(gov, signers, 2, 30);
         vm.startPrank(gov);
         board.setFeed(board.markKey(BTC), 200, HEARTBEAT);
-        board.setFeed(board.markKey(HYPE), 200, HEARTBEAT);
+        board.setFeed(board.markKey(STK1), 200, HEARTBEAT);
         vm.stopPrank();
         quorumSrc = new QuorumMarkSource(board);
 
-        vm.etch(PRECOMPILE, address(new MockCorePrecompile()).code);
-        core = MockCorePrecompile(payable(PRECOMPILE));
-        coreSrc = new CoreReadMarkSource(gov, PRECOMPILE);
+        vm.etch(ADAPTER, address(new MockNativeAdapter()).code);
+        native = MockNativeAdapter(ADAPTER);
+        nativeSrc = new NativeMarkSource(gov, ADAPTER);
         vm.startPrank(gov);
-        coreSrc.setAsset(BTC, BTC_INDEX, 5); // BTC: szDecimals 5, so raw has 1 decimal
-        coreSrc.setAsset(HYPE, HYPE_INDEX, 2); // HYPE: szDecimals 2, so raw has 4 decimals
+        nativeSrc.setAsset(BTC, BTC_ID);
+        nativeSrc.setAsset(STK1, STK1_ID);
         vm.stopPrank();
 
         router = new MarkRouter(gov, DELAY);
@@ -97,15 +98,15 @@ contract MarkSourcesTest is Test {
         board.vote(key, r, px);
     }
 
-    /// Puts `code` at the precompile address and checks the read reverts with PrecompileFailed
+    /// Puts `code` at the adapter address and checks the read reverts with AdapterFailed
     /// using less than `maxGas` in total.
     function _failsCleanly(bytes memory code, uint256 maxGas) internal {
-        vm.etch(PRECOMPILE, code);
+        vm.etch(ADAPTER, code);
         uint256 before = gasleft();
-        try coreSrc.markWad(BTC) {
+        try nativeSrc.markWad(BTC) {
             fail();
         } catch (bytes memory err) {
-            assertEq(bytes4(err), CoreReadMarkSource.PrecompileFailed.selector);
+            assertEq(bytes4(err), NativeMarkSource.AdapterFailed.selector);
         }
         assertLt(before - gasleft(), maxGas);
     }
@@ -121,38 +122,39 @@ contract MarkSourcesTest is Test {
         router.applyRoute(market);
     }
 
-    /// 1. The quorum and precompile sources report the same mark in the same WAD units.
+    /// 1. The quorum and native sources report the same mark in the same WAD units; the native source passes the
+    ///    chain's own time through, and its adapter fails cleanly.
     function test_sourcesAgreeInUnits() public {
-        core.set(BTC_INDEX, 971234); // 97123.4 with 1 decimal
-        core.set(HYPE_INDEX, 412345); // 41.2345 with 4 decimals
+        native.set(BTC_ID, 97123.4e18, nowT - 3);
+        native.set(STK1_ID, 412.345e18, nowT);
         _publish(BTC, 97123.4e18);
-        _publish(HYPE, 41.2345e18);
+        _publish(STK1, 412.345e18);
 
-        (uint256 coreBtc, uint256 coreAt) = coreSrc.markWad(BTC);
+        (uint256 nativeBtc, uint256 nativeAt) = nativeSrc.markWad(BTC);
         (uint256 quorumBtc, uint256 quorumAt) = quorumSrc.markWad(BTC);
-        assertEq(coreBtc, 97123.4e18);
-        assertEq(coreBtc, quorumBtc);
-        assertEq(coreAt, nowT); // precompile reading is fresh at the current block
+        assertEq(nativeBtc, 97123.4e18);
+        assertEq(nativeBtc, quorumBtc);
+        assertEq(nativeAt, nowT - 3); // the chain's own time, judged by the router
         assertEq(quorumAt, nowT);
 
-        (uint256 coreHype,) = coreSrc.markWad(HYPE);
-        (uint256 quorumHype,) = quorumSrc.markWad(HYPE);
-        assertEq(coreHype, 41.2345e18);
-        assertEq(coreHype, quorumHype);
+        (uint256 nativeStk,) = nativeSrc.markWad(STK1);
+        (uint256 quorumStk,) = quorumSrc.markWad(STK1);
+        assertEq(nativeStk, 412.345e18);
+        assertEq(nativeStk, quorumStk);
 
-        // Failure modes of the precompile adapter
-        vm.expectRevert(abi.encodeWithSelector(CoreReadMarkSource.UnknownMarket.selector, bytes32("ETH")));
-        coreSrc.markWad("ETH");
-        core.set(BTC_INDEX, 0);
-        vm.expectRevert(abi.encodeWithSelector(CoreReadMarkSource.ZeroMark.selector, BTC));
-        coreSrc.markWad(BTC);
-        // A failing, out-of-gas or malformed precompile reverts cleanly within the gas cap
-        assertEq(coreSrc.callGas(), 100_000);
+        // Failure modes of the adapter
+        vm.expectRevert(abi.encodeWithSelector(NativeMarkSource.UnknownMarket.selector, bytes32("ETH")));
+        nativeSrc.markWad("ETH");
+        native.set(BTC_ID, 0, nowT);
+        vm.expectRevert(abi.encodeWithSelector(NativeMarkSource.ZeroMark.selector, BTC));
+        nativeSrc.markWad(BTC);
+        // A failing, out-of-gas or malformed adapter reverts cleanly within the gas cap
+        assertEq(nativeSrc.callGas(), 100_000);
         _failsCleanly(hex"5f5ffd", 150_000); // reverts (PUSH0 PUSH0 REVERT)
         _failsCleanly(hex"fe", 150_000); // invalid opcode: burns only the capped gas
         _failsCleanly(hex"5b5f56", 150_000); // endless loop (JUMPDEST PUSH0 JUMP): out of gas at the cap
-        _failsCleanly(hex"60405ff3", 150_000); // 64-byte reply instead of 32
-        _failsCleanly(hex"5f195f5260205ff3", 150_000); // 32 bytes, but not a uint64
+        _failsCleanly(hex"60205ff3", 150_000); // a 32-byte reply instead of 64
+        _failsCleanly(hex"60605ff3", 150_000); // a 96-byte reply instead of 64
         _failsCleanly(hex"", 150_000); // no code at the address
 
         // The cap is configurable by governance only, with a floor
@@ -160,24 +162,50 @@ contract MarkSourcesTest is Test {
         vm.expectRevert(
             abi.encodeWithSelector(IAccessControl.AccessControlUnauthorizedAccount.selector, anyone, bytes32(0))
         );
-        coreSrc.setCallGas(50_000);
+        nativeSrc.setCallGas(50_000);
         vm.prank(gov);
-        vm.expectRevert(CoreReadMarkSource.BadConfig.selector);
-        coreSrc.setCallGas(9_999);
+        vm.expectRevert(NativeMarkSource.BadConfig.selector);
+        nativeSrc.setCallGas(9_999);
         vm.prank(gov);
-        coreSrc.setCallGas(30_000);
+        nativeSrc.setCallGas(30_000);
         _failsCleanly(hex"5b5f56", 60_000); // a lower cap bounds the loop lower
 
         // Quorum source with nothing published
         vm.expectRevert(abi.encodeWithSelector(QuorumBoard.NoData.selector, board.markKey("ETH")));
         quorumSrc.markWad("ETH");
 
-        // Only governance configures the adapter
-        vm.prank(anyone);
+        // Only governance configures the adapter; empty settings are refused
+        vm.startPrank(anyone);
         vm.expectRevert(
             abi.encodeWithSelector(IAccessControl.AccessControlUnauthorizedAccount.selector, anyone, bytes32(0))
         );
-        coreSrc.setAsset(BTC, 1, 5);
+        nativeSrc.setAsset(BTC, BTC_ID);
+        vm.expectRevert(
+            abi.encodeWithSelector(IAccessControl.AccessControlUnauthorizedAccount.selector, anyone, bytes32(0))
+        );
+        nativeSrc.setAdapter(anyone);
+        vm.stopPrank();
+        vm.startPrank(gov);
+        vm.expectRevert(NativeMarkSource.BadConfig.selector);
+        nativeSrc.setAsset(BTC, bytes32(0));
+        vm.expectRevert(NativeMarkSource.BadConfig.selector);
+        nativeSrc.setAdapter(address(0));
+        vm.stopPrank();
+        vm.expectRevert(NativeMarkSource.BadConfig.selector);
+        new NativeMarkSource(gov, address(0));
+    }
+
+    /// Fuzz: whatever the adapter answers, the source gives back exactly the chain's price and time, or refuses a zero.
+    function testFuzz_nativeSourcePassesTheChainsValuesThrough(uint256 px, uint256 at) public {
+        native.set(BTC_ID, px, at);
+        if (px == 0) {
+            vm.expectRevert(abi.encodeWithSelector(NativeMarkSource.ZeroMark.selector, BTC));
+            nativeSrc.markWad(BTC);
+            return;
+        }
+        (uint256 got, uint256 gotAt) = nativeSrc.markWad(BTC);
+        assertEq(got, px);
+        assertEq(gotAt, at);
     }
 
     /// 2. Route changes wait out the timelock; the primary must be fresh; a fresh secondary
@@ -186,8 +214,8 @@ contract MarkSourcesTest is Test {
         vm.expectRevert(abi.encodeWithSelector(MarkRouter.NoRoute.selector, BTC));
         router.markWad(BTC);
 
-        // T2 route: precompile primary, quorum secondary, 50 bps
-        MarkRouter.Route memory t2 = _route(coreSrc, quorumSrc, 50);
+        // T2 route: native primary, quorum secondary, 50 bps
+        MarkRouter.Route memory t2 = _route(nativeSrc, quorumSrc, 50);
         vm.prank(anyone);
         vm.expectRevert(
             abi.encodeWithSelector(IAccessControl.AccessControlUnauthorizedAccount.selector, anyone, bytes32(0))
@@ -209,27 +237,36 @@ contract MarkSourcesTest is Test {
         router.applyRoute(BTC);
 
         // Agreeing sources: the primary's mark is returned
-        core.set(BTC_INDEX, 1000000); // 100000.0
+        native.set(BTC_ID, 100_000e18, nowT);
         _publish(BTC, 100_000e18);
         assertEq(router.markWad(BTC), 100_000e18);
 
         // 0.3% apart: inside 50 bps, primary returned
-        core.set(BTC_INDEX, 1003000);
+        native.set(BTC_ID, 100_300e18, nowT);
         assertEq(router.markWad(BTC), 100_300e18);
 
         // 2% apart: refused
-        core.set(BTC_INDEX, 1020000);
+        native.set(BTC_ID, 102_000e18, nowT);
         vm.expectRevert(abi.encodeWithSelector(MarkRouter.Disagree.selector, BTC, 102_000e18, 100_000e18));
         router.markWad(BTC);
 
         // Secondary stale: no cross-check possible, the fresh primary stands
         _adv(MAX_AGE + 1);
+        native.set(BTC_ID, 102_000e18, nowT);
         assertEq(router.markWad(BTC), 102_000e18);
 
-        // Primary unavailable: Stale, whatever the secondary says
+        // The native mark's own time decides its freshness: older than maxAge, or from the future, is unavailable
         _publish(BTC, 102_000e18);
-        core.set(BTC_INDEX, 0);
-        vm.expectRevert(abi.encodeWithSelector(MarkRouter.Stale.selector, BTC, address(coreSrc)));
+        native.set(BTC_ID, 102_000e18, nowT - MAX_AGE - 1);
+        vm.expectRevert(abi.encodeWithSelector(MarkRouter.Stale.selector, BTC, address(nativeSrc)));
+        router.markWad(BTC);
+        native.set(BTC_ID, 102_000e18, nowT + 1);
+        vm.expectRevert(abi.encodeWithSelector(MarkRouter.Stale.selector, BTC, address(nativeSrc)));
+        router.markWad(BTC);
+
+        // Primary unavailable: Stale, whatever the secondary says
+        native.set(BTC_ID, 0, nowT);
+        vm.expectRevert(abi.encodeWithSelector(MarkRouter.Stale.selector, BTC, address(nativeSrc)));
         router.markWad(BTC);
 
         // A queued change can be cancelled, and bad routes are refused
@@ -241,7 +278,7 @@ contract MarkSourcesTest is Test {
         vm.expectRevert(MarkRouter.BadRoute.selector);
         router.queueRoute(BTC, _route(quorumSrc, quorumSrc, 50)); // same source twice
         vm.expectRevert(MarkRouter.BadRoute.selector);
-        router.queueRoute(BTC, _route(coreSrc, quorumSrc, 0)); // secondary without a band
+        router.queueRoute(BTC, _route(nativeSrc, quorumSrc, 0)); // secondary without a band
         vm.expectRevert(MarkRouter.BadRoute.selector);
         router.queueRoute(BTC, _route(IMarkSource(anyone), IMarkSource(address(0)), 0)); // not a contract
         vm.stopPrank();
@@ -249,24 +286,24 @@ contract MarkSourcesTest is Test {
 
     /// 3. A quorum-only route (T0) goes stale when the board stops publishing, then recovers.
     function test_quorumOnlyRouteGoesStale() public {
-        _setRoute(HYPE, _route(quorumSrc, IMarkSource(address(0)), 0));
+        _setRoute(STK1, _route(quorumSrc, IMarkSource(address(0)), 0));
 
         // Nothing published yet: the primary is unavailable
-        vm.expectRevert(abi.encodeWithSelector(MarkRouter.Stale.selector, HYPE, address(quorumSrc)));
-        router.markWad(HYPE);
+        vm.expectRevert(abi.encodeWithSelector(MarkRouter.Stale.selector, STK1, address(quorumSrc)));
+        router.markWad(STK1);
 
-        _publish(HYPE, 41e18);
-        assertEq(router.markWad(HYPE), 41e18);
+        _publish(STK1, 41e18);
+        assertEq(router.markWad(STK1), 41e18);
 
         _adv(MAX_AGE);
-        assertEq(router.markWad(HYPE), 41e18); // exactly maxAge old: still fresh
+        assertEq(router.markWad(STK1), 41e18); // exactly maxAge old: still fresh
 
         _adv(1);
-        vm.expectRevert(abi.encodeWithSelector(MarkRouter.Stale.selector, HYPE, address(quorumSrc)));
-        router.markWad(HYPE);
+        vm.expectRevert(abi.encodeWithSelector(MarkRouter.Stale.selector, STK1, address(quorumSrc)));
+        router.markWad(STK1);
 
         // The quorum publishes again: the route recovers
-        _publish(HYPE, 41.5e18);
-        assertEq(router.markWad(HYPE), 41.5e18);
+        _publish(STK1, 41.5e18);
+        assertEq(router.markWad(STK1), 41.5e18);
     }
 }

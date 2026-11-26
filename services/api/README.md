@@ -5,7 +5,7 @@ indexer's Postgres; it holds no key and sends nothing. Endpoints and fields: `op
 
 - `/v1/status`, `/v1/markets`, `/v1/chains/:market` (indicative), `/v1/quote/buy` (exact), `/v1/positions/:owner`,
   `/v1/receipts/proof`.
-- **The exact quote** simulates the real `OpenBook.buy` from a dummy buyer whose USDC balance and allowance are set for
+- **The exact quote** simulates the real `OpenBook.buy` from a dummy buyer whose settlement-token balance and allowance are set for
   that call only (a state override: nothing is sent). The token's storage slots are found once by probing; with an
   unusual token the endpoint answers `quoted: false` with the reason rather than guessing.
 - Positions come from the indexer's `positions` table; their units use the book's current norm.

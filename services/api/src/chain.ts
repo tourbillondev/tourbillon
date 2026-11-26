@@ -1,8 +1,11 @@
 import { readFileSync } from "node:fs";
+import { stockToken } from "@tourbillon/common/covers.ts";
+import { settlementOf, type Settlement } from "@tourbillon/common/settlement.ts";
 import { encodeAbiParameters, formatEther, formatUnits, getAddress, keccak256, parseAbi, stringToHex, toHex, type Address, type Hex, type PublicClient } from "viem";
 
 /// Chain reads for the API: market and pool state, and the exact buy quote. The quote simulates the real
-/// `OpenBook.buy` (the cheapest of the pool, the given maker quotes and offers) from a dummy buyer whose USDC balance and
+/// `OpenBook.buy` (the cheapest of the pool, the given maker quotes and offers) from a dummy buyer whose settlement-token
+/// balance and
 /// allowance are set for the call only (a state override: nothing is sent, nothing changes on-chain). The token's storage
 /// slots are found once by probing; if that fails the API says so instead of guessing a price.
 
@@ -14,7 +17,8 @@ export type Dep = {
   pool: Address;
   book: Address;
   openBook: Address;
-  usdc: Address;
+  usdc: Address; // the settlement token (owner D1)
+  settlement: Settlement; // its symbol and decimals, as the deploy read them from the token
   receipts: Address | null;
   markets: string[];
 };
@@ -33,7 +37,8 @@ export function loadDep(path: string): Dep {
     pool: need("MainspringPool"),
     book: need("PathFundingBook"),
     openBook: need("OpenBook"),
-    usdc: need("MockUSDC"),
+    usdc: need("SettlementToken"),
+    settlement: settlementOf(d),
     receipts: typeof d.ReceiptRoots === "string" ? getAddress(d.ReceiptRoots) : null,
     markets: d.markets as string[],
   };
@@ -68,7 +73,6 @@ export const abi = parseAbi([
 ]);
 
 export const b32 = (m: string) => stringToHex(m, { size: 32 });
-export const usdc = (v: bigint) => formatUnits(v, 6);
 export const QUOTER = "0x000000000000000000000000000000000000ab01" as Address; // a dummy buyer for quotes, never a real account
 const BIG = 10n ** 30n;
 
@@ -76,6 +80,8 @@ export function makeReads(client: PublicClient, d: Dep) {
   const read = async <T>(address: Address, functionName: string, args: readonly unknown[] = []): Promise<T> =>
     client.readContract({ address, abi, functionName, args } as never) as Promise<T>;
   const maybe = async <T>(p: Promise<T>): Promise<T | null> => p.catch(() => null);
+  /// A settlement amount as a decimal string in the token's own decimals (from the deployment file, never assumed).
+  const usdc = (v: bigint) => formatUnits(v, d.settlement.decimals);
 
   let slots: { balance: Hex; allowance: Hex } | null | undefined;
   async function findSlots(): Promise<{ balance: Hex; allowance: Hex } | null> {
@@ -102,6 +108,7 @@ export function makeReads(client: PublicClient, d: Dep) {
   }
 
   return {
+    amount: usdc,
     read,
     maybe,
     async status() {
@@ -131,6 +138,7 @@ export function makeReads(client: PublicClient, d: Dep) {
       }
       return {
         chainId: d.chainId,
+        settlement: { token: d.settlement.token, symbol: d.settlement.symbol, decimals: d.settlement.decimals }, // owner D1
         block: head.number.toString(),
         blockTime: Number(head.timestamp),
         opens: { buysPaused, drawdownPaused: opensPaused, depositsPaused },
@@ -149,7 +157,7 @@ export function makeReads(client: PublicClient, d: Dep) {
     async markets() {
       return Promise.all(
         d.markets.map(async (m) => {
-          const [cfg, mark, vol, nCap, nUse, dCap, dUse, paused] = await Promise.all([
+          const [cfg, mark, vol, nCap, nUse, dCap, dUse, paused, stock] = await Promise.all([
             read<readonly [boolean, number, bigint]>(d.engine, "markets", [b32(m)]),
             maybe(read<bigint>(d.router, "markWad", [b32(m)])),
             maybe(read<bigint>(d.board, "volBps", [b32(m)])),
@@ -158,9 +166,11 @@ export function makeReads(client: PublicClient, d: Dep) {
             read<bigint>(d.pool, "directionalCap", [b32(m)]),
             read<bigint>(d.pool, "directional", [b32(m)]),
             read<boolean>(d.pool, "marketPaused", [b32(m)]),
+            stockToken(client, d.pool, m),
           ]);
           return {
             market: m,
+            kind: stock ? "stock" : "crypto", // a tokenized stock (hedged on-chain) or crypto (hedged at an exchange)
             listed: cfg[0],
             spreadBps: cfg[1],
             strikeStep: formatEther(cfg[2]),

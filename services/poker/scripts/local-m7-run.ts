@@ -24,13 +24,18 @@ import {
 import { foundry } from "viem/chains";
 import { blendDelta, blendValue } from "@tourbillon/common/tempo.ts";
 import { writerWorstPerUnit } from "../../maker-gateway/src/quote.ts";
-import { SimVenue } from "../../hedger/src/simvenue.ts";
+import { SimExchange } from "../../hedger/src/simexchange.ts";
+import { standInFeeds, startStandIn } from "@tourbillon/common/standin.ts";
+import { encodeDeployData, keccak256, toHex } from "viem";
 import { loadM7Deployment } from "../../receipts/src/collect.ts";
 import { Collector } from "../../receipts/src/epochs.ts";
 import { buildTree, leafOf, proofOf } from "../../receipts/src/tree.ts";
 
-/// M7 step 11: the whole M7 system on anvil. DeployM7, then every service as a real process (three signers, two
-/// pokers, the hedger on the simulated venue, the risk-monitor with the automated key E1, the maker-gateway with two
+/// The local end-to-end run (M7 step 11, rebuilt in RH7 for Robinhood Chain): the whole system on anvil. DeployM7,
+/// then every service as a real process: three signers reading their feeds files from a local stand-in (exchanges,
+/// Pyth, an equity reference) and a mock on-chain price adapter for STK1, two pokers, hedger-cex on the simulated
+/// exchange (BTC, ETH), hedger-onchain through the pool's hedgeSwap and a mock router that governance lists through the
+/// timelock (STK1), the risk-monitor with the automated key E1, the maker-gateway with two
 /// maker bots, the receipts service, and the MCP server driven over stdio). Governance runs through real Safe
 /// transactions signed by anvil's unlocked owners (EIP-712 SafeTx): no key anywhere. Automining anvil plus an empty
 /// block every second, so routed buys can be re-priced at their exact parent state. Logs and report in a temp folder.
@@ -42,10 +47,9 @@ const SERVICES = resolve(import.meta.dir, "../..");
 const CONTRACTS = resolve(SERVICES, "../contracts");
 const PORT = 33545;
 const RPC = `http://127.0.0.1:${PORT}`;
-const MARKETS = ["BTC", "ETH", "HYPE"];
-const STEP: Record<string, number> = { BTC: 100, ETH: 5, HYPE: 0.1 };
-const SZ: Record<string, number> = { BTC: 5, ETH: 4, HYPE: 2 };
-const POOL_HL = "0x00000000000000000000000000000000000000E1" as Address;
+const MARKETS = ["BTC", "ETH", "STK1"];
+const STEP: Record<string, number> = { BTC: 100, ETH: 5, STK1: 0.1 };
+const SZ: Record<string, number> = { BTC: 5, ETH: 4, STK1: 2 };
 const USDC = 10n ** 6n;
 const WAD = 10n ** 18n;
 const MAX = 2n ** 256n - 1n;
@@ -110,6 +114,11 @@ const abi = parseAbi([
   "function unpauseDeposits()",
   "function depositsPaused() view returns (bool)",
   "function grantRole(bytes32, address)",
+  "function setHedge(address, uint16, bytes32, uint256, uint256)",
+  "function setHedger(address)",
+  "function freeze()",
+  "function unfreeze()",
+  "function frozen() view returns (bool)",
   "function hasRole(bytes32, address) view returns (bool)",
   "function schedule(address target, uint256 value, bytes data, bytes32 predecessor, bytes32 salt, uint256 delay)",
   "function execute(address target, uint256 value, bytes payload, bytes32 predecessor, bytes32 salt) payable",
@@ -124,12 +133,12 @@ const abi = parseAbi([
   "function buy(bytes32 market, Leg[] legs, Part[] movement, uint256 units, uint256 maxCost, uint256 deadline, Quote[] quotes, bytes[] sigs, uint256[] offerIds) returns (uint256, uint256, uint8)",
   "function sell(uint256, uint256, uint256, uint256) returns (uint256, uint256)",
   "function required(bytes32, uint256) view returns (uint256, uint256)",
-  "function entries(bytes32, uint256) view returns (uint256 raw, uint256 usdcPerUnit, uint256 coverPerUnit, uint256 usdcLocked, uint256 whypeLocked, bool flagged)",
+  "function entries(bytes32, uint256) view returns (uint256 raw, uint256 settlementPerUnit, uint256 coverPerUnit, uint256 settlementLocked, uint256 coverLocked, bool flagged)",
   "function seriesSources(uint256) view returns (bytes32[])",
   "function matchedRaw(uint256) view returns (uint256)",
   "function matchedRawOf(uint256) view returns (uint256)",
   "function uncoveredRaw(uint256) view returns (uint256)",
-  "function heldUsdc() view returns (uint256)",
+  "function heldSettlement() view returns (uint256)",
   "function freeOf(address, address) view returns (uint256)",
   "function lockedOf(address, address) view returns (uint256)",
   "function openSeries(bytes32) view returns (uint256[])",
@@ -174,7 +183,7 @@ const abi = parseAbi([
 const events = parseAbi([
   "event Routed(address indexed buyer, uint256 indexed id, uint8 kind, uint256 sigmaBps, uint256 cost, address source)",
   "event Sold(address indexed seller, uint256 indexed id, bytes32 indexed market, uint256 units, uint256 raw, uint256 sWad, uint256 sigmaBps, uint256 unitValueWad, uint256 gross, uint256 fee, uint256 net, bool markFromSample, bool volFromSample)",
-  "event BoughtBack(bytes32 indexed key, uint256 indexed seriesId, uint256 raw, uint256 paidUsdc, uint256 paidWhype, uint256 shortfall)",
+  "event BoughtBack(bytes32 indexed key, uint256 indexed seriesId, uint256 raw, uint256 paidSettlement, uint256 paidCover, uint256 shortfall)",
   "event AgentBought(bytes32 indexed mandate, address indexed owner, uint256 indexed id, uint256 raw, uint256 cost, uint8 kind)",
   "event PositionSold(address indexed owner, uint256 indexed id, uint256 raw, uint256 units, uint256 net, bytes32 mandate)",
   "event RoleGranted(bytes32 indexed role, address indexed account, address indexed sender)",
@@ -190,7 +199,7 @@ async function rpc(method: string, params: unknown[] = []): Promise<unknown> {
 // ---------------------------------------------------------------- chain and DeployM7
 
 say(`logs in ${out}; scale ${scale}`);
-const anvil = Bun.spawn(["anvil", "--port", String(PORT), "--accounts", "24", "--silent"], { stdout: "ignore", stderr: "ignore" });
+const anvil = Bun.spawn(["anvil", "--port", String(PORT), "--accounts", "26", "--silent"], { stdout: "ignore", stderr: "ignore" });
 const client = createPublicClient({ chain: foundry, transport: http(RPC), pollingInterval: 200 }) as PublicClient;
 for (let i = 0; i < 80; i++) {
   try {
@@ -216,6 +225,8 @@ const AGENT = acc[20]!;
 const OA = acc[21]!;
 const OB_ = acc[22]!;
 const TREASURY = acc[23]!;
+const KEEPER = acc[24]!; // hedger-onchain's key: the hedger behind the hedge keeper gate, set through the timelock
+const PRICER = acc[25]!; // moves the mock on-chain price adapter (a stand-in for Robinhood Chain's tokenized-stock price)
 const ANYONE = "0x000000000000000000000000000000000000a11a" as Address;
 const env = {
   ...process.env,
@@ -225,6 +236,7 @@ const env = {
   RECEIPTS_POSTER: POSTER,
   PROTOCOL_RECIPIENT: PROTO,
   SIGNERS: SIGNERS.join(","),
+  STOCK_MARKETS: "none", // the run checks the other services at any hour; the session rule has its own tests
 };
 {
   const r = Bun.spawnSync(["forge", "script", "script/DeployM7.s.sol:DeployM7", "--rpc-url", RPC, "--unlocked", "--sender", DEPLOYER, "--broadcast"], { cwd: CONTRACTS, env });
@@ -236,7 +248,8 @@ const m7 = JSON.parse(readFileSync(m7File, "utf8")) as Record<string, Address> &
 const POOL = m7.MainspringPool!;
 const ENGINE = m7.Engine!;
 const BOOK = m7.PathFundingBook!;
-const MUSDC = m7.MockUSDC!;
+const MUSDC = m7.SettlementToken!; // the settlement token (owner D1: USDG), as the deploy wrote it
+const SYM = String((m7 as Record<string, unknown>).settlementSymbol);
 const VAULT = m7.MakerVault!;
 const MB = m7.MatchBook!;
 const OBK = m7.OpenBook!;
@@ -332,7 +345,7 @@ async function safeTx(safe: Address, owners: Address[], to: Address, data: Hex):
 }
 const enc = (functionName: string, args: readonly unknown[] = []) => encodeFunctionData({ abi, functionName, args } as never);
 
-// funds and allowances
+// the settlement token and allowances
 const START_USDC = new Map<Address, bigint>();
 for (const w of [LP, ...TRADERS, OA, OB_]) {
   await must(w, MUSDC, "mint", [w, 10_000_000n * USDC]);
@@ -343,17 +356,35 @@ say(`deployed; Safe ${SAFE}; guardian ${GUARD}; timelock ${TL}; AgentRouter ${AR
 
 // ---------------------------------------------------------------- the simulated venue and services
 
-const PRICE: Record<string, number> = { BTC: 74_000, ETH: 2_000, HYPE: 40 };
-const sim = new SimVenue(MARKETS.map((n) => ({ name: n, szDecimals: SZ[n]!, mid: PRICE[n]! })));
+const PRICE: Record<string, number> = { BTC: 74_000, ETH: 2_000, STK1: 40 };
+const CRYPTO = ["BTC", "ETH"];
+const sim = new SimExchange(CRYPTO.map((n) => ({ name: n, szDecimals: SZ[n]!, mid: PRICE[n]! })));
 sim.deposit(1_000_000);
+// every signer source on this machine: exchange tickers, Pyth and the equity reference from the stand-in; STK1's
+// on-chain price from a mock adapter (the same shape as NativeMarkSource's adapter)
+const standIn = startStandIn();
+const adapterArt = JSON.parse(readFileSync(join(CONTRACTS, "out/MockPriceAdapter.sol/MockPriceAdapter.json"), "utf8")) as { bytecode: { object: Hex } };
+const adapterAbi = parseAbi(["function set(bytes32 assetId, uint256 pxWad)"]);
+const ADAPTER = (await client.waitForTransactionReceipt({ hash: await createWalletClient({ chain: foundry, transport: http(RPC), account: PRICER }).deployContract({ abi: [], bytecode: adapterArt.bytecode.object }) })).contractAddress!;
+const STK1_ASSET = keccak256(toHex("standin:STK1"));
+async function setPrices(): Promise<void> {
+  for (const m of MARKETS) {
+    const px = Number(PRICE[m]!.toPrecision(5));
+    standIn.set(m, String(px));
+    if (CRYPTO.includes(m)) sim.setMid(m, px);
+  }
+  const hash = await createWalletClient({ chain: foundry, transport: http(RPC), account: PRICER }).writeContract({ address: ADAPTER, abi: adapterAbi, functionName: "set", args: [STK1_ASSET, parseEther(String(Number(PRICE.STK1!.toPrecision(5))))] });
+  await client.waitForTransactionReceipt({ hash });
+}
+await setPrices();
+const feedsFile = join(out, "feeds.json");
+writeFileSync(feedsFile, JSON.stringify(standInFeeds(standIn.url, [{ name: "BTC", kind: "crypto" }, { name: "ETH", kind: "crypto" }, { name: "STK1", kind: "stock", adapter: ADAPTER, assetId: STK1_ASSET }])));
 let walking = true;
 const pricer = (async () => {
   let k = 1;
   while (walking) {
-    for (const m of MARKETS) {
-      PRICE[m] = PRICE[m]! * (1 + Math.sin(k * 1.7 + m.length) * 0.001);
-      sim.setMid(m, Number(PRICE[m]!.toPrecision(5)));
-    }
+    for (const m of MARKETS) PRICE[m] = PRICE[m]! * (1 + Math.sin(k * 1.7 + m.length) * 0.001);
+    await setPrices().catch(() => undefined);
     k++;
     await sleep(30_000);
   }
@@ -376,12 +407,13 @@ function service(name: string, cwd: string, entry: string, args: string[]): Proc
   return p;
 }
 const statusFile = join(out, "hedger-status.json");
+const onchainStatus = join(out, "hedger-onchain-status.json");
 const GATEWAY = "http://127.0.0.1:33600";
-for (const [i, s] of SIGNERS.entries()) service(`signer-${i + 1}`, join(SERVICES, "quorum-signer"), "src/main.ts", ["--deployment", m7File, "--rpc", RPC, "--local-unlocked", s, "--hl-api", sim.url, "--test-vol", "0.45", "--equity-pool", POOL, "--equity-hl-user", POOL_HL]);
+for (const [i, s] of SIGNERS.entries()) service(`signer-${i + 1}`, join(SERVICES, "quorum-signer"), "src/main.ts", ["--deployment", m7File, "--rpc", RPC, "--local-unlocked", s, "--feeds", feedsFile, "--test-vol", "0.45", "--equity-pool", POOL, "--exchange", "sim", "--exchange-url", sim.url]);
 service("poker-primary", join(SERVICES, "poker"), "src/main.ts", ["--deployment", m7File, "--rpc", RPC, "--local-unlocked", acc[1]!, "--role", "primary"]);
 service("poker-backup", join(SERVICES, "poker"), "src/main.ts", ["--deployment", m7File, "--rpc", RPC, "--local-unlocked", acc[2]!, "--role", "backup"]);
-service("hedger", join(SERVICES, "hedger"), "src/main.ts", ["--deployment", m7File, "--rpc", RPC, "--hl-user", POOL_HL, "--venue", "sim", "--venue-url", sim.url, "--status-file", statusFile, "--tick-seconds", "15"]);
-service("risk-monitor", join(SERVICES, "risk-monitor"), "src/main.ts", ["--deployment", m7File, "--rpc", RPC, "--local-unlocked", E1, "--hl-api", sim.url, "--hl-user", POOL_HL, "--hedger-status", statusFile, "--equity-every-seconds", "300", "--tick-seconds", "15"]);
+service("hedger", join(SERVICES, "hedger"), "src/cex.ts", ["--deployment", m7File, "--rpc", RPC, "--exchange", "sim", "--exchange-url", sim.url, "--status-file", statusFile, "--tick-seconds", "15"]);
+service("risk-monitor", join(SERVICES, "risk-monitor"), "src/main.ts", ["--deployment", m7File, "--rpc", RPC, "--local-unlocked", E1, "--exchange", "sim", "--exchange-url", sim.url, "--hedger-status", `${statusFile},${onchainStatus}`, "--equity-every-seconds", "300", "--tick-seconds", "15"]);
 service("maker-gateway", join(SERVICES, "maker-gateway"), "src/main.ts", ["--deployment", m7File, "--rpc", RPC, "--port", "33600"]);
 service("receipts", join(SERVICES, "receipts"), "src/main.ts", ["--deployment", m7File, "--rpc", RPC, "--local-unlocked", POSTER, "--port", "33601", "--margin-seconds", "30", "--tick-seconds", "15"]);
 
@@ -519,8 +551,8 @@ const lpRound = await nextSettlement("the LP round settled");
 await must(LP, POOL, "claimShares", [lpRound]);
 await marksFresh();
 for (const [name, mk, off] of [["maker-1", MK1, "-300"], ["maker-2", MK2, "-500"]] as const) {
-  service(name, join(SERVICES, "maker-gateway"), "src/bot.ts", ["--deployment", m7File, "--rpc", RPC, "--gateway", GATEWAY, "--maker", mk, "--market", "BTC", "--sigma-offset-bps", off, "--max-units", "40", "--every-seconds", "30", "--fund", "300000"]);
-  await waitFor(`${name} funded`, async () => (await read<bigint>(VAULT, "freeOf", [mk, MUSDC])) > 0n, 60_000);
+  service(name, join(SERVICES, "maker-gateway"), "src/bot.ts", ["--deployment", m7File, "--rpc", RPC, "--gateway", GATEWAY, "--maker", mk, "--market", "BTC", "--sigma-offset-bps", off, "--max-units", "40", "--every-seconds", "30", "--deposit", "300000"]);
+  await waitFor(`${name} deposited`, async () => (await read<bigint>(VAULT, "freeOf", [mk, MUSDC])) > 0n, 60_000);
 }
 await waitFor("quotes at the gateway", async () => ((await (await fetch(new URL("/health", GATEWAY))).json()) as { quotes: number }).quotes >= 2, 90_000);
 say(`NAV ${usd(await read<bigint>(POOL, "navNow")).toFixed(2)} after the LP round`);
@@ -556,12 +588,17 @@ const report: string[] = [];
   crit[1] = { ok: eoaAdmins.length === 0 && unexpectedKeys.length === 0, detail: `no externally owned account holds an admin role (${eoaAdmins.length}); keys hold only E1's market pause and the receipts poster (${unexpectedKeys.length} other)` };
 }
 const govResults: { what: string; ok: boolean; detail: string }[] = [];
+const routerArt = JSON.parse(readFileSync(join(CONTRACTS, "out/MockHedgeRouter.sol/MockHedgeRouter.json"), "utf8")) as { bytecode: { object: Hex } };
+const HEDGE_ROUTER = (await client.waitForTransactionReceipt({ hash: await createWalletClient({ chain: foundry, transport: http(RPC), account: PRICER }).sendTransaction({ data: encodeDeployData({ abi: parseAbi(["constructor(address usdc, address stock, uint256 scale, uint256 pxWad)"]), bytecode: routerArt.bytecode.object, args: [MUSDC, m7.MockStockToken!, 1n, parseEther("40")] }) }) })).contractAddress!;
 const timelockOps: { what: string; target: Address; data: Hex; salt: Hex }[] = [
   { what: "caps: BTC notional to $4.5M", target: POOL, data: enc("setCaps", [b32("BTC"), 4_500_000n * USDC, 1_000_000n * USDC]), salt: b32("op-caps") },
   { what: "fees: protocol share and recipient", target: POOL, data: enc("setProtocolFee", [1000, PROTO]), salt: b32("op-fee") },
   { what: "signer set: a fourth signer", target: BOARD, data: enc("setSigner", ["0x0000000000000000000000000000000000005454", true]), salt: b32("op-signer") },
   { what: "routes: BTC route with a 150 s max age", target: ROUTER, data: enc("queueRoute", [b32("BTC"), { primary: m7.QuorumMarkSource!, secondary: "0x0000000000000000000000000000000000000000", maxAge: 150, maxDevBps: 0 }]), salt: b32("op-route") },
   { what: "treasury address", target: POOL, data: enc("setTreasury", [TREASURY]), salt: b32("op-treasury") },
+  // RH6: the on-chain stock hedge: a router (a mock of Robinhood Chain liquidity at the mark) and the keeper
+  { what: "hedge: router, 1% slippage, STK1 inventory cap, daily cap", target: POOL, data: enc("setHedge", [HEDGE_ROUTER, 100, b32("STK1"), 100_000n * WAD, 5_000_000n * USDC]), salt: b32("op-hedge") },
+  { what: "hedge: the hedger key behind the gate", target: m7.HedgeKeeperGate!, data: enc("setHedger", [KEEPER]), salt: b32("op-keeper") },
 ];
 {
   // refused on every path but the timelock: the Safe directly, an owner alone, the guardian, the deployer
@@ -625,9 +662,9 @@ let preId = 0n;
   const gu = await safeTx(GUARD, GUARDIANS.slice(0, 2), ENGINE, enc("unpauseBuys"));
   const gs = await safeTx(GUARD, GUARDIANS.slice(0, 2), POOL, enc("setCaps", [b32("BTC"), 1n, 1n]));
   guardianResults.push({ what: "the guardian cannot unpause or change a setting", ok: !gu.ok && !gs.ok, detail: `${gu.ok ? "unpaused" : gu.reason}; ${gs.ok ? "set" : gs.reason}` });
-  const e1a = await tx(E1, POOL, "pauseMarket", [b32("HYPE")]);
+  const e1a = await tx(E1, POOL, "pauseMarket", [b32("STK1")]);
   const e1b = await tx(E1, POOL, "pauseDeposits");
-  const e1c = await tx(E1, POOL, "unpauseMarket", [b32("HYPE")]);
+  const e1c = await tx(E1, POOL, "unpauseMarket", [b32("STK1")]);
   guardianResults.push({ what: "E1 pauses a market only (not deposits, never unpauses)", ok: e1a.ok && !e1b.ok && !e1c.ok, detail: `${e1a.ok}/${e1b.ok}/${e1c.ok}` });
 }
 
@@ -639,17 +676,60 @@ for (const op of timelockOps) {
   noteGas("timelock execute (anyone)", r);
   govResults.push({ what: `executed after the delay by anyone: ${op.what}`, ok: r.ok, detail: r.ok ? "done" : r.reason });
 }
+// the router and the keeper are live: hedger-onchain starts (the mock router fills at the mark it is told)
+service("hedger-onchain", join(SERVICES, "hedger"), "src/onchain.ts", ["--deployment", m7File, "--rpc", RPC, "--local-unlocked", KEEPER, "--delta-cap", "STK1=40000", "--status-file", onchainStatus, "--tick-seconds", "15"]);
+const routerSet = parseAbi(["function set(uint256 pxWad, uint256 feeBps, uint256 shortBps, bool broken)"]);
+const routerFollows = (async () => {
+  while (walking) {
+    await createWalletClient({ chain: foundry, transport: http(RPC), account: PRICER }).writeContract({ address: HEDGE_ROUTER, abi: routerSet, functionName: "set", args: [parseEther(String(Number(PRICE.STK1!.toPrecision(5)))), 30n, 0n, false] }).catch(() => undefined);
+    await sleep(15_000);
+  }
+})();
 const wround = await nextSettlement("the hour's settlement (deposits paused)");
 {
   const w = await tx(LP, POOL, "withdraw", [wround]);
   guardianResults.push({ what: "a withdrawal settles and pays while deposits are paused", ok: w.ok, detail: w.ok ? "paid" : w.reason });
-  for (const [to, data] of [[ENGINE, enc("unpauseBuys")], [POOL, enc("unpauseMarket", [b32("ETH")])], [POOL, enc("unpauseMarket", [b32("HYPE")])], [POOL, enc("unpauseDeposits")]] as const) {
+  for (const [to, data] of [[ENGINE, enc("unpauseBuys")], [POOL, enc("unpauseMarket", [b32("ETH")])], [POOL, enc("unpauseMarket", [b32("STK1")])], [POOL, enc("unpauseDeposits")]] as const) {
     const s = await safeTx(SAFE, OWNERS.slice(0, 3), to, data);
     noteGas("Safe unpause (3-of-5, no delay)", s);
     if (!s.ok) guardianResults.push({ what: "Safe unpause", ok: false, detail: s.reason });
   }
   const cleared = !(await read<boolean>(ENGINE, "buysPaused")) && !(await read<boolean>(POOL, "marketPaused", [b32("ETH")])) && !(await read<boolean>(POOL, "depositsPaused"));
   guardianResults.push({ what: "the Safe unpauses directly, with no delay", ok: cleared, detail: cleared ? "all clear" : "still paused" });
+}
+// RH7: a trader buys STK1 calls (the pool goes short delta), so hedger-onchain has something to hedge: it buys the
+// stock through the pool's hedgeSwap; the pool holds it, never the keeper
+let stk1Hedge = { buyOk: false, target: 0, held: 0, keeperHeld: 0n, rows: 0, freeze: { frozen: false, guardianCannotUnfreeze: false, refusedWhileFrozen: false, safeUnfroze: false } };
+{
+  const mark = (await routerMark("STK1")) ?? 40;
+  const call = [{ isCall: true, k: kAt("STK1", mark), qty: 1 }];
+  const b = await tx(TRADERS[1]!, OBK, "buy", [b32("STK1"), legArgs(call), tempoArg(7 * DAY), wadStr(600), 10n ** 13n, (await chainNow()) + 3600n, [], [], []]);
+  stk1Hedge.buyOk = b.ok;
+  if (!b.ok) say(`STK1 buy refused: ${b.reason}`);
+  for (let i = 0; i < 8; i++) {
+    await sleep(15_000);
+    const lines = existsSync(join(out, "hedger-onchain.log")) ? readFileSync(join(out, "hedger-onchain.log"), "utf8").trim().split("\n").filter(Boolean).map((l) => JSON.parse(l) as Record<string, unknown>) : [];
+    const plans = lines.filter((l) => l.msg === "plan" && l.market === "STK1");
+    stk1Hedge.rows = lines.filter((l) => l.msg === "hedge").length;
+    const last = plans[plans.length - 1];
+    stk1Hedge.target = last ? Number(last.target) : 0;
+    if (stk1Hedge.rows > 0 && last?.reason === "in-band") break;
+  }
+  stk1Hedge.held = Number(formatUnits(await read<bigint>(m7.MockStockToken!, "balanceOf", [POOL]), 18));
+  stk1Hedge.keeperHeld = await read<bigint>(m7.MockStockToken!, "balanceOf", [KEEPER]);
+  // the guardian freezes hedging at the gate: the next pass is refused there; only the Safe unfreezes
+  const fr = await safeTx(GUARD, GUARDIANS.slice(0, 2), m7.HedgeKeeperGate!, enc("freeze"));
+  const guardUnfreeze = await safeTx(GUARD, GUARDIANS.slice(0, 2), m7.HedgeKeeperGate!, enc("unfreeze"));
+  // more STK1 calls bought: the target moves, so the hedger tries a swap, which the frozen gate refuses
+  await tx(TRADERS[1]!, OBK, "buy", [b32("STK1"), legArgs(call), tempoArg(7 * DAY), wadStr(600), 10n ** 13n, (await chainNow()) + 3600n, [], [], []]);
+  let frozenSeen = false;
+  for (let i = 0; i < 6 && !frozenSeen; i++) {
+    await sleep(10_000);
+    frozenSeen = readFileSync(join(out, "hedger-onchain.log"), "utf8").includes("on-chain hedging frozen at the gate");
+  }
+  const sf = await safeTx(SAFE, OWNERS.slice(0, 3), m7.HedgeKeeperGate!, enc("unfreeze"));
+  stk1Hedge.freeze = { frozen: fr.ok, guardianCannotUnfreeze: !guardUnfreeze.ok, refusedWhileFrozen: frozenSeen, safeUnfroze: sf.ok && !(await read<boolean>(m7.HedgeKeeperGate!, "frozen")) };
+  say(`STK1 hedge: target ${stk1Hedge.target.toFixed(2)} shares, the pool holds ${stk1Hedge.held.toFixed(2)}, ${stk1Hedge.rows} swap(s)`);
 }
 await warp(3600 + 30, "the router's own delay for the new BTC route");
 {
@@ -679,12 +759,12 @@ await marksFresh();
   const before = await read<bigint>(MUSDC, "balanceOf", [TREASURY]);
   const s1 = await safeTx(SAFE, OWNERS.slice(0, 3), POOL, enc("sendToTreasury", [small]));
   noteGas("Safe treasury move", s1);
-  t.push({ what: "the Safe moves funds directly within the daily cap", ok: s1.ok && (await read<bigint>(MUSDC, "balanceOf", [TREASURY])) - before === small, detail: s1.ok ? `${usd(small)} sent` : s1.reason });
+  t.push({ what: `the Safe moves ${SYM} directly within the daily cap`, ok: s1.ok && (await read<bigint>(MUSDC, "balanceOf", [TREASURY])) - before === small, detail: s1.ok ? `${usd(small)} sent` : s1.reason });
   const s2 = await safeTx(SAFE, OWNERS.slice(0, 3), POOL, enc("sendToTreasury", [cap]));
   t.push({ what: "a move over the day's cap is refused", ok: !s2.ok, detail: s2.ok ? "sent" : s2.reason });
   const s3 = await tx(TRADERS[0]!, POOL, "sendToTreasury", [1n]);
   const s4 = await tx(OWNERS[0]!, POOL, "sendToTreasury", [1n]);
-  t.push({ what: "no one else moves treasury funds (a trader, a Safe owner alone)", ok: !s3.ok && !s4.ok, detail: `${s3.ok ? "sent" : s3.reason}; ${s4.ok ? "sent" : s4.reason}` });
+  t.push({ what: `no one else moves treasury ${SYM} (a trader, a Safe owner alone)`, ok: !s3.ok && !s4.ok, detail: `${s3.ok ? "sent" : s3.reason}; ${s4.ok ? "sent" : s4.reason}` });
   crit[4] = { ok: t.every((x) => x.ok), detail: t.map((x) => `${x.ok ? "" : "FAILED "}${x.what} [${x.detail}]`).join("; ") + "; the address was set through the timelock (criterion 2)" };
 }
 
@@ -955,7 +1035,7 @@ walking = false;
 await pricer;
 clearInterval(ticker);
 // read the books before stopping
-const holders = [POOL, VAULT, MB, ENGINE, OBK, RA, AR, BOOK, TL, SAFE, GUARD, ...acc];
+const holders = [POOL, VAULT, MB, ENGINE, OBK, RA, AR, BOOK, TL, SAFE, GUARD, HEDGE_ROUTER, ...acc]; // the mock router holds the settlement token the pool swapped (a venue)
 let onchain = 0n;
 for (const h of holders) onchain += await read<bigint>(MUSDC, "balanceOf", [h]);
 const supply = await read<bigint>(MUSDC, "totalSupply");
@@ -963,7 +1043,7 @@ const zeroHolders = await Promise.all([ENGINE, OBK, RA, AR].map((h) => read<bigi
 let vaultBooks = 0n;
 for (const mk of [MK1, MK2]) vaultBooks += (await read<bigint>(VAULT, "freeOf", [mk, MUSDC])) + (await read<bigint>(VAULT, "lockedOf", [mk, MUSDC]));
 const vaultBal = await read<bigint>(MUSDC, "balanceOf", [VAULT]);
-const mbOk = (await read<bigint>(MB, "heldUsdc")) === (await read<bigint>(MUSDC, "balanceOf", [MB]));
+const mbOk = (await read<bigint>(MB, "heldSettlement")) === (await read<bigint>(MUSDC, "balanceOf", [MB]));
 const law1Traders: string[] = [];
 for (const t of TRADERS) {
   const bal = await read<bigint>(MUSDC, "balanceOf", [t]);
@@ -976,6 +1056,8 @@ for (const t of TRADERS) {
 for (const p of procs) p.kill("SIGTERM");
 await Promise.all(procs.map((p) => p.exited));
 sim.stop();
+standIn.stop();
+await routerFollows.catch(() => undefined);
 
 const expectedTools = ["chains_by_tempo", "vol_feed", "shapes", "quotes", "positions", "mandates", "build_mandate", "build_buy", "build_sell"];
 const unusedTools = expectedTools.filter((t) => !mcpUsed.has(t) && t !== "shapes" && t !== "quotes");
@@ -983,24 +1065,40 @@ crit[8] = { ok: mcpTools.join() === expectedTools.join() && unusedTools.length =
 
 const alarms = lines("risk-monitor").filter((l) => l.msg === "alarm");
 const count = (n: string) => alarms.filter((l) => l.name === n).length;
-const queuedNamed = alarms.filter((l) => l.name === "TIMELOCK_QUEUED").map((l) => String((l.values as Record<string, unknown>).call));
-const pausedBy = alarms.filter((l) => l.name === "PAUSED").map((l) => String((l.values as Record<string, unknown>).by));
-const unexpected = alarms.filter((l) => ["ROLE_CHANGED", "MONITOR_ERROR", "BUYBACK_FAILED", "MATCHED_UNCOVERED", "RECEIPTS_STALE"].includes(String(l.name)));
+const queuedNamed = alarms.filter((l) => l.name === "timelock-queued").map((l) => String((l.values as Record<string, unknown>).call));
+const pausedBy = alarms.filter((l) => l.name === "paused").map((l) => String((l.values as Record<string, unknown>).by));
+// the hedger key behind the gate was set through the timelock (queued and announced): expected, and announced as it
+// should be (the pool's HEDGER_ROLE itself sits on the gate from the deploy, never on a key)
+const plannedGrant = (l: Record<string, unknown>) => l.name === "role-changed" && getAddress(String((l.values as Record<string, unknown>).account)) === KEEPER && (l.values as Record<string, unknown>).role === "hedger key";
+const unexpected = alarms.filter((l) => ["role-changed", "monitor-error", "buyback-failed", "matched-uncovered", "receipts-stale"].includes(String(l.name)) && !plannedGrant(l));
+{
+  // hedger-onchain: hedge rows through the pool and its last status (the pool holds the stock, never the keeper)
+  const lines = existsSync(join(out, "hedger-onchain.log")) ? readFileSync(join(out, "hedger-onchain.log"), "utf8").trim().split("\n").filter(Boolean).map((l) => JSON.parse(l) as Record<string, unknown>) : [];
+  const rows = lines.filter((l) => l.msg === "hedge" && l.via === "onchain_dex");
+  const held = await read<bigint>(m7.MockStockToken!, "balanceOf", [POOL]);
+  const keeperHeld = await read<bigint>(m7.MockStockToken!, "balanceOf", [KEEPER]);
+  report.push(`hedger-onchain: ${rows.length} swaps through the pool; the pool holds ${formatUnits(held, 18)} STK1; the keeper holds ${formatUnits(keeperHeld, 18)}`);
+}
 report.push(`risk-monitor: ${[...new Set(alarms.map((l) => String(l.name)))].map((n) => `${n} ${count(n)}`).join(", ")}`);
 crit[9] = {
-  ok: count("TIMELOCK_QUEUED") >= 6 && count("TIMELOCK_EXECUTED") >= 5 && count("TIMELOCK_CANCELLED") >= 1 && pausedBy.includes("the guardian") && pausedBy.includes("the automated risk key (E1)") && count("UNPAUSED") >= 4 && unexpected.length === 0,
-  detail: `queued calls named (${queuedNamed.slice(0, 3).join("; ")}…), executed and cancelled announced; pauses by ${[...new Set(pausedBy)].join(", ")}; unpauses ${count("UNPAUSED")}; unexpected ${unexpected.map((l) => l.name).join(", ") || "none"}`,
+  ok: count("timelock-queued") >= 6 && count("timelock-executed") >= 5 && count("timelock-cancelled") >= 1 && pausedBy.includes("the guardian") && pausedBy.includes("the automated risk key (E1)") && count("unpaused") >= 4 && unexpected.length === 0 && alarms.some(plannedGrant),
+  detail: `queued calls named (${queuedNamed.slice(0, 3).join("; ")}…), executed and cancelled announced; the keeper's role grant announced (${alarms.some(plannedGrant)}); pauses by ${[...new Set(pausedBy)].join(", ")}; unpauses ${count("unpaused")}; unexpected ${unexpected.map((l) => l.name).join(", ") || "none"}`,
+};
+
+crit[12] = {
+  ok: stk1Hedge.buyOk && stk1Hedge.rows >= 1 && stk1Hedge.target > 0 && Math.abs(stk1Hedge.held - stk1Hedge.target) <= 0.1 * stk1Hedge.target + 1 && stk1Hedge.keeperHeld === 0n && Object.values(stk1Hedge.freeze).every(Boolean),
+  detail: `hedger-onchain (RH6, G7) through the hedge keeper gate (RH8b): ${stk1Hedge.rows} swap(s) after an STK1 call buy; target ${stk1Hedge.target.toFixed(2)} shares, the pool holds ${stk1Hedge.held.toFixed(2)}, the keeper ${formatUnits(stk1Hedge.keeperHeld, 18)}; the guardian froze the gate (${stk1Hedge.freeze.frozen}), could not unfreeze it (${stk1Hedge.freeze.guardianCannotUnfreeze}), the next swap was refused at the gate (${stk1Hedge.freeze.refusedWhileFrozen}), the Safe unfroze it (${stk1Hedge.freeze.safeUnfroze})`,
 };
 
 const badRoutes = routeChecks.filter((r) => !r.ok);
 crit[10] = {
   ok: badRoutes.length === 0 && routeChecks.length > 0 && law4.length === 0 && mirror.length === 0 && shortfall === 0 && onchain === supply && zeroHolders.every((z) => z === 0n) && vaultBooks === vaultBal && mbOk && law1Traders.length === 0,
-  detail: `routing: ${routeChecks.length - badRoutes.length}/${routeChecks.length} cheapest when re-priced per candidate at the parent block; law 4: ${law4.length} violations; pool mirror and nothing uncovered (${mirror.length}); ${sellsOk} sells paid, buyback shortfall beyond dust ${shortfall}; USDC ${usd(onchain)} of supply ${usd(supply)}; Engine, OpenBook, RiskAuction and AgentRouter hold ${zeroHolders.map(usd).join("/")}; vault and MatchBook books = balances (${vaultBooks === vaultBal && mbOk}); law 1 for traders (${law1Traders.length} mismatches)`,
+  detail: `routing: ${routeChecks.length - badRoutes.length}/${routeChecks.length} cheapest when re-priced per candidate at the parent block; law 4: ${law4.length} violations; pool mirror and nothing uncovered (${mirror.length}); ${sellsOk} sells paid, buyback shortfall beyond dust ${shortfall}; ${SYM} ${usd(onchain)} of supply ${usd(supply)}; Engine, OpenBook, RiskAuction and AgentRouter hold ${zeroHolders.map(usd).join("/")}; vault and MatchBook books = balances (${vaultBooks === vaultBal && mbOk}); law 1 for traders (${law1Traders.length} mismatches)`,
 };
 
 let errorLines = 0;
 const samples: string[] = [];
-for (const f of ["signer-1", "signer-2", "signer-3", "poker-primary", "poker-backup", "hedger", "risk-monitor", "maker-gateway", "maker-1", "maker-2", "receipts"]) {
+for (const f of ["signer-1", "signer-2", "signer-3", "poker-primary", "poker-backup", "hedger", "hedger-onchain", "risk-monitor", "maker-gateway", "maker-1", "maker-2", "receipts"]) {
   for (const l of lines(f)) {
     if (l.level === "error") {
       errorLines++;
@@ -1024,6 +1122,7 @@ const names: Record<number, string> = {
   9: "risk-monitor",
   10: "laws 1–5 (routing, law 4, buybacks, conservation)",
   11: "service error lines and gas",
+  12: "on-chain stock hedge through the gate",
 };
 const crits = Object.keys(names).map((n) => {
   const c = crit[Number(n)] ?? { ok: false, detail: "not reached" };

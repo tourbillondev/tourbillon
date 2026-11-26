@@ -1,5 +1,5 @@
 /// The 15-minute venue-outage rule, per market. Pure: the caller passes the time.
-/// A market is down when the monitor's own probe of Hyperliquid fails for it, or the hedger reports it failing. After
+/// A market is down when its venue fails: the exchange probe (crypto) or its hedger's status (both kinds). After
 /// `windowMs` of continuous downtime it trips once (the caller pauses opens on that market); any healthy pass resets
 /// the timer; a trip is followed by one "recovered" when the market is healthy again.
 

@@ -8,7 +8,10 @@ evm_version = "cancun"
 via_ir = true
 optimizer = true
 optimizer_runs = 200
-fs_permissions = [{ access = "read-write", path = "./deployments" }, { access = "read", path = "./out" }]
+# Pinned so a build can be compared byte for byte with what is deployed.
+bytecode_hash = "ipfs"
+cbor_metadata = true
+fs_permissions = [{ access = "read-write", path = "./deployments" }, { access = "read", path = "./out" }, { access = "read", path = "./calendar" }]
 auto_detect_remappings = false
 remappings = [
     "forge-std/=lib/forge-std/src/",
@@ -25,6 +28,14 @@ compilation_restrictions = [{ paths = "lib/safe-smart-account/**", via_ir = fals
 [fuzz]
 runs = 1000
 seed = "0x7462"
+
+# The playbook's depth for stateful invariants (03 §2): 100,000 calls per suite (1,000 runs × 100 calls each). Every
+# suite also carries inline deep.* lines (inline default.* lines would otherwise apply under this profile too). Run with
+#   FOUNDRY_PROFILE=deep forge test --match-path 'test/invariant/*'
+# CI runs it on a schedule (.github/workflows/invariants-deep.yml). The default profile keeps a shorter depth per suite.
+[profile.deep.invariant]
+runs = 1000
+depth = 100
 
 [fmt]
 line_length = 120

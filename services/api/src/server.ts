@@ -1,16 +1,17 @@
 import { getAddress, isAddress, parseEther, type Address, type Hex } from "viem";
 import { blendValue } from "@tourbillon/common/tempo.ts";
-import { b32, usdc, type Dep, type Reads } from "./chain.ts";
+import { b32, type Dep, type Reads } from "./chain.ts";
 
 /// API v1 (launch core; owner D4: open, read-only, no keys, per-IP rate limits). JSON over GET only:
+///   /healthz                        {"ok":true}: the process answers (the release system's live check)
 ///   /v1/status                      pauses, pool NAV and coverage, mark and vol freshness per market, receipts
 ///   /v1/markets                     listing, spread, strike step, mark, vol, caps and use, pauses
 ///   /v1/chains/:market              indicative call and put values around the mark per tempo (board vol)
 ///   /v1/quote/buy                   the exact cost of a buy now (best of the pool and the maker quotes)
 ///   /v1/positions/:owner            held directly and in the AgentRouter sub-account, with units now
 ///   /v1/receipts/proof              a receipt's Merkle proof (from the receipts service)
-/// Amounts: USDC as decimal strings (6 decimals); strikes, units and marks as decimal strings. Wording follows the spec's
-/// rules (Overview section 9): "NAV", never return or income language.
+/// Amounts: the settlement token (its symbol and decimals in /v1/status, from the deployment file) as decimal strings; strikes, units and marks as decimal strings. Wording follows the spec's
+/// rules (Overview section 9): "NAV" and "funding received", never the words that section rules out.
 
 export type PositionRow = { id: string; owner: string; held: string; market: string; legs_json: unknown; tempo_or_movement: unknown; raw: string };
 export type Deps = {
@@ -101,7 +102,7 @@ export function makeApi(x: Deps, opts: { perMinute?: number; trustProxy?: boolea
     const deadline = (await x.now()) + 600n;
     const r = await x.reads.quoteBuy([b32(m), legs, movement, units, 2n ** 128n, deadline, quotes, sigs, []]);
     if (!r.ok) return { market: m, quoted: false, reason: r.reason };
-    return { market: m, quoted: true, cost: usdc(r.cost), source: KINDS[r.kind] ?? "unknown", makerQuotesConsidered: quotes.length, note: "premium plus fee at the current block; a buy pays at most the maxCost it sets" };
+    return { market: m, quoted: true, cost: x.reads.amount(r.cost), symbol: x.dep.settlement.symbol, source: KINDS[r.kind] ?? "unknown", makerQuotesConsidered: quotes.length, note: "premium plus fee at the current block; a buy pays at most the maxCost it sets" };
   }
 
   async function positions(owner: string) {
@@ -119,6 +120,8 @@ export function makeApi(x: Deps, opts: { perMinute?: number; trustProxy?: boolea
     async fetch(req: Request, server?: { requestIP(r: Request): { address: string } | null }): Promise<Response> {
       if (req.method === "OPTIONS") return new Response(null, { status: 204, headers: { "access-control-allow-origin": "*", "access-control-allow-methods": "GET" } });
       if (req.method !== "GET") return bad("read-only: GET only", 405);
+      // the release system's live check (playbook 07 §5): the process answers; no chain read, never rate-limited
+      if (new URL(req.url).pathname === "/healthz") return json({ ok: true });
       const ip = (opts.trustProxy ? req.headers.get("x-forwarded-for")?.split(",")[0]?.trim() : undefined) ?? server?.requestIP(req)?.address ?? "unknown";
       if (!limit.allow(ip)) return bad("rate limit: try again in a minute", 429);
       const url = new URL(req.url);

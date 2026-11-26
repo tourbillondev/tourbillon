@@ -46,7 +46,7 @@ function deriveKey(c: Keystore["crypto"], password: string): Buffer {
   throw new Error(`keystore: unsupported kdf ${(c as { kdf: string }).kdf}`);
 }
 
-/// Returns the private key. Throws on a wrong password (MAC mismatch) without revealing anything else.
+/// Gives the private key. Throws on a wrong password (MAC mismatch) without revealing anything else.
 export function decryptKeystore(ks: Keystore, password: string): Hex {
   const c = ks.crypto;
   if (c.cipher !== "aes-128-ctr") throw new Error(`keystore: unsupported cipher ${c.cipher}`);

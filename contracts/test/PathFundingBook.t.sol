@@ -8,7 +8,7 @@ import {TempoBlend} from "../src/TempoBlend.sol";
 
 contract PathFundingBookTest is Test {
     uint256 constant T0 = 1_794_182_400; // a day boundary
-    uint256 constant BLOCK_GAS = 32_000_000; // Arbitrum Orbit default block gas limit; Elysium's own is (U)
+    uint256 constant BLOCK_GAS = 32_000_000; // Arbitrum Orbit default block gas limit; Robinhood Chain's own is (U) until RobinhoodProbe measures it
     bytes32 constant BTC = "BTC";
     bytes32 constant OLD = "OLD";
     address constant HOLDER = address(0xA11CE);
@@ -222,7 +222,7 @@ contract PathFundingBookTest is Test {
         book.latestSample(OLD); // other markets are separate
     }
 
-    /// seriesOf returns exactly the terms given to open; exists tracks whether a series was opened.
+    /// seriesOf gives exactly the terms given to open; exists tracks whether a series was opened.
     function test_seriesOfAndExists() public {
         book.record(BTC, 100e18, 5000);
         TempoBlend.Part[] memory mv = new TempoBlend.Part[](3);

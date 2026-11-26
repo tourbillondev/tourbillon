@@ -1,31 +1,41 @@
 import { afterAll, beforeAll, describe, expect, spyOn, test } from "bun:test";
 import { parseEther } from "viem";
 import { decide, type KeyState } from "../src/decide.ts";
-import { accountValueFrom, EQUITY_OFFSET, EquitySource, equityKey, equityVote, transfersFromLedger } from "../src/equity.ts";
+import { EQUITY_OFFSET, EquitySource, equityKey, equityVote } from "../src/equity.ts";
+import { HttpExchange, parseMarkets, parseTransfers } from "@tourbillon/common/exchange.ts";
+import { SimExchange } from "../../hedger/src/simexchange.ts";
 
-// Ledger entries shaped as Hyperliquid documents userNonFundingLedgerUpdates (synthetic values; field names (U)).
-const LEDGER = [
-  { time: 1, hash: "0x01", delta: { type: "deposit", usdc: "600000.0" } },
-  { time: 2, hash: "0x02", delta: { type: "deposit", usdc: "400000.0" } },
-  { time: 3, hash: "0x03", delta: { type: "withdraw", usdc: "100001.0", nonce: 7, fee: "1.0" } },
-  { time: 4, hash: "0x04", delta: { type: "accountClassTransfer", usdc: "5.0", toPerp: true } }, // ignored
+// Transfers as the exchange adapter gives them (synthetic values).
+const TRANSFERS = [
+  { type: "deposit", amount: "600000.0", fee: "0" },
+  { type: "deposit", amount: "400000.0" },
+  { type: "withdraw", amount: "100001.0", fee: "1.0" },
+  { type: "internal", amount: "5.0" }, // ignored
 ];
-const STATE = { marginSummary: { accountValue: "950000.5", totalNtlPos: "0.0" } };
 
 describe("EQUITY value", () => {
   test("deposits credited and withdrawals sent home net of fee", () => {
-    expect(transfersFromLedger(LEDGER)).toEqual({ deposits: parseEther("1000000"), withdrawalsNet: parseEther("100000") });
-    expect(() => transfersFromLedger({})).toThrow("not a list");
+    expect(parseTransfers(TRANSFERS)).toEqual({ deposits: parseEther("1000000"), withdrawalsNet: parseEther("100000") });
+    expect(() => parseTransfers({})).toThrow("not a list");
   });
 
   test("P&L only: account value − deposits + withdrawals home, plus the offset", () => {
-    const v = equityVote(accountValueFrom(STATE), parseEther("1000000"), parseEther("100000"));
+    const v = equityVote(parseEther("950000.5"), parseEther("1000000"), parseEther("100000"));
     expect(v - EQUITY_OFFSET).toBe(parseEther("50000.5")); // 950,000.5 − 1,000,000 + 100,000
     // a loss is below the offset, still a valid board value
     expect(equityVote(parseEther("700000"), parseEther("1000000"), 0n)).toBe(EQUITY_OFFSET - parseEther("300000"));
     expect(() => equityVote(0n, EQUITY_OFFSET + 1n, 0n)).toThrow("below the offset range");
-    expect(accountValueFrom({ marginSummary: { accountValue: "0.0" } })).toBe(0n);
-    expect(() => accountValueFrom({})).toThrow();
+  });
+
+  test("markets: a missing or non-positive price leaves the market out", () => {
+    const m = parseMarkets([
+      { name: "BTC", szDecimals: 5, pxDecimals: 1, mid: "100000", mark: "100001" },
+      { name: "ETH", szDecimals: 4, pxDecimals: 2, mid: "0", mark: "3000" },
+      { name: "SOL", szDecimals: 2, pxDecimals: 3 },
+    ]);
+    expect([...m.keys()]).toEqual(["BTC"]);
+    expect(m.get("BTC")).toEqual({ name: "BTC", szDecimals: 5, pxDecimals: 1, mid: 100000, mark: 100001 });
+    expect(() => parseMarkets({})).toThrow("not a list");
   });
 
   test.skipIf(!Bun.which("cast"))("the key equals keccak256(abi.encode('EQUITY', pool)) as the pool computes it", () => {
@@ -45,39 +55,33 @@ describe("EQUITY value", () => {
   });
 });
 
-describe("EquitySource against a local fake server", () => {
-  let mode: "ok" | "500" = "ok";
-  const bodies: Record<string, unknown>[] = [];
-  let server: ReturnType<typeof Bun.serve>;
+describe("EquitySource against the simulated exchange", () => {
+  let ex: SimExchange;
   beforeAll(() => {
-    server = Bun.serve({
-      port: 0,
-      async fetch(req) {
-        const b = (await req.json()) as Record<string, unknown>;
-        bodies.push(b);
-        if (mode === "500") return new Response("down", { status: 500 });
-        if (b.type === "clearinghouseState") return Response.json(STATE);
-        if (b.type === "userNonFundingLedgerUpdates") return Response.json(LEDGER);
-        return new Response("?", { status: 400 });
-      },
-    });
+    ex = new SimExchange([{ name: "BTC", szDecimals: 5, mid: 100_000 }]);
+    ex.deposit(1_000_000);
+    ex.withdraw(100_001, 1);
+    ex.cash += 50_000.5;
   });
-  afterAll(() => server.stop(true));
+  afterAll(() => ex.stop());
 
-  test("reads both endpoints for the pool's account; a failed read gives no reading", async () => {
+  test("a read-only key reads the account value and the transfers; it cannot trade; a failed read gives no reading", async () => {
     const quiet = spyOn(process.stdout, "write").mockImplementation(() => true);
     try {
-      const user = "0x00000000000000000000000000000000000000E1";
-      const src = new EquitySource(user, `http://127.0.0.1:${server.port}`, 3000, () => 1_000_000);
+      const read = new HttpExchange("sim", ex.url, ex.issueKey("read"));
+      const src = new EquitySource(read, () => 1_000_000);
       const r = await src.read(1_800_000_000);
-      expect(r).toEqual({ value: EQUITY_OFFSET + parseEther("50000.5"), at: 1_800_000_000 });
-      expect(bodies.map((b) => b.type).sort()).toEqual(["clearinghouseState", "userNonFundingLedgerUpdates"]);
-      expect(bodies.every((b) => b.user === user)).toBe(true);
-      mode = "500";
+      // cash 1,000,000 − 100,001 + 50,000.5; the withdrawal counts net of its 1 USDC fee, so the fee is a cost: P&L 49,999.5
+      expect(r).toEqual({ value: EQUITY_OFFSET + parseEther("49999.5"), at: 1_800_000_000 });
+      expect(ex.requests.map((q) => q.path).sort()).toEqual(["/v1/account", "/v1/transfers"]);
+      await expect(read.placeIoc([{ market: "BTC", side: "buy", sz: 0.01, limitPx: 200_000, reduceOnly: false }])).rejects.toThrow("HTTP 403");
+      expect(ex.rejected).toEqual(["a read key tried to trade"]);
+      await expect(new HttpExchange("sim", ex.url, "made-up").accountValue()).rejects.toThrow("HTTP 401");
+      ex.outage = "http500";
       expect(await src.read(1_800_000_000)).toBeNull();
     } finally {
       quiet.mockRestore();
-      mode = "ok";
+      ex.outage = "none";
     }
   });
 });

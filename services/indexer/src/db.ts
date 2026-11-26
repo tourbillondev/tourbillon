@@ -39,6 +39,13 @@ export async function apply(db: Db, name: string, nextBlock: bigint, ops: Op[], 
         await tx`UPDATE board_votes SET dropped = true WHERE key = ${o.key} AND round = ${o.round.toString()} AND signer = ${o.signer}`;
       } else if (o.t === "final") {
         await tx`INSERT INTO board_finals (key, round, median, published, votes, ts) VALUES (${o.key}, ${o.round.toString()}, ${o.median.toString()}, ${o.published.toString()}, ${Number(o.votes)}, ${o.ts.toString()}) ON CONFLICT DO NOTHING`;
+        // a MARK final is also a quorum row in the marks audit trail (the key's market from the labels)
+        await tx`INSERT INTO marks (market, ts, source, round, px, median, accepted)
+                 SELECT market, ${o.ts.toString()}, 'quorum', ${o.round.toString()}, ${o.published.toString()}, ${o.median.toString()}, ${o.published === o.median}
+                 FROM board_keys WHERE key = ${o.key} AND kind = 'MARK' ON CONFLICT DO NOTHING`;
+      } else if (o.t === "hedge") {
+        await tx`INSERT INTO hedges (id, market, side, sz, px, settlement_amount, sent_at, reconciled_at, filled_sz, via)
+                 VALUES (${o.id}, ${o.market}, ${o.buy ? "buy" : "sell"}, ${o.token.toString()}, ${o.markWad.toString()}, ${o.settlementAmount.toString()}, ${o.ts.toString()}, ${o.ts.toString()}, ${o.token.toString()}, 'onchain_dex') ON CONFLICT DO NOTHING`;
       } else {
         const id = o.id.toString();
         const s = terms.get(id) ?? (await tx`SELECT market, legs_json, movement FROM series WHERE id = ${id}`).map((r: { market: string; legs_json: unknown; movement: unknown }) => ({ market: r.market, legs: r.legs_json, movement: r.movement }))[0];

@@ -10,16 +10,18 @@ export type Config = {
   key: KeyInput;
   dryRun: boolean;
   once: boolean;
+  feeds?: string; // the signer's feeds file (feedsConfig.ts); needed unless test marks are given
   testMarks?: Map<string, bigint>; // anvil only
   testVol?: bigint; // anvil only
   equityPool?: Address; // MainspringPool whose EQUITY key this signer votes
-  equityHlUser?: Address; // that pool's Hyperliquid account
-  hlApi?: string; // anvil only: a local fake of Hyperliquid's info API
+  exchange?: string; // the crypto hedge exchange holding that pool's account (read-only key); "sim" on anvil (Q5)
+  exchangeUrl?: string; // sim only: the local simulated exchange
 };
 
 const USAGE = `usage: bun src/main.ts --deployment <file> (--keystore <name> [--keystore-dir <dir>] | --local-unlocked <addr> | --watch <addr>)
-                [--rpc <url>] [--dry-run] [--once] [--test-marks BTC=100000,ETH=3000] [--test-vol 0.5]
-                [--equity-pool <pool> --equity-hl-user <hyperliquid address>] [--hl-api <url>]`;
+                (--feeds <file.json> | --test-marks STK1=400,BTC=100000 [--test-vol 0.5])
+                [--rpc <url>] [--dry-run] [--once]
+                [--equity-pool <pool> --exchange sim --exchange-url <local url>]`;
 
 export function parseArgs(argv: string[]): Config {
   const a = new Map<string, string | true>();
@@ -34,7 +36,7 @@ export function parseArgs(argv: string[]): Config {
       a.set(flag, v);
     }
   }
-  const known = new Set(["deployment", "rpc", "keystore", "keystore-dir", "local-unlocked", "watch", "dry-run", "once", "test-marks", "test-vol", "equity-pool", "equity-hl-user", "hl-api"]);
+  const known = new Set(["deployment", "rpc", "keystore", "keystore-dir", "local-unlocked", "watch", "dry-run", "once", "feeds", "test-marks", "test-vol", "equity-pool", "exchange", "exchange-url"]);
   for (const k of a.keys()) if (!known.has(k)) throw new Error(`unknown flag --${k}\n${USAGE}`);
 
   const str = (k: string) => (typeof a.get(k) === "string" ? (a.get(k) as string) : undefined);
@@ -51,7 +53,7 @@ export function parseArgs(argv: string[]): Config {
   const dryRun = a.has("dry-run");
   if (key.type === "watch" && !dryRun) throw new Error("--watch is for --dry-run only");
 
-  const cfg: Config = { deployment, rpc: str("rpc"), key, dryRun, once: a.has("once") };
+  const cfg: Config = { deployment, rpc: str("rpc"), key, dryRun, once: a.has("once"), feeds: str("feeds") };
   const marks = str("test-marks");
   if (marks) {
     cfg.testMarks = new Map(
@@ -65,13 +67,15 @@ export function parseArgs(argv: string[]): Config {
   const vol = str("test-vol");
   if (vol) cfg.testVol = parseEther(vol);
   const pool = str("equity-pool");
-  const hlUser = str("equity-hl-user");
-  if ((pool === undefined) !== (hlUser === undefined)) throw new Error("--equity-pool and --equity-hl-user go together");
-  if (pool && hlUser) {
+  const exchange = str("exchange");
+  if ((pool === undefined) !== (exchange === undefined)) throw new Error("--equity-pool and --exchange go together");
+  if (pool && exchange) {
     cfg.equityPool = getAddress(pool);
-    cfg.equityHlUser = getAddress(hlUser);
+    cfg.exchange = exchange;
+    cfg.exchangeUrl = str("exchange-url");
   }
-  cfg.hlApi = str("hl-api");
+  if (!cfg.feeds && !cfg.testMarks) throw new Error(`--feeds is required (test marks are for a local anvil only)\n${USAGE}`);
+  if (cfg.feeds && cfg.testMarks) throw new Error("give --feeds or --test-marks, not both");
   return cfg;
 }
 
@@ -80,5 +84,5 @@ export function checkForChain(cfg: Config, chainId: number): void {
   const local = chainId === LOCAL_CHAIN_ID;
   if (cfg.key.type === "local-unlocked" && !local) throw new Error("--local-unlocked works only on a local anvil (31337)");
   if ((cfg.testMarks || cfg.testVol !== undefined) && !local) throw new Error("test values work only on a local anvil (31337)");
-  if (cfg.hlApi && !local) throw new Error("--hl-api works only on a local anvil (31337)");
+  if (cfg.exchange === "sim" && !local) throw new Error("--exchange sim works only on a local anvil (31337)");
 }

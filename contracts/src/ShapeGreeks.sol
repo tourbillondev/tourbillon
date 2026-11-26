@@ -45,13 +45,13 @@ library ShapeGreeks {
         return (vHi - vLo) * 100 / int256(hi - lo);
     }
 
-    /// @notice |delta| × S × units in USDC (6 decimals): the position's dollar delta.
+    /// @notice |delta| × S × units in settlement token (6 decimals): the position's dollar delta.
     function deltaUsd(int256 d, uint256 s, uint256 units) internal pure returns (uint256) {
         uint256 a = d < 0 ? uint256(-d) : uint256(d);
         return a * s / WAD * units / WAD / 1e12;
     }
 
-    /// @notice |vega| × units in USDC (6 decimals) per vol point.
+    /// @notice |vega| × units in settlement token (6 decimals) per vol point.
     function vegaUsd(int256 v, uint256 units) internal pure returns (uint256) {
         uint256 a = v < 0 ? uint256(-v) : uint256(v);
         return a * units / WAD / 1e12;

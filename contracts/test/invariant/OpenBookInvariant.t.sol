@@ -17,7 +17,9 @@ import {MatchBook} from "../../src/MatchBook.sol";
 import {OpenBook, IEngineOpenFor} from "../../src/OpenBook.sol";
 import {IEngineConfig} from "../../src/WriterBook.sol";
 import {MockUSDC} from "../mocks/MockUSDC.sol";
-import {MockWHYPE} from "../mocks/MockWHYPE.sol";
+import {MockStockToken} from "../mocks/MockStockToken.sol";
+import {CoverFixture} from "../mocks/CoverFixture.sol";
+import {CoveringAssets} from "../../src/CoveringAssets.sol";
 import {MockMarks, MockVols} from "../Engine.t.sol";
 
 /// M6 step 7: the open book on the full stack. Random sequences of routed buys (signed maker quotes, writer offers,
@@ -29,8 +31,8 @@ contract OpenBookHandler is Test {
     address public constant LP = address(0x1A1);
     uint256 public constant START = 100_000_000e6;
 
-    MockUSDC public usdc;
-    MockWHYPE public whype;
+    MockUSDC public settlement;
+    MockStockToken public stock;
     MockMarks public marks;
     MockVols public vols;
     MainspringPool public pool;
@@ -66,8 +68,8 @@ contract OpenBookHandler is Test {
 
     constructor() {
         vm.warp(nowT);
-        usdc = new MockUSDC();
-        whype = new MockWHYPE();
+        settlement = new MockUSDC();
+        stock = new MockStockToken("Mock Stock One", "STK1", 18);
         marks = new MockMarks();
         vols = new MockVols();
         address[] memory sg = new address[](3);
@@ -77,12 +79,12 @@ contract OpenBookHandler is Test {
         address bookAt = vm.computeCreateAddress(address(this), n + 1);
         address engineAt = vm.computeCreateAddress(address(this), n + 2);
         pool = new MainspringPool(
-            address(this), usdc, PathFundingBook(bookAt), marks, vols, IEquityFeed(address(board)), PROTO
+            address(this), settlement, PathFundingBook(bookAt), marks, vols, IEquityFeed(address(board)), PROTO
         );
         book = new PathFundingBook(engineAt, address(this), marks, vols);
         engine = new Engine(address(this), book, pool, marks, vols);
         require(address(book) == bookAt && address(engine) == engineAt, "prediction");
-        vault = new MakerVault(address(this), IERC20(address(usdc)), IERC20(address(whype)));
+        vault = new MakerVault(address(this), IERC20(address(settlement)), CoverFixture.listed(address(this), address(marks), IERC20(address(stock))));
         mb = new MatchBook(address(this), book, IEngineConfig(address(engine)), vault, marks, vols);
         address obAt = vm.computeCreateAddress(address(this), vm.getNonce(address(this)) + 1);
         qb = new VolQuoteBook(obAt);
@@ -105,30 +107,30 @@ contract OpenBookHandler is Test {
         vols.set(BTC, 4500);
         book.record(BTC, s, 4500);
 
-        usdc.mint(LP, START);
+        settlement.mint(LP, START);
         vm.startPrank(LP);
-        usdc.approve(address(pool), type(uint256).max);
+        settlement.approve(address(pool), type(uint256).max);
         pool.deposit(10_000_000e6);
         vm.stopPrank();
         pool.startEpoch();
         while (!pool.markChunk(100)) {}
         pool.settle();
         for (uint256 i; i < 2; ++i) {
-            usdc.mint(traders[i], START);
+            settlement.mint(traders[i], START);
             vm.prank(traders[i]);
-            usdc.approve(address(engine), type(uint256).max);
+            settlement.approve(address(engine), type(uint256).max);
         }
         for (uint256 i; i < 3; ++i) {
             (makers[i], makerPks[i]) = makeAddrAndKey(string(abi.encode("maker", i)));
-            usdc.mint(makers[i], START);
+            settlement.mint(makers[i], START);
             vm.startPrank(makers[i]);
-            usdc.approve(address(vault), type(uint256).max);
-            vault.deposit(IERC20(address(usdc)), 20_000_000e6);
+            settlement.approve(address(vault), type(uint256).max);
+            vault.deposit(IERC20(address(settlement)), 20_000_000e6);
             vm.stopPrank();
         }
-        usdc.mint(WRITER, START);
+        settlement.mint(WRITER, START);
         vm.prank(WRITER);
-        usdc.approve(address(mb), type(uint256).max);
+        settlement.approve(address(mb), type(uint256).max);
         sids[0] = book.idOfShape(BTC, shape(0), _day());
         sids[1] = book.idOfShape(BTC, shape(1), _day());
     }
@@ -260,12 +262,12 @@ contract OpenBookHandler is Test {
         address m = makers[seed % 3];
         if ((seed >> 8) % 2 == 0) {
             vm.prank(m);
-            vault.deposit(IERC20(address(usdc)), 1e6 + (seed >> 16) % 1_000_000e6);
+            vault.deposit(IERC20(address(settlement)), 1e6 + (seed >> 16) % 1_000_000e6);
         } else {
-            uint256 free = vault.freeOf(m, IERC20(address(usdc)));
+            uint256 free = vault.freeOf(m, IERC20(address(settlement)));
             if (free == 0) return;
             vm.prank(m);
-            vault.withdraw(IERC20(address(usdc)), 1 + (seed >> 16) % free);
+            vault.withdraw(IERC20(address(settlement)), 1 + (seed >> 16) % free);
         }
     }
 
@@ -377,7 +379,10 @@ contract OpenBookHandler is Test {
 
 /// forge-config: default.invariant.runs = 32
 /// forge-config: default.invariant.depth = 40
+/// forge-config: deep.invariant.runs = 1000
+/// forge-config: deep.invariant.depth = 100
 /// forge-config: default.invariant.fail-on-revert = true
+/// forge-config: deep.invariant.fail-on-revert = true
 contract OpenBookInvariantTest is Test {
     OpenBookHandler h;
 
@@ -458,7 +463,7 @@ contract OpenBookInvariantTest is Test {
     /// 4. Money: USDC is conserved; the vault holds exactly free + locked; the MatchBook holds exactly what it accounts
     ///    for; the Engine and the router hold nothing.
     function invariant_moneyIsConservedAndHeldWhereItBelongs() public view {
-        MockUSDC u = h.usdc();
+        MockUSDC u = h.settlement();
         uint256 total = u.balanceOf(address(h.pool())) + u.balanceOf(address(h.vault())) + u.balanceOf(address(h.mb()))
             + u.balanceOf(h.PROTO()) + u.balanceOf(h.LP()) + u.balanceOf(h.WRITER()) + u.balanceOf(address(h.engine()))
             + u.balanceOf(address(h.ob()));
@@ -473,7 +478,7 @@ contract OpenBookInvariantTest is Test {
         }
         assertEq(total, u.totalSupply(), "USDC conserved");
         assertEq(u.balanceOf(address(h.vault())), vaultSum, "the vault holds free + locked");
-        assertEq(u.balanceOf(address(h.mb())), h.mb().heldUsdc(), "the MatchBook holds what it accounts for");
+        assertEq(u.balanceOf(address(h.mb())), h.mb().heldSettlement(), "the MatchBook holds what it accounts for");
         assertEq(u.balanceOf(address(h.engine())), 0);
         assertEq(u.balanceOf(address(h.ob())), 0);
     }

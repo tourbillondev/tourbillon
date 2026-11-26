@@ -20,15 +20,15 @@ contract HousePoolTest is Test {
     address constant FEES = address(0xFEE);
     address constant STRANGER = address(0xBAD);
 
-    MockUSDC usdc;
+    MockUSDC settlement;
     HousePool pool;
 
     function setUp() public {
-        usdc = new MockUSDC();
-        pool = new HousePool(address(this), usdc, FEES);
+        settlement = new MockUSDC();
+        pool = new HousePool(address(this), settlement, FEES);
         pool.setEngine(address(this));
-        usdc.mint(address(this), 10_000_000e6);
-        usdc.approve(address(pool), type(uint256).max);
+        settlement.mint(address(this), 10_000_000e6);
+        settlement.approve(address(pool), type(uint256).max);
         pool.deposit(1_000_000e6);
         pool.setCap(BTC, 500_000e6);
         pool.setCap(ETH, 100_000e6);
@@ -39,8 +39,8 @@ contract HousePoolTest is Test {
         vm.expectRevert(abi.encodeWithSelector(HousePool.NotSixDecimals.selector, 7));
         new HousePool(address(this), seven, FEES);
         vm.expectRevert(HousePool.ZeroAddress.selector);
-        new HousePool(address(0), usdc, FEES);
-        assertEq(address(pool.asset()), address(usdc));
+        new HousePool(address(0), settlement, FEES);
+        assertEq(address(pool.asset()), address(settlement));
     }
 
     function test_onlyEngineAndAdmin() public {
@@ -71,7 +71,7 @@ contract HousePoolTest is Test {
         // the engine is set once
         vm.expectRevert(HousePool.EngineAlreadySet.selector);
         pool.setEngine(STRANGER);
-        HousePool fresh = new HousePool(address(this), usdc, FEES);
+        HousePool fresh = new HousePool(address(this), settlement, FEES);
         vm.expectRevert(HousePool.NotEngine.selector); // no engine yet: nobody may call
         fresh.onBuy(BTC, 1, 1e18, 1e18, 100e18, 0, 0, 0);
         vm.expectRevert(HousePool.ZeroAddress.selector);
@@ -89,8 +89,8 @@ contract HousePoolTest is Test {
         pool.onBuy(ETH, 3, 10e18, 10e18, 3_000e18, 0, 1, 0);
         assertEq(pool.openNotional(ETH), 30_000e6);
         // a cap of 0 refuses every buy
-        vm.expectRevert(abi.encodeWithSelector(HousePool.CapExceeded.selector, bytes32("HYPE"), 1, 0));
-        pool.onBuy("HYPE", 4, 1e12, 1e12, 1e18, 0, 0, 0); // the smallest notional rounds up to 1 micro-USDC
+        vm.expectRevert(abi.encodeWithSelector(HousePool.CapExceeded.selector, bytes32("STK1"), 1, 0));
+        pool.onBuy("STK1", 4, 1e12, 1e12, 1e18, 0, 0, 0); // the smallest notional rounds up to 1 micro-USDC
         vm.expectRevert(HousePool.ZeroRaw.selector);
         pool.onBuy(BTC, 1, 1, 0, 1e18, 0, 0, 0);
     }
@@ -101,8 +101,8 @@ contract HousePoolTest is Test {
         pool.onSell(BTC, 7, 100, 0, 0, 0, 1_000e6 + 25e6, 1_000e6, 25e6, SELLER);
         assertEq(pool.seriesNotional(7), 100_000e6);
         assertEq(pool.openNotional(BTC), 100_000e6);
-        assertEq(usdc.balanceOf(SELLER), 1_000e6);
-        assertEq(usdc.balanceOf(FEES), 25e6);
+        assertEq(settlement.balanceOf(SELLER), 1_000e6);
+        assertEq(settlement.balanceOf(FEES), 25e6);
         // more raw than held is capped: the rest is released exactly
         pool.onSell(BTC, 7, 1_000, 0, 0, 0, 0, 0, 0, SELLER);
         assertEq(pool.seriesRaw(7), 0);
@@ -114,7 +114,7 @@ contract HousePoolTest is Test {
     /// INTERIM LIMIT (mainnet blocker): a sell the pool cannot pay reverts.
     function test_insolventSellReverts() public {
         pool.onBuy(BTC, 1, 1e18, 1e18, 100_000e18, 0, 0, 0);
-        uint256 bal = usdc.balanceOf(address(pool));
+        uint256 bal = settlement.balanceOf(address(pool));
         vm.expectRevert(abi.encodeWithSelector(HousePool.Insolvent.selector, bal + 1, bal));
         pool.onSell(BTC, 1, 1e18, 0, 0, 0, bal + 1, bal, 1, SELLER);
     }
@@ -131,7 +131,7 @@ contract HousePoolTest is Test {
         pool.onSell(BTC, 1, 2e18, 0, 0, 0, 0, 0, 0, SELLER);
         assertEq(pool.free(), 400_000e6);
         pool.withdraw(address(this), 400_000e6);
-        assertEq(usdc.balanceOf(address(pool)), 0);
+        assertEq(settlement.balanceOf(address(pool)), 0);
     }
 
     /// Random buys and sells on three series in two markets: market and total notional always equal the sum of
@@ -165,15 +165,15 @@ contract HousePoolTest is Test {
         assertEq(pool.openNotional(ETH), 0);
     }
 
-    function test_mockUsdcHasSixDecimalsAndPermit() public {
-        assertEq(usdc.decimals(), 6);
+    function test_mockSettlementHasSixDecimalsAndPermit() public {
+        assertEq(settlement.decimals(), 6);
         uint256 pk = 0xA11CE; // a throwaway test key, generated for this test only
         address owner = vm.addr(pk);
         uint256 deadline = block.timestamp + 1 hours;
         bytes32 digest = keccak256(
             abi.encodePacked(
                 "\x19\x01",
-                usdc.DOMAIN_SEPARATOR(),
+                settlement.DOMAIN_SEPARATOR(),
                 keccak256(
                     abi.encode(
                         keccak256("Permit(address owner,address spender,uint256 value,uint256 nonce,uint256 deadline)"),
@@ -187,7 +187,7 @@ contract HousePoolTest is Test {
             )
         );
         (uint8 v, bytes32 r, bytes32 s) = vm.sign(pk, digest);
-        usdc.permit(owner, address(pool), 5e6, deadline, v, r, s);
-        assertEq(usdc.allowance(owner, address(pool)), 5e6);
+        settlement.permit(owner, address(pool), 5e6, deadline, v, r, s);
+        assertEq(settlement.allowance(owner, address(pool)), 5e6);
     }
 }

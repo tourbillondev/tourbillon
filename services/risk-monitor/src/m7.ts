@@ -22,6 +22,9 @@ export const m7Abi = parseAbi([
   "event DepositsPaused(address by)",
   "event DepositsUnpaused(address by)",
   "event OpensResumed(address by, uint256 navPerShare)",
+  "event HedgingFrozen(address indexed by)",
+  "event HedgingUnfrozen(address indexed by)",
+  "event HedgerSet(address indexed hedger)",
 ]);
 
 /// The governed functions, to name what a queued operation will do.
@@ -47,6 +50,10 @@ export const governedAbi = parseAbi([
   "function grantRole(bytes32 role, address account)",
   "function revokeRole(bytes32 role, address account)",
   "function updateDelay(uint256 newDelay)",
+  "function setHedger(address hedger)",
+  "function setHedge(address router, uint16 slippageBps, bytes32 market, uint256 inventoryCap, uint256 dailyCap)",
+  "function listPool(address tokenA, address tokenB, uint24 fee, int24 tickSpacing)",
+  "function list(bytes32 market, address token, address[] holders)",
 ]);
 
 export type M7Addresses = {
@@ -54,6 +61,7 @@ export type M7Addresses = {
   receipts: Address | null;
   safe: Address | null;
   guardian: Address | null;
+  gate?: Address | null; // RH8b: the hedge keeper gate
   riskPauser: Address | null;
   deployer: Address | null; // role changes it made are the deploy's handover, not announced
   names: Map<string, string>;
@@ -92,35 +100,44 @@ export function m7Alarms(events: M7Event[], a: M7Addresses): Omit<Alarm, "state"
       case "CallScheduled": {
         const d = describeCall(getAddress(String(v.target)), v.data as Hex, a.names);
         const delay = Number(v.delay as bigint);
-        out.push({ name: "TIMELOCK_QUEUED", level: "alarm", what: `An admin action was queued in the timelock: ${d.contract}.${d.call}. It can run once the delay has passed.`, who: "everyone: review it; the Safe can cancel it before it runs", market: null, values: { id: v.id, contract: d.contract, call: d.call, delaySeconds: delay, executableAt: e.blockTimestamp + delay, tx } });
+        out.push({ name: "timelock-queued", level: "alarm", what: `An admin action was queued in the timelock: ${d.contract}.${d.call}. It can run once the delay has passed.`, who: "everyone: review it; the Safe can cancel it before it runs", market: null, values: { id: v.id, contract: d.contract, call: d.call, delaySeconds: delay, executableAt: e.blockTimestamp + delay, tx } });
         break;
       }
       case "CallExecuted": {
         const d = describeCall(getAddress(String(v.target)), v.data as Hex, a.names);
-        out.push({ name: "TIMELOCK_EXECUTED", level: "warn", what: `A queued admin action ran: ${d.contract}.${d.call}.`, who: "nobody", market: null, values: { id: v.id, contract: d.contract, call: d.call, tx } });
+        out.push({ name: "timelock-executed", level: "warn", what: `A queued admin action ran: ${d.contract}.${d.call}.`, who: "nobody", market: null, values: { id: v.id, contract: d.contract, call: d.call, tx } });
         break;
       }
       case "Cancelled":
-        out.push({ name: "TIMELOCK_CANCELLED", level: "warn", what: "A queued admin action was cancelled by the Safe.", who: "nobody", market: null, values: { id: v.id, tx } });
+        out.push({ name: "timelock-cancelled", level: "warn", what: "A queued admin action was cancelled by the Safe.", who: "nobody", market: null, values: { id: v.id, tx } });
         break;
       case "RoleGranted":
       case "RoleRevoked":
         if (a.deployer && getAddress(String(v.sender)) === a.deployer) break; // the deploy's own handover
-        out.push({ name: "ROLE_CHANGED", level: "alarm", what: `A role was ${e.eventName === "RoleGranted" ? "granted" : "revoked"} on ${a.names.get(e.address.toLowerCase()) ?? e.address}.`, who: "admin: confirm it was a queued and announced timelock action", market: null, values: { role: v.role, account: v.account, by: who(v.sender, a), tx } });
+        out.push({ name: "role-changed", level: "alarm", what: `A role was ${e.eventName === "RoleGranted" ? "granted" : "revoked"} on ${a.names.get(e.address.toLowerCase()) ?? e.address}.`, who: "admin: confirm it was a queued and announced timelock action", market: null, values: { role: v.role, account: v.account, by: who(v.sender, a), tx } });
         break;
       case "BuysPaused":
       case "MarketPaused":
       case "DepositsPaused": {
         const kind = e.eventName === "BuysPaused" ? "all opens (buys, routed fills, writes)" : e.eventName === "MarketPaused" ? "opens on this market" : "new deposits";
-        out.push({ name: "PAUSED", level: "alarm", what: `Paused: ${kind}. Sells and withdrawals are never paused.`, who: "the Safe: review, then unpause when safe", market: e.eventName === "MarketPaused" ? market(v.market) : null, values: { by: who(v.by, a), tx } });
+        out.push({ name: "paused", level: "alarm", what: `Paused: ${kind}. Sells and withdrawals are never paused.`, who: "the Safe: review, then unpause when satisfied", market: e.eventName === "MarketPaused" ? market(v.market) : null, values: { by: who(v.by, a), tx } });
         break;
       }
+      case "HedgingFrozen":
+        out.push({ name: "paused", level: "alarm", what: "Paused: on-chain stock hedging (the hedge keeper gate is frozen). Sells and withdrawals are never paused; stock opens pause once the hedge has been down 15 minutes.", who: "the Safe: review, then unfreeze the gate when satisfied", market: null, values: { by: who(v.by, a), tx } });
+        break;
+      case "HedgingUnfrozen":
+        out.push({ name: "unpaused", level: "warn", what: "Unpaused: on-chain stock hedging (the hedge keeper gate).", who: "nobody", market: null, values: { by: who(v.by, a), tx } });
+        break;
+      case "HedgerSet":
+        out.push({ name: "role-changed", level: "alarm", what: "The hedger key behind the hedge keeper gate was changed (a timelock action).", who: "admin: confirm it was a queued and announced timelock action", market: null, values: { role: "hedger key", account: v.hedger, tx } });
+        break;
       case "BuysUnpaused":
       case "MarketUnpaused":
       case "DepositsUnpaused":
       case "OpensResumed": {
         const kind = e.eventName === "BuysUnpaused" ? "all opens" : e.eventName === "MarketUnpaused" ? "opens on this market" : e.eventName === "DepositsUnpaused" ? "deposits" : "opens after a drawdown pause";
-        out.push({ name: "UNPAUSED", level: "warn", what: `Unpaused: ${kind}.`, who: "nobody", market: e.eventName === "MarketUnpaused" ? market(v.market) : null, values: { by: who(v.by, a), tx } });
+        out.push({ name: "unpaused", level: "warn", what: `Unpaused: ${kind}.`, who: "nobody", market: e.eventName === "MarketUnpaused" ? market(v.market) : null, values: { by: who(v.by, a), tx } });
         break;
       }
     }

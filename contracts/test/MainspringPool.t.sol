@@ -24,7 +24,7 @@ abstract contract MainspringPoolBase is Test {
     address constant ATTACKER = address(0xBAD);
     uint256 constant ALL = type(uint256).max;
 
-    MockUSDC usdc;
+    MockUSDC settlement;
     MockMarks marks;
     MockVols vols;
     MainspringPool pool;
@@ -45,7 +45,7 @@ abstract contract MainspringPoolBase is Test {
 
     function setUp() public virtual {
         _set(T0);
-        usdc = new MockUSDC();
+        settlement = new MockUSDC();
         marks = new MockMarks();
         vols = new MockVols();
         address[] memory sg = new address[](3);
@@ -56,7 +56,7 @@ abstract contract MainspringPoolBase is Test {
         address bookAt = vm.computeCreateAddress(address(this), n + 1);
         address engineAt = vm.computeCreateAddress(address(this), n + 2);
         pool = new MainspringPool(
-            address(this), usdc, PathFundingBook(bookAt), marks, vols, IEquityFeed(address(board)), PROTO
+            address(this), settlement, PathFundingBook(bookAt), marks, vols, IEquityFeed(address(board)), PROTO
         );
         book = new PathFundingBook(engineAt, address(this), marks, vols);
         engine = new Engine(address(this), book, pool, marks, vols);
@@ -81,10 +81,10 @@ abstract contract MainspringPoolBase is Test {
         book.record(ETH, 2_000e18, 6000);
         for (uint256 i; i < 4; ++i) {
             address who = [A, B, TRADER, ATTACKER][i];
-            usdc.mint(who, 100_000_000e6);
+            settlement.mint(who, 100_000_000e6);
             vm.startPrank(who);
-            usdc.approve(address(pool), type(uint256).max);
-            usdc.approve(address(engine), type(uint256).max);
+            settlement.approve(address(pool), type(uint256).max);
+            settlement.approve(address(engine), type(uint256).max);
             vm.stopPrank();
         }
     }
@@ -119,8 +119,8 @@ abstract contract MainspringPoolBase is Test {
     }
 
     /// The three signers post a P&L-only EQUITY value (signed USDC, 6 decimals) with the fixed offset.
-    function _postEquity(int256 pnlUsdc) internal {
-        uint256 v = uint256(int256(pool.EQUITY_OFFSET()) + pnlUsdc * 1e12);
+    function _postEquity(int256 pnlSettlement) internal {
+        uint256 v = uint256(int256(pool.EQUITY_OFFSET()) + pnlSettlement * 1e12);
         bytes32 key = pool.equityKey();
         ++equityRound;
         vm.prank(S1);
@@ -153,22 +153,22 @@ contract MainspringPoolTest is MainspringPoolBase {
 
     function test_feesSplitNinetyTen() public {
         _seed(1_000_000e6);
-        uint256 poolBefore = usdc.balanceOf(address(pool));
+        uint256 poolBefore = settlement.balanceOf(address(pool));
         (uint256 id, uint256 cost) = _buy(BTC, true, 70_000e18, 1e18);
         uint256 v = EnginePricing.unitValue(true, 70_000e18, 70_000e18, 4500, TempoBlend.single(1 days));
         (uint256 premium, uint256 fee) = EnginePricing.buyQuote(v, 1e18, 70_000e18, 200);
         assertEq(cost, premium + fee);
-        assertEq(usdc.balanceOf(PROTO), fee / 10, "10% of the buy fee to protocol");
-        assertEq(usdc.balanceOf(address(pool)), poolBefore + premium + fee - fee / 10);
+        assertEq(settlement.balanceOf(PROTO), fee / 10, "10% of the buy fee to protocol");
+        assertEq(settlement.balanceOf(address(pool)), poolBefore + premium + fee - fee / 10);
 
-        uint256 protoBefore = usdc.balanceOf(PROTO);
-        uint256 traderBefore = usdc.balanceOf(TRADER);
+        uint256 protoBefore = settlement.balanceOf(PROTO);
+        uint256 traderBefore = settlement.balanceOf(TRADER);
         (uint256 gross, uint256 sellFee) = EnginePricing.sellQuote(v, 1e18, 70_000e18, 200);
         uint256 net = _sell(id, ALL);
         assertEq(net, gross - sellFee);
-        assertEq(usdc.balanceOf(TRADER) - traderBefore, net);
-        assertEq(usdc.balanceOf(PROTO) - protoBefore, sellFee / 10, "10% of the sell fee to protocol");
-        assertEq(usdc.balanceOf(address(engine)), 0);
+        assertEq(settlement.balanceOf(TRADER) - traderBefore, net);
+        assertEq(settlement.balanceOf(PROTO) - protoBefore, sellFee / 10, "10% of the sell fee to protocol");
+        assertEq(settlement.balanceOf(address(engine)), 0);
     }
 
     /// Two LPs over several rounds while trading moves NAV: nobody entering or leaving is favoured by rounding.
@@ -206,7 +206,7 @@ contract MainspringPoolTest is MainspringPoolBase {
         vm.prank(A);
         pool.claimShares(2);
         assertLe(Math.mulDiv(pool.balanceOf(A) - 10_000_000e18, nps2, 1e18), d2);
-        assertGe(usdc.balanceOf(address(pool)), pool.owed(), "owed USDC is always held");
+        assertGe(settlement.balanceOf(address(pool)), pool.owed(), "owed USDC is always held");
     }
 
     /// The classic first-depositor attack (deposit 1 unit, donate to inflate the price) cannot take a later
@@ -217,7 +217,7 @@ contract MainspringPoolTest is MainspringPoolBase {
         vm.prank(ATTACKER);
         pool.claimShares(0);
         vm.prank(ATTACKER);
-        usdc.transfer(address(pool), 1_000_000e6); // donation
+        settlement.transfer(address(pool), 1_000_000e6); // donation
         _set(nowT + 1 hours);
         _lp(A, 1_000_000e6);
         _epochAndSettle();
@@ -277,7 +277,7 @@ contract MainspringPoolTest is MainspringPoolBase {
         pool.withdraw(1);
         assertEq(pool.balanceOf(A), pool.balanceOf(B), "pro rata: the same unfilled shares back to each");
         assertGt(pool.balanceOf(A), 0);
-        assertApproxEqAbs(usdc.balanceOf(A), usdc.balanceOf(B), 1);
+        assertApproxEqAbs(settlement.balanceOf(A), settlement.balanceOf(B), 1);
         assertGe(pool.available(), pool.stressedLiability(), "sells stay covered after withdrawals");
     }
 
@@ -295,10 +295,10 @@ contract MainspringPoolTest is MainspringPoolBase {
         (,, bool settled, bool refunded,, uint256 filled,,,,) = pool.rounds(1);
         assertTrue(settled && refunded);
         assertEq(filled, 0);
-        uint256 before = usdc.balanceOf(B);
+        uint256 before = settlement.balanceOf(B);
         vm.prank(B);
         pool.claimShares(1);
-        assertEq(usdc.balanceOf(B) - before, 50_000e6, "deposit refunded in full");
+        assertEq(settlement.balanceOf(B) - before, 50_000e6, "deposit refunded in full");
         vm.prank(A);
         pool.withdraw(1);
         assertEq(pool.balanceOf(A), 300_000e18, "shares returned");
@@ -415,9 +415,9 @@ contract MainspringPoolTest is MainspringPoolBase {
         units = bound(units, 5e18, 25e18);
         address[5] memory lps = [address(0x101), address(0x102), address(0x103), address(0x104), address(0x105)];
         for (uint256 i; i < 5; ++i) {
-            usdc.mint(lps[i], 10_000_000e6);
+            settlement.mint(lps[i], 10_000_000e6);
             vm.prank(lps[i]);
-            usdc.approve(address(pool), type(uint256).max);
+            settlement.approve(address(pool), type(uint256).max);
             _lp(lps[i], bound(uint256(keccak256(abi.encode(seed, i))), 200_000e6, 1_000_000e6));
         }
         _epochAndSettle();
@@ -442,7 +442,7 @@ contract MainspringPoolTest is MainspringPoolBase {
             pool.withdraw(1);
         }
         assertLe(owedBefore - pool.owed(), owedBefore);
-        assertGe(usdc.balanceOf(address(pool)), pool.owed() + pool.queuedDeposits());
+        assertGe(settlement.balanceOf(address(pool)), pool.owed() + pool.queuedDeposits());
     }
 
     // ---------------------------------------------------------------- EQUITY and treasury
@@ -482,7 +482,7 @@ contract MainspringPoolTest is MainspringPoolBase {
         _set(nowT + 1 hours);
         _postEquity(100_000e6);
         _set(nowT + 1 hours);
-        _postEquity(140_000e6); // 40% gain
+        _postEquity(140_000e6); // up by 40,000 USDC
         assertEq(pool.equityTerm(), 95_000e6, "the gain does not count yet");
         _set(nowT + 1 hours);
         _postEquity(140_000e6);
@@ -517,15 +517,15 @@ contract MainspringPoolTest is MainspringPoolBase {
         pool.sendToTreasury(100_000e6);
         assertEq(pool.navNow(), nav0, "send: NAV unchanged");
 
-        // landing on Hyperliquid: account value +100,000 and deposits credited +100,000, so the P&L-only EQUITY
+        // landing at the exchange: account value +100,000 and deposits credited +100,000, so the P&L-only EQUITY
         // the signers post is unchanged
         _set(nowT + 1 hours);
         _postEquity(0);
         assertEq(pool.navNow(), nav0, "landing: NAV unchanged");
 
-        // return: withdrawn from Hyperliquid and received back by the pool
+        // return: withdrawn from the exchange and received back by the pool
         vm.prank(TREASURY);
-        usdc.approve(address(pool), 100_000e6);
+        settlement.approve(address(pool), 100_000e6);
         pool.receiveFromTreasury(100_000e6);
         assertEq(pool.navNow(), nav0, "return: NAV unchanged");
         _set(nowT + 1 hours);
@@ -556,7 +556,7 @@ contract MainspringPoolTest is MainspringPoolBase {
         pool.sendToTreasury(60_000e6);
         pool.sendToTreasury(50_000e6);
         assertEq(pool.sentOut(), 200_000e6);
-        assertEq(usdc.balanceOf(TREASURY), 200_000e6);
+        assertEq(settlement.balanceOf(TREASURY), 200_000e6);
         // the next UTC day has a fresh allowance (once EQUITY is fresh again)
         _set(nowT + 1 days);
         _postEquity(0);
@@ -571,9 +571,9 @@ contract MainspringPoolTest is MainspringPoolBase {
         vm.expectRevert(abi.encodeWithSelector(MainspringPool.AboveFree.selector, free + 1, free));
         pool.sendToTreasury(free + 1);
 
-        // returns: treasury or admin only, with an event
+        // sending back: treasury or admin only, with an event
         vm.prank(TREASURY);
-        usdc.approve(address(pool), type(uint256).max);
+        settlement.approve(address(pool), type(uint256).max);
         vm.prank(ATTACKER);
         vm.expectRevert(MainspringPool.NotTreasury.selector);
         pool.receiveFromTreasury(1);

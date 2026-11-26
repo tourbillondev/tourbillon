@@ -5,11 +5,13 @@ import { createPublicClient, createWalletClient, decodeErrorResult, decodeEventL
 import { foundry } from "viem/chains";
 import { revertName } from "@tourbillon/common/tx.ts";
 import { blendDelta } from "@tourbillon/common/tempo.ts";
-import { SimVenue } from "../../hedger/src/simvenue.ts";
+import { SimExchange } from "../../hedger/src/simexchange.ts";
 import { buildQuote, signQuote } from "../../maker-gateway/src/bot.ts";
 import { loadM6Deployment } from "../../maker-gateway/src/chain.ts";
 import { toJson, writerWorstPerUnit, type Quote } from "../../maker-gateway/src/quote.ts";
 
+/// Superseded (RH7): kept for the record of its milestone, not run. Since RH3 the signers read feeds files, and since
+/// RH6 STK1 is hedged on-chain; the local end-to-end run is scripts/local-m7-run.ts, rebuilt for Robinhood Chain.
 /// M6 step 11: the open book on anvil for about 20 minutes. Every service runs as a real process (three signers, two
 /// pokers, the hedger on the simulated venue, the risk-monitor, the maker-gateway and two reference maker bots). Buyers
 /// route through the OpenBook with the gateway's quotes and the writer offers; makers and offer writers are bought back
@@ -24,10 +26,9 @@ const SERVICES = resolve(import.meta.dir, "../..");
 const CONTRACTS = resolve(SERVICES, "../contracts");
 const PORT = 32545;
 const RPC = `http://127.0.0.1:${PORT}`;
-const MARKETS = ["BTC", "ETH", "HYPE"];
-const STEP: Record<string, number> = { BTC: 100, ETH: 5, HYPE: 0.1 };
-const SZ: Record<string, number> = { BTC: 5, ETH: 4, HYPE: 2 };
-const POOL_HL = "0x00000000000000000000000000000000000000E1" as Address;
+const MARKETS = ["BTC", "ETH", "STK1"];
+const STEP: Record<string, number> = { BTC: 100, ETH: 5, STK1: 0.1 };
+const SZ: Record<string, number> = { BTC: 5, ETH: 4, STK1: 2 };
 const USDC = 10n ** 6n;
 const WAD = 10n ** 18n;
 const MAX = 2n ** 256n - 1n;
@@ -95,12 +96,12 @@ const abi = parseAbi([
   "function claim(bytes32, uint256) returns (uint256, uint256)",
   "function earlyClose(bytes32, uint256, uint256, int256, uint256) returns (uint256, int256)",
   "function required(bytes32, uint256) view returns (uint256, uint256)",
-  "function entries(bytes32, uint256) view returns (uint256 raw, uint256 usdcPerUnit, uint256 coverPerUnit, uint256 usdcLocked, uint256 whypeLocked, bool flagged)",
+  "function entries(bytes32, uint256) view returns (uint256 raw, uint256 settlementPerUnit, uint256 coverPerUnit, uint256 settlementLocked, uint256 coverLocked, bool flagged)",
   "function sources(bytes32) view returns (uint8 kind, address owner, uint256 offerId)",
   "function seriesSources(uint256) view returns (bytes32[])",
   "function matchedRaw(uint256) view returns (uint256)",
   "function uncoveredRaw(uint256) view returns (uint256)",
-  "function heldUsdc() view returns (uint256)",
+  "function heldSettlement() view returns (uint256)",
   // vault
   "function freeOf(address, address) view returns (uint256)",
   "function lockedOf(address, address) view returns (uint256)",
@@ -146,16 +147,16 @@ const events = parseAbi([
   "event Routed(address indexed buyer, uint256 indexed id, uint8 kind, uint256 sigmaBps, uint256 cost, address source)",
   "event ShapeBought(address indexed buyer, uint256 indexed id, bytes32 indexed market, uint256 units, uint256 raw, uint256 sWad, uint256 sigmaBps, int256 unitValueWad, uint256 premium, uint256 fee)",
   "event Sold(address indexed seller, uint256 indexed id, bytes32 indexed market, uint256 units, uint256 raw, uint256 sWad, uint256 sigmaBps, uint256 unitValueWad, uint256 gross, uint256 fee, uint256 net, bool markFromSample, bool volFromSample)",
-  "event Matched(bytes32 indexed key, uint256 indexed seriesId, uint256 units, uint256 raw, uint256 usdcLocked, uint256 whypeLocked)",
-  "event BoughtBack(bytes32 indexed key, uint256 indexed seriesId, uint256 raw, uint256 paidUsdc, uint256 paidWhype, uint256 shortfall)",
+  "event Matched(bytes32 indexed key, uint256 indexed seriesId, uint256 units, uint256 raw, uint256 settlementLocked, uint256 coverLocked)",
+  "event BoughtBack(bytes32 indexed key, uint256 indexed seriesId, uint256 raw, uint256 paidSettlement, uint256 paidCover, uint256 shortfall)",
   "event DustAbsorbed(bytes32 indexed key, uint256 indexed seriesId, uint256 usdc)",
   "event Flagged(bytes32 indexed key, uint256 indexed seriesId, uint256 uncoveredRaw)",
-  "event Claimed(bytes32 indexed key, uint256 indexed seriesId, uint256 usdcReleased, uint256 whypeReleased)",
+  "event Claimed(bytes32 indexed key, uint256 indexed seriesId, uint256 settlementReleased, uint256 coverReleased)",
   "event EarlyClosed(bytes32 indexed key, uint256 indexed seriesId, uint256 raw, uint256 units, int256 cost, uint256 fee)",
   "event OfferPosted(uint256 indexed offerId, address indexed writer, uint256 indexed seriesId, uint64 sigmaBps, uint128 maxUnits, uint64 validUntil)",
   "event OfferFilled(uint256 indexed offerId, uint256 units, uint256 raw)",
-  "event OfferCancelled(uint256 indexed offerId, uint256 usdcReturned, uint256 whypeReturned)",
-  "event BuybackSettled(uint256 indexed id, uint256 paidUsdc, uint256 paidWhype, uint256 shortfall)",
+  "event OfferCancelled(uint256 indexed offerId, uint256 settlementReturned, uint256 coverReturned)",
+  "event BuybackSettled(uint256 indexed id, uint256 paidSettlement, uint256 paidCover, uint256 shortfall)",
   "event BuybackFailed(uint256 indexed id, uint256 rawSold)",
   "event Started(uint256 indexed lotId, bytes32 indexed market, uint256 indexed seriesId, uint256 raw, uint256 bond, uint64 commitEnd, uint64 revealEnd)",
   "event Forfeited(uint256 indexed lotId, address indexed bidder, uint256 bond, string why)",
@@ -201,7 +202,7 @@ const dep = loadM6Deployment(m6File);
 const POOL = m6.MainspringPool!;
 const ENGINE = m6.Engine!;
 const BOOK = m6.PathFundingBook!;
-const MUSDC = m6.MockUSDC!;
+const MUSDC = m6.SettlementToken!;
 const VAULT = m6.MakerVault!;
 const MB = m6.MatchBook!;
 const OB = m6.OpenBook!;
@@ -273,8 +274,8 @@ say(`deployed; pool ${POOL}; OpenBook ${OB}; MatchBook ${MB}; RiskAuction ${RA}`
 
 // ---------------------------------------------------------------- the simulated venue and the price path
 
-const PRICE: Record<string, number> = { BTC: 100_000, ETH: 3_000, HYPE: 40 };
-const sim = new SimVenue(MARKETS.map((n) => ({ name: n, szDecimals: SZ[n]!, mid: PRICE[n]! })));
+const PRICE: Record<string, number> = { BTC: 100_000, ETH: 3_000, STK1: 40 };
+const sim = new SimExchange(MARKETS.map((n) => ({ name: n, szDecimals: SZ[n]!, mid: PRICE[n]! })));
 sim.deposit(1_000_000);
 let walking = true;
 const pricer = (async () => {
@@ -312,14 +313,14 @@ process.on("exit", () => {
   anvil.kill("SIGKILL");
 });
 for (const [i, s] of [S1!, S2!, S3!].entries()) {
-  const p = service(`signer-${i + 1}`, join(SERVICES, "quorum-signer"), "src/main.ts", ["--deployment", m1File, "--rpc", RPC, "--local-unlocked", s, "--hl-api", sim.url, "--test-vol", "0.45", "--equity-pool", POOL, "--equity-hl-user", POOL_HL]);
+  const p = service(`signer-${i + 1}`, join(SERVICES, "quorum-signer"), "src/main.ts", ["--deployment", m1File, "--rpc", RPC, "--local-unlocked", s, "--test-vol", "0.45", "--equity-pool", POOL, "--exchange", "sim", "--exchange-url", sim.url]);
   signers.push(p);
   procs.push(p);
 }
 procs.push(service("poker-primary", join(SERVICES, "poker"), "src/main.ts", ["--deployment", m6File, "--rpc", RPC, "--local-unlocked", POKER1!, "--role", "primary"]));
 procs.push(service("poker-backup", join(SERVICES, "poker"), "src/main.ts", ["--deployment", m6File, "--rpc", RPC, "--local-unlocked", POKER2!, "--role", "backup"]));
-procs.push(service("hedger", join(SERVICES, "hedger"), "src/main.ts", ["--deployment", m6File, "--rpc", RPC, "--hl-user", POOL_HL, "--venue", "sim", "--venue-url", sim.url, "--status-file", statusFile, "--tick-seconds", "15"]));
-procs.push(service("risk-monitor", join(SERVICES, "risk-monitor"), "src/main.ts", ["--deployment", m6File, "--rpc", RPC, "--local-unlocked", RISK!, "--hl-api", sim.url, "--hl-user", POOL_HL, "--hedger-status", statusFile, "--equity-every-seconds", "300", "--tick-seconds", "20"]));
+procs.push(service("hedger", join(SERVICES, "hedger"), "src/cex.ts", ["--deployment", m6File, "--rpc", RPC, "--exchange", "sim", "--exchange-url", sim.url, "--status-file", statusFile, "--tick-seconds", "15"]));
+procs.push(service("risk-monitor", join(SERVICES, "risk-monitor"), "src/main.ts", ["--deployment", m6File, "--rpc", RPC, "--local-unlocked", RISK!, "--exchange", "sim", "--exchange-url", sim.url, "--hedger-status", statusFile, "--equity-every-seconds", "300", "--tick-seconds", "20"]));
 procs.push(service("maker-gateway", join(SERVICES, "maker-gateway"), "src/main.ts", ["--deployment", m6File, "--rpc", RPC, "--port", String(GW_PORT)]));
 
 // ---------------------------------------------------------------- helpers
@@ -527,7 +528,7 @@ async function routedBuy(who: Address, m: string, legs: Leg[], tempo: number, un
       }
       if (kind === KIND_OFFER) {
         const o = offers.find((x) => x.writer === keysSeen.get(key)!.owner && !x.cancelled);
-        if (o) o.filledUsdc += e.args.usdcLocked as bigint;
+        if (o) o.filledUsdc += e.args.settlementLocked as bigint;
       }
     }
   }
@@ -736,8 +737,8 @@ say(`NAV ${usd(await read<bigint>(POOL, "navNow")).toFixed(2)} after the LP roun
 // two maker bots, each funding its vault (anvil-signed quotes; no key)
 // maker 2 is the cheaper one on BTC, maker 1 on ETH, so both fill
 for (const [name, mk, btcOff, ethOff, band] of [["maker-1", MK1!, "-300", "-600", "0.3"], ["maker-2", MK2!, "-500", "-300", "0.15"]] as const) {
-  procs.push(service(name, join(SERVICES, "maker-gateway"), "src/bot.ts", ["--deployment", m6File, "--rpc", RPC, "--gateway", GATEWAY, "--maker", mk, "--market", "BTC", "--sigma-offset-bps", btcOff, "--band-pct", band, "--max-units", "40", "--every-seconds", "30", "--fund", "300000"]));
-  await waitFor(`${name} funded`, async () => (await read<bigint>(VAULT, "freeOf", [mk, MUSDC])) > 0n, 60_000);
+  procs.push(service(name, join(SERVICES, "maker-gateway"), "src/bot.ts", ["--deployment", m6File, "--rpc", RPC, "--gateway", GATEWAY, "--maker", mk, "--market", "BTC", "--sigma-offset-bps", btcOff, "--band-pct", band, "--max-units", "40", "--every-seconds", "30", "--deposit", "300000"]));
+  await waitFor(`${name} deposited`, async () => (await read<bigint>(VAULT, "freeOf", [mk, MUSDC])) > 0n, 60_000);
   procs.push(service(`${name}-eth`, join(SERVICES, "maker-gateway"), "src/bot.ts", ["--deployment", m6File, "--rpc", RPC, "--gateway", GATEWAY, "--maker", mk, "--market", "ETH", "--sigma-offset-bps", ethOff, "--band-pct", band, "--max-units", "800", "--every-seconds", "30"]));
 }
 await waitFor("quotes at the gateway", async () => ((await (await fetch(new URL("/health", GATEWAY))).json()) as { quotes: number }).quotes >= 4, 90_000);
@@ -775,7 +776,7 @@ await hush();
   attempts.push({ kind: "cancelOffer", who: W2!, ok: true, gas: r.gasUsed, phase });
   const ev = decoded(r).find((e) => e.eventName === "OfferCancelled")!;
   oETH.cancelled = true;
-  oETH.returned = ev.args.usdcReturned as bigint;
+  oETH.returned = ev.args.settlementReturned as bigint;
   say(`offer ${oETH.id} cancelled: ${usd(oETH.returned)} returned of ${usd(oETH.escrow)} escrow (${usd(oETH.filledUsdc)} moved to matched entries)`);
 }
 quiet = false;
@@ -874,7 +875,7 @@ for (const [k, src] of keysSeen) {
     const r = await tx(src.owner, MB, "claim", [k, BigInt(sid)]);
     attempts.push({ kind: "claim", who: src.owner, ok: r.ok, reason: r.ok ? undefined : r.reason, gas: r.ok ? r.receipt.gasUsed : undefined, phase });
     if (!r.ok) continue;
-    claimedUsdc += decoded(r.receipt).find((x) => x.eventName === "Claimed")!.args.usdcReleased as bigint;
+    claimedUsdc += decoded(r.receipt).find((x) => x.eventName === "Claimed")!.args.settlementReleased as bigint;
     const after = await read<readonly [bigint, bigint, bigint, bigint, bigint, boolean]>(MB, "entries", [k, BigInt(sid)]);
     const [reqU] = await read<readonly [bigint, bigint]>(MB, "required", [k, BigInt(sid)]);
     if (after[3] !== reqU) claimExact.push(`series ${sid}: locked ${after[3]} ≠ required ${reqU} after the claim`);
@@ -902,7 +903,7 @@ const bidSigma = new Map<Address, bigint>();
   lotId = (st?.args.lotId as bigint) ?? 0n;
   const lot = await read<{ seriesId: bigint; raw: bigint; bond: bigint }>(RA, "lot", [lotId]);
   auction.push({ what: "the lot is the largest carried BTC series (the 30-day spread), bond 5% of its worst case", ok: r.ok && lot.seriesId === lotSeries, detail: r.ok ? `series ${lot.seriesId}, raw ${formatUnits(lot.raw, 18)}, bond ${usd(lot.bond)}` : r.reason });
-  // MK3 and MK4 fund their vaults for the bond
+  // MK3 and MK4 deposit into their vaults for the bond
   for (const mk of [MK3!, MK4!]) await must(mk, VAULT, "deposit", [MUSDC, 50_000n * USDC]);
   const board = await read<bigint>(BOARD, "volBps", [b32("BTC")]);
   for (const [mk, off] of [[MK3!, -1500n], [MK1!, -800n], [MK4!, -1000n], [MK2!, -300n]] as const) {
@@ -985,7 +986,7 @@ await checkMatched("after every exit");
 for (const o of offers.filter((x) => !x.cancelled)) {
   const r = await must(o.writer, MB, "cancelOffer", [o.id]);
   o.cancelled = true;
-  o.returned = decoded(r).find((e) => e.eventName === "OfferCancelled")!.args.usdcReturned as bigint;
+  o.returned = decoded(r).find((e) => e.eventName === "OfferCancelled")!.args.settlementReturned as bigint;
 }
 for (const [k, src] of keysSeen) {
   for (const sid of seriesTerms.keys()) {
@@ -1082,11 +1083,11 @@ check(9, hedgeErrors.length === 0 && hedgeChecks.length >= 9 && hedgeChecks.ever
 // 10. risk-monitor
 const alarms = lines("risk-monitor").filter((l) => l.msg === "alarm");
 const count = (n: string) => alarms.filter((l) => l.name === n).length;
-const expectedNames = ["AUCTION_STARTED", "AUCTION_FORFEIT", "AUCTION_SETTLED", "VAULT_SLASHED"];
-const unexpected = alarms.filter((l) => ["BUYBACK_FAILED", "MATCHED_UNCOVERED", "BUYBACK_SHORTFALL", "MONITOR_ERROR"].includes(String(l.name)));
+const expectedNames = ["auction-started", "auction-forfeit", "auction-settled", "vault-slashed"];
+const unexpected = alarms.filter((l) => ["buyback-failed", "matched-uncovered", "buyback-shortfall", "monitor-error"].includes(String(l.name)));
 const nameCounts = [...new Set(alarms.map((l) => String(l.name)))].map((n) => `${n} ${count(n)}`).join(", ");
 report.push(`risk-monitor alarm lines: ${nameCounts}`);
-check(10, expectedNames.every((n) => count(n) > 0) && count("AUCTION_FORFEIT") >= 2 && unexpected.length === 0, `risk-monitor: the auction (started, 2 forfeits, settled) and the slash announced; no failed buyback, uncovered raw, shortfall or monitor error (${unexpected.map((l) => l.name).join(", ") || "none"})`);
+check(10, expectedNames.every((n) => count(n) > 0) && count("auction-forfeit") >= 2 && unexpected.length === 0, `risk-monitor: the auction (started, 2 forfeits, settled) and the slash announced; no failed buyback, uncovered raw, shortfall or monitor error (${unexpected.map((l) => l.name).join(", ") || "none"})`);
 
 // 11. conservation
 const holders = [POOL, VAULT, MB, ENGINE, OB, RA, BOOK, ...acc];
@@ -1097,7 +1098,7 @@ const [eng, obb, rab] = await Promise.all([ENGINE, OB, RA].map((h) => read<bigin
 let vaultBooks = 0n;
 for (const mk of MAKERS) vaultBooks += (await read<bigint>(VAULT, "freeOf", [mk, MUSDC])) + (await read<bigint>(VAULT, "lockedOf", [mk, MUSDC]));
 const vaultBal = await read<bigint>(MUSDC, "balanceOf", [VAULT]);
-const mbHeld = await read<bigint>(MB, "heldUsdc");
+const mbHeld = await read<bigint>(MB, "heldSettlement");
 const mbBal = await read<bigint>(MUSDC, "balanceOf", [MB]);
 const law1: string[] = [...law1Mismatch];
 for (const t of BUYERS) {

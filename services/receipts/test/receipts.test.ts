@@ -46,7 +46,7 @@ describe("which logs are receipts", () => {
     auction: getAddress("0x00000000000000000000000000000000000000a5"),
     board: getAddress("0x00000000000000000000000000000000000000a6"),
     pool: getAddress("0x00000000000000000000000000000000000000a7"),
-    markets: ["BTC", "ETH", "HYPE"],
+    markets: ["BTC", "ETH", "STK1"],
     deployBlock: 0n,
   };
   const log = (address: Hex, topics: Hex[]): Log => ({ address, topics, data: "0x", blockNumber: 5n, transactionHash: h(7), logIndex: 3, blockHash: h(8), transactionIndex: 0, removed: false }) as unknown as Log;

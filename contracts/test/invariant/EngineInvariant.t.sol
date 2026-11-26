@@ -20,7 +20,7 @@ contract EngineHandler is Test {
     uint256 public constant START_USDC = 1_000_000e6;
     uint256 public constant N_SERIES = 6;
 
-    MockUSDC public usdc;
+    MockUSDC public settlement;
     MockMarks public marks;
     MockVols public vols;
     HousePool public pool;
@@ -52,7 +52,7 @@ contract EngineHandler is Test {
     uint256 public buysWhileStale; // law 2: must stay 0
     uint256 public buysWhilePaused; // must stay 0
     uint256 public sellFailures; // law 3: must stay 0
-    uint256 public insolventSells; // interim blocker: must stay 0 with a well-funded pool
+    uint256 public insolventSells; // interim blocker: must stay 0 with a pool that holds enough USDC
     uint256 public priceMismatches; // law 5: must stay 0
     uint256 public payoutMismatches; // pool outflow must equal seller + fee recipient inflow
     uint256 public normIncreases; // funding never runs backwards (see _checkNorms)
@@ -62,10 +62,10 @@ contract EngineHandler is Test {
 
     constructor() {
         vm.warp(nowT);
-        usdc = new MockUSDC();
+        settlement = new MockUSDC();
         marks = new MockMarks();
         vols = new MockVols();
-        pool = new HousePool(address(this), usdc, FEES);
+        pool = new HousePool(address(this), settlement, FEES);
         address predicted = vm.computeCreateAddress(address(this), vm.getNonce(address(this)) + 1);
         book = new PathFundingBook(predicted, address(this), marks, vols);
         engine = new Engine(address(this), book, pool, marks, vols);
@@ -73,8 +73,8 @@ contract EngineHandler is Test {
         pool.setEngine(address(engine));
         engine.setMarket(BTC, 1_000e18, 200);
         engine.grantRole(engine.PAUSER_ROLE(), address(this));
-        usdc.mint(address(this), 100_000_000e6);
-        usdc.approve(address(pool), type(uint256).max);
+        settlement.mint(address(this), 100_000_000e6);
+        settlement.approve(address(pool), type(uint256).max);
         pool.deposit(100_000_000e6);
         pool.setCap(BTC, type(uint256).max);
         marks.set(BTC, s);
@@ -82,10 +82,10 @@ contract EngineHandler is Test {
         book.record(BTC, s, 5000);
 
         for (uint256 i; i < 3; ++i) {
-            usdc.mint(actors[i], START_USDC);
+            settlement.mint(actors[i], START_USDC);
             expectedBalance[actors[i]] = START_USDC;
             vm.prank(actors[i]);
-            usdc.approve(address(engine), type(uint256).max);
+            settlement.approve(address(engine), type(uint256).max);
         }
         terms[0] = Terms(true, 50_000e18, 0);
         terms[1] = Terms(false, 50_000e18, 0);
@@ -122,16 +122,16 @@ contract EngineHandler is Test {
             (uint256 p, uint256 f) = EnginePricing.buyQuote(v, units, s, 200);
             expectedCost = p + f;
         }
-        uint256 balBefore = usdc.balanceOf(a);
-        uint256 feesBefore = usdc.balanceOf(FEES);
+        uint256 balBefore = settlement.balanceOf(a);
+        uint256 feesBefore = settlement.balanceOf(FEES);
         vm.prank(a);
         try engine.buy(BTC, t.isCall, t.k, mv, units, type(uint256).max, nowT) returns (uint256, uint256 cost) {
             buysOk++;
             if (markStale || volStale) buysWhileStale++;
             if (paused) buysWhilePaused++;
-            if (cost != expectedCost || balBefore - usdc.balanceOf(a) != cost) priceMismatches++;
+            if (cost != expectedCost || balBefore - settlement.balanceOf(a) != cost) priceMismatches++;
             expectedBalance[a] -= cost;
-            expectedFees += usdc.balanceOf(FEES) - feesBefore;
+            expectedFees += settlement.balanceOf(FEES) - feesBefore;
         } catch {
             // expected refusals: stale sources, paused, strike out of band, not caught up
         }
@@ -145,16 +145,16 @@ contract EngineHandler is Test {
         if (!book.exists(id) || book.balanceOf(id, a) == 0) return;
         uint256 units = all ? type(uint256).max : bound(unitsSeed, 1, 3e18);
 
-        uint256 balBefore = usdc.balanceOf(a);
-        uint256 feesBefore = usdc.balanceOf(FEES);
-        uint256 poolBefore = usdc.balanceOf(address(pool));
+        uint256 balBefore = settlement.balanceOf(a);
+        uint256 feesBefore = settlement.balanceOf(FEES);
+        uint256 poolBefore = settlement.balanceOf(address(pool));
         vm.prank(a);
         try engine.sell(id, units, 0, nowT) returns (uint256, uint256 net) {
             sellsOk++;
             if (paused || markStale || volStale) sellsWhilePausedOrStale++;
-            uint256 toSeller = usdc.balanceOf(a) - balBefore;
-            uint256 toFees = usdc.balanceOf(FEES) - feesBefore;
-            if (toSeller != net || poolBefore - usdc.balanceOf(address(pool)) != toSeller + toFees) payoutMismatches++;
+            uint256 toSeller = settlement.balanceOf(a) - balBefore;
+            uint256 toFees = settlement.balanceOf(FEES) - feesBefore;
+            if (toSeller != net || poolBefore - settlement.balanceOf(address(pool)) != toSeller + toFees) payoutMismatches++;
             expectedBalance[a] += net;
             expectedFees += toFees;
         } catch (bytes memory err) {
@@ -250,7 +250,10 @@ contract EngineHandler is Test {
 /// The laws and the accounting, checked after every random call.
 /// forge-config: default.invariant.runs = 64
 /// forge-config: default.invariant.depth = 80
+/// forge-config: deep.invariant.runs = 1000
+/// forge-config: deep.invariant.depth = 100
 /// forge-config: default.invariant.fail-on-revert = true
+/// forge-config: deep.invariant.fail-on-revert = true
 contract EngineInvariantTest is Test {
     EngineHandler h;
 
@@ -261,25 +264,25 @@ contract EngineInvariantTest is Test {
 
     /// The Engine never holds money.
     function invariant_engineHoldsNothing() public view {
-        assertEq(h.usdc().balanceOf(address(h.engine())), 0);
+        assertEq(h.settlement().balanceOf(address(h.engine())), 0);
     }
 
     /// No USDC appears or disappears: actors, the pool and the fee recipient hold all of it.
-    function invariant_usdcIsConserved() public view {
-        uint256 sum = h.usdc().balanceOf(address(h.pool())) + h.usdc().balanceOf(h.FEES());
+    function invariant_settlementIsConserved() public view {
+        uint256 sum = h.settlement().balanceOf(address(h.pool())) + h.settlement().balanceOf(h.FEES());
         for (uint256 i; i < 3; ++i) {
-            sum += h.usdc().balanceOf(h.actor(i));
+            sum += h.settlement().balanceOf(h.actor(i));
         }
-        assertEq(sum, h.usdc().totalSupply());
+        assertEq(sum, h.settlement().totalSupply());
     }
 
     /// Law 1: a buyer's balance is exactly start − Σ costs + Σ sell proceeds. Nothing else is ever taken.
     function invariant_buyersLoseOnlyWhatTheyPaid() public view {
         for (uint256 i; i < 3; ++i) {
             address a = h.actor(i);
-            assertEq(h.usdc().balanceOf(a), h.expectedBalance(a));
+            assertEq(h.settlement().balanceOf(a), h.expectedBalance(a));
         }
-        assertEq(h.usdc().balanceOf(h.FEES()), h.expectedFees());
+        assertEq(h.settlement().balanceOf(h.FEES()), h.expectedFees());
     }
 
     /// Law 2: no buy ever succeeded with a stale mark or vol; no buy while paused.
@@ -349,6 +352,6 @@ contract EngineInvariantTest is Test {
         assertEq(h.buysWhileStale() + h.buysWhilePaused() + h.sellFailures() + h.normIncreases(), 0);
         invariant_bookPoolAndActorsAgree();
         invariant_buyersLoseOnlyWhatTheyPaid();
-        invariant_usdcIsConserved();
+        invariant_settlementIsConserved();
     }
 }

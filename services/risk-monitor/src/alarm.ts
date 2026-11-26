@@ -2,7 +2,8 @@ import { log } from "@tourbillon/common/log.ts";
 
 /// Alarm lines in one stable shape, so a staff alert bot (Telegram, later) can post them without parsing prose:
 ///   { t, level: "alarm" | "warn", msg: "alarm", name, state: "raised" | "cleared" | "event", what, who, market, values }
-/// - name   a fixed identifier (the list below); never renamed once used
+/// - name   a fixed identifier (the list below), lower-dash as the playbook names them (06b §1); the bot posts it
+///          joined with the market (mark-stale-STK1). Renamed once, in RH7, from the M3 UPPER_SNAKE names
 /// - state  "raised" when a condition starts, "cleared" when it ends, "event" for one-off events (treasury moves)
 /// - what   one plain sentence: what happened
 /// - who    who has to act (or "nobody: automatic action taken")
@@ -11,42 +12,50 @@ import { log } from "@tourbillon/common/log.ts";
 /// A condition is announced once when raised and once when cleared, not every pass.
 
 export type AlarmName =
-  | "VENUE_DOWN_PAUSED"
-  | "VENUE_RECOVERED"
-  | "EQUITY_MISMATCH"
-  | "EQUITY_NOT_READY"
-  | "TREASURY_SENT"
-  | "TREASURY_RETURNED"
-  | "COVERAGE_LOW"
-  | "COVERAGE_BREACHED"
-  | "CAP_HIGH"
-  | "DRAWDOWN_PAUSED"
-  | "MARK_STALE"
-  | "SAMPLE_STALE"
-  | "SETTLEMENT_STALE"
-  | "HEDGER_SILENT"
-  | "PAUSE_FAILED"
-  | "MONITOR_ERROR"
+  | "venue-down-paused"
+  | "venue-recovered"
+  | "equity-mismatch"
+  | "equity-not-ready"
+  | "treasury-sent"
+  | "treasury-returned"
+  | "coverage-low"
+  | "coverage-breached"
+  | "cap-high"
+  | "drawdown-paused"
+  | "mark-stale"
+  | "sample-stale"
+  | "settlement-stale"
+  | "hedger-silent"
+  | "pause-failed"
+  | "monitor-error"
   // M6, the open book
-  | "BUYBACK_FAILED"
-  | "BUYBACK_SHORTFALL"
-  | "MATCHED_UNCOVERED"
-  | "DUST_ABSORBED"
-  | "VAULT_SLASHED"
-  | "AUCTION_STARTED"
-  | "AUCTION_FORFEIT"
-  | "AUCTION_SETTLED"
-  | "AUCTION_SETTLE_DUE"
+  | "buyback-failed"
+  | "buyback-shortfall"
+  | "matched-uncovered"
+  | "dust-absorbed"
+  | "vault-slashed"
+  | "auction-started"
+  | "auction-forfeit"
+  | "auction-settled"
+  | "auction-settle-due"
   // M7, governance and receipts
-  | "TIMELOCK_QUEUED"
-  | "TIMELOCK_EXECUTED"
-  | "TIMELOCK_CANCELLED"
-  | "ROLE_CHANGED"
-  | "PAUSED"
-  | "UNPAUSED"
-  | "RECEIPTS_STALE"
+  | "timelock-queued"
+  | "timelock-executed"
+  | "timelock-cancelled"
+  | "role-changed"
+  | "paused"
+  | "unpaused"
+  | "receipts-stale"
   // launch core
-  | "KEY_BALANCE_LOW";
+  | "key-balance-low"
+  // RH7, Robinhood Chain (posted as name-MARKET)
+  | "dex-down"
+  | "cex-down"
+  | "transfer-stuck"
+  | "session-anchored"
+  | "quarter-cap-high"
+  | "inventory-mismatch"
+  | "split-mismatch";
 
 export type Alarm = {
   name: AlarmName;
@@ -67,8 +76,9 @@ export class Conditions {
   private active = new Map<string, Alarm>();
 
   /// `a` is the alarm while the condition holds; `cleared` describes its end.
-  set(holds: boolean, a: Omit<Alarm, "state">, cleared: string): void {
-    const key = `${a.name}:${a.market ?? "*"}`;
+  /// `id` tells apart conditions of the same name and market (for example one per hedger).
+  set(holds: boolean, a: Omit<Alarm, "state">, cleared: string, id?: string): void {
+    const key = `${a.name}:${a.market ?? "*"}${id ? `:${id}` : ""}`;
     const was = this.active.has(key);
     if (holds && !was) {
       this.active.set(key, { ...a, state: "raised" });

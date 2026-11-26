@@ -1,0 +1,14 @@
+# The team bot (playbook 06): the only poster of the launch and of release emergencies; the only Telegram reader.
+[Unit]
+Description=Tourbillon team bot
+After=network-online.target
+
+[Service]
+User=tourbillon
+WorkingDirectory=/home/tourbillon/tourbillon-ship/services/teambot
+ExecStart=/home/tourbillon/.bun/bin/bun src/main.ts --data /home/tourbillon/tourbillon-teambot-data --release-heartbeat /var/lib/tourbillon-ship/heartbeat --dust-log /var/log/tourbillon/risk-monitor.log --env-file /home/tourbillon/.tourbillon-release/alerts.env
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

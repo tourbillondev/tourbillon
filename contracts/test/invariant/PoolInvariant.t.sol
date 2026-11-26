@@ -11,11 +11,16 @@ import {QuorumBoard} from "../../src/QuorumBoard.sol";
 import {TempoBlend} from "../../src/TempoBlend.sol";
 import {MockUSDC} from "../mocks/MockUSDC.sol";
 import {MockMarks, MockVols} from "../Engine.t.sol";
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {CoveringAssets, ICoverMarks} from "../../src/CoveringAssets.sol";
+import {HedgeSwap} from "../../src/HedgeSwap.sol";
+import {MockStockToken} from "../mocks/MockStockToken.sol";
+import {MockHedgeRouter} from "../mocks/MockHedgeRouter.sol";
 
 /// Drives the whole M3 pool system with random sequences: LP deposits, withdrawal requests, cancels and claims; hourly
-/// epochs, marking and settlement; buys and sells; price moves with samples; EQUITY posts; treasury sends and returns;
-/// market pauses. It owns every contract and keeps ghost counters for the invariants. Every failed action is caught
-/// and classified.
+/// epochs, marking and settlement; buys and sells; price moves with samples; EQUITY posts; treasury sends out and back;
+/// market pauses; on-chain stock hedge swaps (RH6, G7) through a router at the mark less a 0.3% fee. It owns every
+/// contract and keeps ghost counters for the invariants. Every failed action is caught and classified.
 contract PoolHandler is Test {
     bytes32 public constant BTC = "BTC";
     address public constant PROTO = address(0x9907);
@@ -23,13 +28,19 @@ contract PoolHandler is Test {
     uint256 public constant START = 50_000_000e6;
     uint256 public constant N_SERIES = 4;
 
-    MockUSDC public usdc;
+    MockUSDC public settlement;
     MockMarks public marks;
     MockVols public vols;
     QuorumBoard public board;
     MainspringPool public pool;
     PathFundingBook public book;
     Engine public engine;
+    bytes32 public constant STK1 = "STK1";
+    MockStockToken public stock;
+    MockHedgeRouter public router;
+    uint256 public hedgesOk;
+    uint256 public hedgeNavJumps; // a swap moved NAV by more than the venue's fee
+    uint256 public coverageAfterHedge; // a hedge buy accepted that left coverage breached
 
     address[3] public lps = [address(0x1A1), address(0x1A2), address(0x1A3)];
     address[2] public traders = [address(0x7A1), address(0x7A2)];
@@ -37,14 +48,14 @@ contract PoolHandler is Test {
     uint256 public nowT = 1_794_182_400;
     uint256 public s = 70_000e18;
     uint256 internal equityRound;
-    int256 public pnl; // the P&L the signers post for the pool's Hyperliquid account (USDC, 6 decimals)
+    int256 public pnl; // the P&L the signers post for the pool's exchange account (settlement token, 6 decimals)
 
     uint128[N_SERIES] internal strikes = [70_000e18, 72_000e18, 68_000e18, 70_000e18];
     bool[N_SERIES] internal isCall = [true, true, false, false];
     uint256[N_SERIES] public ids;
 
     // ghosts
-    mapping(address => uint256) public expectedUsdc; // LPs and traders: exact USDC balance
+    mapping(address => uint256) public expectedSettlement; // LPs and traders: exact USDC balance
     uint256 public buysOk;
     uint256 public sellsOk;
     uint256 public settlesOk;
@@ -61,7 +72,7 @@ contract PoolHandler is Test {
 
     constructor() {
         vm.warp(nowT);
-        usdc = new MockUSDC();
+        settlement = new MockUSDC();
         marks = new MockMarks();
         vols = new MockVols();
         address[] memory sg = new address[](3);
@@ -71,7 +82,7 @@ contract PoolHandler is Test {
         address bookAt = vm.computeCreateAddress(address(this), n + 1);
         address engineAt = vm.computeCreateAddress(address(this), n + 2);
         pool = new MainspringPool(
-            address(this), usdc, PathFundingBook(bookAt), marks, vols, IEquityFeed(address(board)), PROTO
+            address(this), settlement, PathFundingBook(bookAt), marks, vols, IEquityFeed(address(board)), PROTO
         );
         book = new PathFundingBook(engineAt, address(this), marks, vols);
         engine = new Engine(address(this), book, pool, marks, vols);
@@ -83,6 +94,16 @@ contract PoolHandler is Test {
         pool.setTreasury(TREASURY);
         pool.grantRole(pool.RISK_PAUSER_ROLE(), address(this));
         engine.setMarket(BTC, 100e18, 200);
+        // RH6: a stock market for the on-chain hedge (no options on it here: the invariant is about USDC and NAV)
+        stock = new MockStockToken("STK1", "STK1", 18);
+        CoveringAssets covers = new CoveringAssets(address(this), ICoverMarks(address(marks)));
+        covers.list(STK1, IERC20(address(stock)), new address[](0));
+        pool.setCoverAssets(covers);
+        marks.set(STK1, 40e18);
+        router = new MockHedgeRouter(settlement, IERC20(address(stock)), 1, 40e18);
+        router.set(40e18, 30, 0, false);
+        pool.setHedge(address(router), 100, STK1, 100_000e18, 2_000_000e6);
+        pool.grantRole(pool.HEDGER_ROLE(), address(this));
         board.setFeed(pool.equityKey(), 5000, 2 hours);
         marks.set(BTC, s);
         vols.set(BTC, 4500);
@@ -94,24 +115,24 @@ contract PoolHandler is Test {
             _fund(traders[i], address(engine));
         }
         vm.prank(TREASURY);
-        usdc.approve(address(pool), type(uint256).max);
+        settlement.approve(address(pool), type(uint256).max);
         for (uint256 i; i < N_SERIES; ++i) {
             ids[i] = book.idOf(BTC, isCall[i], strikes[i], TempoBlend.single(1 days));
         }
         // a first LP round so trading can start
         vm.prank(lps[0]);
         pool.deposit(5_000_000e6);
-        expectedUsdc[lps[0]] -= 5_000_000e6;
+        expectedSettlement[lps[0]] -= 5_000_000e6;
         _epochAndSettle();
         _postEquity();
         _postEquity();
     }
 
     function _fund(address who, address spender) internal {
-        usdc.mint(who, START);
-        expectedUsdc[who] = START;
+        settlement.mint(who, START);
+        expectedSettlement[who] = START;
         vm.prank(who);
-        usdc.approve(spender, type(uint256).max);
+        settlement.approve(spender, type(uint256).max);
     }
 
     function _postEquity() internal {
@@ -140,21 +161,21 @@ contract PoolHandler is Test {
             uint256 d = pool.depositOf(r, lp);
             if (d > 0) {
                 uint256 before = pool.balanceOf(lp);
-                uint256 usdcBefore = usdc.balanceOf(lp);
+                uint256 settlementBefore = settlement.balanceOf(lp);
                 vm.prank(lp);
                 pool.claimShares(r);
                 uint256 got = pool.balanceOf(lp) - before;
                 if (Math.mulDiv(got, nps, 1e18) > d) unfairDeposits++;
-                expectedUsdc[lp] += usdc.balanceOf(lp) - usdcBefore; // a refunded round
+                expectedSettlement[lp] += settlement.balanceOf(lp) - settlementBefore; // a refunded round
             }
             uint256 w = pool.withdrawOf(r, lp);
             if (w > 0) {
-                uint256 usdcBefore = usdc.balanceOf(lp);
+                uint256 settlementBefore = settlement.balanceOf(lp);
                 vm.prank(lp);
                 pool.withdraw(r);
-                uint256 gotUsdc = usdc.balanceOf(lp) - usdcBefore;
-                if (gotUsdc > Math.mulDiv(w, nps + 1, 1e18)) unfairWithdrawals++;
-                expectedUsdc[lp] += gotUsdc;
+                uint256 gotSettlement = settlement.balanceOf(lp) - settlementBefore;
+                if (gotSettlement > Math.mulDiv(w, nps + 1, 1e18)) unfairWithdrawals++;
+                expectedSettlement[lp] += gotSettlement;
             }
         }
         deposits;
@@ -170,7 +191,7 @@ contract PoolHandler is Test {
         amt = bound(amt, 1e6, 3_000_000e6);
         vm.prank(lp);
         pool.deposit(amt);
-        expectedUsdc[lp] -= amt;
+        expectedSettlement[lp] -= amt;
     }
 
     function lpRequestWithdraw(uint256 who, uint256 frac) external {
@@ -189,7 +210,7 @@ contract PoolHandler is Test {
             if (d == 0) return;
             vm.prank(lp);
             pool.cancelDeposit();
-            expectedUsdc[lp] += d;
+            expectedSettlement[lp] += d;
         } else {
             if (pool.withdrawOf(r, lp) == 0) return;
             vm.prank(lp);
@@ -228,15 +249,15 @@ contract PoolHandler is Test {
         units = bound(units, 1e16, 5e18);
         uint256 v = EnginePricing.unitValue(isCall[j], s, strikes[j], 4500, TempoBlend.single(1 days));
         (uint256 premium, uint256 fee) = EnginePricing.buyQuote(v, units, s, 200);
-        uint256 before = usdc.balanceOf(t);
+        uint256 before = settlement.balanceOf(t);
         vm.prank(t);
         try engine.buy(BTC, isCall[j], strikes[j], TempoBlend.single(1 days), units, type(uint256).max, nowT) returns (
             uint256, uint256 cost
         ) {
             buysOk++;
-            if (cost != premium + fee || before - usdc.balanceOf(t) != cost) priceMismatches++;
+            if (cost != premium + fee || before - settlement.balanceOf(t) != cost) priceMismatches++;
             if (pool.available() < pool.stressedLiability()) coverageAfterBuy++;
-            expectedUsdc[t] -= cost;
+            expectedSettlement[t] -= cost;
         } catch (bytes memory err) {
             bytes4 sel = bytes4(err);
             // expected refusals: coverage, caps, pauses, strike band after a move, not caught up
@@ -256,12 +277,12 @@ contract PoolHandler is Test {
         address t = traders[who % 2];
         uint256 id = ids[seriesSeed % N_SERIES];
         if (!book.exists(id) || book.balanceOf(id, t) == 0) return;
-        uint256 before = usdc.balanceOf(t);
+        uint256 before = settlement.balanceOf(t);
         vm.prank(t);
         try engine.sell(id, all ? type(uint256).max : 5e17, 0, nowT) returns (uint256, uint256 net) {
             sellsOk++;
-            if (usdc.balanceOf(t) - before != net) priceMismatches++;
-            expectedUsdc[t] += net;
+            if (settlement.balanceOf(t) - before != net) priceMismatches++;
+            expectedSettlement[t] += net;
         } catch (bytes memory err) {
             if (bytes4(err) == MainspringPool.Insolvent.selector) {
                 (uint256 needed, uint256 avail) = abi.decode(_args(err), (uint256, uint256));
@@ -297,11 +318,47 @@ contract PoolHandler is Test {
     }
 
     function treasuryReturn(uint256 amt) external {
-        uint256 held = usdc.balanceOf(TREASURY);
+        uint256 held = settlement.balanceOf(TREASURY);
         if (held == 0) return;
         amt = bound(amt, 1, held);
         vm.prank(TREASURY);
         pool.receiveFromTreasury(amt);
+    }
+
+    /// The keeper's swap at the mark (which moves within ±5%); the router fills at the mark less 0.3%.
+    function hedge(bool buy, uint256 amt, uint256 moveSeed) external {
+        uint256 px = 38e18 + (moveSeed % 5e18);
+        marks.set(STK1, px);
+        router.set(px, 30, 0, false);
+        uint256 held = stock.balanceOf(address(pool));
+        if (buy) amt = bound(amt, 10e6, 200_000e6);
+        else {
+            if (held == 0) return;
+            amt = bound(amt, 1, held);
+        }
+        uint256 minOut = HedgeSwap.floorOut(buy, amt, px, 1, 100);
+        if (minOut == 0) return;
+        uint256 nav0 = pool.navNow();
+        try pool.hedgeSwap(STK1, buy, amt, minOut) returns (uint256 out) {
+            hedgesOk++;
+            if (buy && pool.available() < pool.stressedLiability()) coverageAfterHedge++;
+            // the fee: 0.3% of the settlement side, plus rounding. Up to five base units: the router floors its
+            // conversion and its fee, this estimate floors once, and the pool's stock value floors before and after
+            // (found by the 100,000-call run: a 79,000-unit sale was 3 base units past a +2 allowance)
+            uint256 settlementSide = buy ? amt : out;
+            uint256 fee = settlementSide * 30 / 9970 + 5;
+            uint256 nav1 = pool.navNow();
+            if (nav1 + fee < nav0 || nav1 > nav0 + 2) hedgeNavJumps++;
+        } catch (bytes memory err) {
+            bytes4 sel = bytes4(err);
+            if (
+                sel != MainspringPool.AboveFree.selector && sel != HedgeSwap.DailyCapExceeded.selector
+                    && sel != HedgeSwap.InventoryCapExceeded.selector
+            ) {
+                unexpectedFailures++;
+                lastError = err;
+            }
+        }
     }
 
     function togglePause() external {
@@ -329,14 +386,17 @@ contract PoolHandler is Test {
 /// The pool's accounting and the laws, checked after every random call.
 /// forge-config: default.invariant.runs = 48
 /// forge-config: default.invariant.depth = 60
+/// forge-config: deep.invariant.runs = 1000
+/// forge-config: deep.invariant.depth = 100
 /// forge-config: default.invariant.fail-on-revert = true
+/// forge-config: deep.invariant.fail-on-revert = true
 contract PoolInvariantTest is Test {
     PoolHandler h;
 
     function setUp() public {
         h = new PoolHandler();
         targetContract(address(h));
-        bytes4[] memory sel = new bytes4[](10);
+        bytes4[] memory sel = new bytes4[](11);
         sel[0] = PoolHandler.lpDeposit.selector;
         sel[1] = PoolHandler.lpRequestWithdraw.selector;
         sel[2] = PoolHandler.lpCancel.selector;
@@ -347,40 +407,41 @@ contract PoolInvariantTest is Test {
         sel[7] = PoolHandler.treasuryReturn.selector;
         sel[8] = PoolHandler.togglePause.selector;
         sel[9] = PoolHandler.resumeIfPaused.selector;
+        sel[10] = PoolHandler.hedge.selector;
         targetSelector(FuzzSelector({addr: address(h), selectors: sel}));
     }
 
     /// The Engine never holds money.
     function invariant_engineHoldsNothing() public view {
-        assertEq(h.usdc().balanceOf(address(h.engine())), 0);
+        assertEq(h.settlement().balanceOf(address(h.engine())), 0);
     }
 
     /// USDC is conserved: LPs, traders, the pool, the protocol and the treasury hold all of it.
-    function invariant_usdcConserved() public view {
-        uint256 sum =
-            h.usdc().balanceOf(address(h.pool())) + h.usdc().balanceOf(h.PROTO()) + h.usdc().balanceOf(h.TREASURY());
+    function invariant_settlementConserved() public view {
+        uint256 sum = h.settlement().balanceOf(address(h.pool())) + h.settlement().balanceOf(h.PROTO())
+            + h.settlement().balanceOf(h.TREASURY()) + h.settlement().balanceOf(address(h.router()));
         for (uint256 i; i < 3; ++i) {
-            sum += h.usdc().balanceOf(h.lp(i));
+            sum += h.settlement().balanceOf(h.lp(i));
         }
         for (uint256 i; i < 2; ++i) {
-            sum += h.usdc().balanceOf(h.trader(i));
+            sum += h.settlement().balanceOf(h.trader(i));
         }
-        assertEq(sum, h.usdc().totalSupply());
+        assertEq(sum, h.settlement().totalSupply());
     }
 
     /// Law 1 and the LP side: every LP and trader holds exactly what the ghost ledger says.
     function invariant_exactBalances() public view {
         for (uint256 i; i < 3; ++i) {
-            assertEq(h.usdc().balanceOf(h.lp(i)), h.expectedUsdc(h.lp(i)), "LP balance");
+            assertEq(h.settlement().balanceOf(h.lp(i)), h.expectedSettlement(h.lp(i)), "LP balance");
         }
         for (uint256 i; i < 2; ++i) {
-            assertEq(h.usdc().balanceOf(h.trader(i)), h.expectedUsdc(h.trader(i)), "trader balance");
+            assertEq(h.settlement().balanceOf(h.trader(i)), h.expectedSettlement(h.trader(i)), "trader balance");
         }
     }
 
     /// Money set aside is always held: queued deposits and owed USDC never exceed the pool's balance.
     function invariant_setAsideIsHeld() public view {
-        assertGe(h.usdc().balanceOf(address(h.pool())), h.pool().queuedDeposits() + h.pool().owed());
+        assertGe(h.settlement().balanceOf(address(h.pool())), h.pool().queuedDeposits() + h.pool().owed());
     }
 
     /// Shares add up: total supply = LPs' shares + the pool's own (escrowed and unclaimed).
@@ -433,6 +494,13 @@ contract PoolInvariantTest is Test {
         assertEq(h.pool().openNotional(h.BTC()), notional);
     }
 
+    /// RH6 (G7): a hedge swap moves NAV by the venue's fee only (the stock counts at the router mark), and a hedge buy
+    /// never leaves available USDC below the stressed liability (sells first, law 3).
+    function invariant_hedgeKeepsNavAndCoverage() public view {
+        assertEq(h.hedgeNavJumps(), 0, "NAV moved by more than the fee");
+        assertEq(h.coverageAfterHedge(), 0, "a hedge buy breached coverage");
+    }
+
     /// Nothing else ever failed unexpectedly.
     function invariant_noUnexpectedFailure() public view {
         assertEq(h.unexpectedFailures(), 0, string(h.lastError()));
@@ -453,11 +521,16 @@ contract PoolInvariantTest is Test {
         h.treasuryReturn(50_000e6);
         h.sell(1, 2, true);
         h.hour(300, -100_000e6);
+        h.hedge(true, 50_000e6, 1e18);
+        h.hedge(false, 1e30, 3e18); // sells everything held
+        h.buy(0, 0, 1e18);
+        h.sell(0, 0, true);
+        assertGe(h.hedgesOk(), 2);
         assertGe(h.buysOk(), 2);
         assertGe(h.sellsOk(), 2);
         assertGe(h.settlesOk(), 3);
         assertEq(h.unexpectedFailures() + h.sellFailures() + h.priceMismatches(), 0, string(h.lastError()));
-        invariant_usdcConserved();
+        invariant_settlementConserved();
         invariant_exactBalances();
         invariant_sharesAddUp();
         invariant_bookRegistryNotionalAgree();

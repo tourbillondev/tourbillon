@@ -5,6 +5,7 @@ import { b32, haveFoundry, startLocalM7, type LocalM7 } from "@tourbillon/common
 import { loadM7Deployment } from "../src/collect.ts";
 import { Collector } from "../src/epochs.ts";
 import { buildTree, KIND_NAV, KIND_TRADE, KIND_VOL_FINAL, leafOf, proofOf } from "../src/tree.ts";
+import { TEARDOWN_MS, hookLimit, within } from "@tourbillon/common/hooks.ts";
 
 // On a local anvil with DeployM7: trades in one hour, then the service (--once) posts every finished hour that holds
 // receipts; the on-chain root equals an independent rebuild, ReceiptRoots verifies a trade's proof, and a second pass
@@ -36,18 +37,18 @@ async function service(): Promise<Record<string, unknown>[]> {
   return out.trim().split("\n").filter(Boolean).map((l) => JSON.parse(l));
 }
 
-beforeAll(async () => {
+beforeAll(within(import.meta.path, "setup", 240_000, async () => {
   if (haveFoundry()) L = await startLocalM7(PORT);
-}, 240_000);
-afterAll(() => L?.stop());
+}), hookLimit(240_000));
+afterAll(within(import.meta.path, "teardown", TEARDOWN_MS, () => L?.stop()), hookLimit(TEARDOWN_MS));
 
 test.skipIf(!haveFoundry())(
   "finished hours are posted once; the root equals an independent rebuild; a trade's proof verifies on-chain",
   async () => {
     const { acc, m7, client, send } = L!;
     const T = acc[16]!;
-    await send(T, m7.MockUSDC!, abi, "mint", [T, 1_000_000n * 10n ** 6n]);
-    await send(T, m7.MockUSDC!, abi, "approve", [m7.Engine!, 1_000_000n * 10n ** 6n]);
+    await send(T, m7.SettlementToken!, abi, "mint", [T, 1_000_000n * 10n ** 6n]);
+    await send(T, m7.SettlementToken!, abi, "approve", [m7.Engine!, 1_000_000n * 10n ** 6n]);
     const legs = [
       { isCall: true, kWad: 74_000n * W, qty: W },
       { isCall: true, kWad: 76_000n * W, qty: -W },

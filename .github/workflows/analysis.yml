@@ -1,0 +1,59 @@
+name: analysis
+on: [push, pull_request]
+
+# Static analysis. Results appear in the repository's Security tab (code scanning).
+# The job token can only read the repository; each job also asks only to post its results there.
+permissions:
+  contents: read
+
+# Every action is pinned to a full commit SHA (the version is in the comment); Dependabot proposes updates.
+jobs:
+  # Slither on contracts/src. Fails on any new Medium or High finding. Findings reviewed as false positives are listed,
+  # each with its reason, in contracts/slither.db.json (outside src, so the bytecode is unchanged). Low and
+  # Informational findings are reported only.
+  slither:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    defaults: { run: { working-directory: contracts } }
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with: { persist-credentials: false, submodules: recursive }
+      - uses: foundry-rs/foundry-toolchain@dba66c27052e63476d886f22216e119ba7e615bf # v1.9.2
+      # Pinned versions, in a throwaway environment.
+      - run: |
+          python3 -m venv "$RUNNER_TEMP/slither"
+          "$RUNNER_TEMP/slither/bin/pip" install --disable-pip-version-check slither-analyzer==0.11.6 crytic-compile==0.4.2
+      - run: '"$RUNNER_TEMP/slither/bin/slither" . --config-file slither.config.json --fail-medium --sarif slither.sarif'
+      - uses: github/codeql-action/upload-sarif@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        if: ${{ !cancelled() && hashFiles('contracts/slither.sarif') != '' }}
+        with:
+          sarif_file: contracts/slither.sarif
+          category: slither
+
+  # CodeQL on the services' TypeScript (security queries). Reports to code scanning.
+  codeql:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with: { persist-credentials: false }
+      - uses: github/codeql-action/init@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        with:
+          languages: javascript-typescript
+          build-mode: none
+          queries: security-extended
+          config: |
+            paths:
+              - services
+              - scripts
+              - tools
+            paths-ignore:
+              - services/node_modules
+              - "services/*/test"
+      - uses: github/codeql-action/analyze@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        with:
+          category: /language:javascript-typescript

@@ -1,0 +1,185 @@
+{
+  "dryRun": false,
+  "repo": "tourbillondev/tourbillon",
+  "tagPrefix": "update-",
+  "base": "FILL_IN at RH12: the public repo's main commit at launch (git rev-parse HEAD)",
+  "queueDir": "/home/tourbillon/tourbillon-ship/queue",
+  "kitDir": "/home/tourbillon/tourbillon-teambot-data",
+  "dataDir": "/var/lib/tourbillon-ship",
+  "releasesLog": "/var/log/tourbillon-ship/releases.log",
+  "teambotInbox": "/home/tourbillon/tourbillon-teambot-data/inbox",
+  "teambotHeartbeat": "/home/tourbillon/tourbillon-teambot-data/heartbeat",
+  "teambotTarget": "mainnet",
+  "secretsFile": "/home/tourbillon/.tourbillon-release/alerts.env",
+  "pushRemote": "git@github-tourbillon-release:tourbillondev/tourbillon.git",
+  "deployKeyFile": "/home/tourbillon/.tourbillon-release/deploy_key",
+  "githubTokenFile": "/home/tourbillon/.tourbillon-release/github-token",
+  "pingUrlFile": "/home/tourbillon/.tourbillon-release/ping-url",
+  "total": 62,
+  "slotMinutes": 60,
+  "leadMinutes": 30,
+  "mainnetAllowed": false,
+  "testnetProof": "/home/tourbillon/tourbillon-ship/testnet-proof.json",
+  "deploy": {
+    "repoDir": "/srv/tourbillon-releases/repo",
+    "buildsDir": "/srv/tourbillon-releases/builds",
+    "install": [
+      {
+        "cmd": [
+          "bun",
+          "install",
+          "--frozen-lockfile"
+        ],
+        "cwd": "services"
+      },
+      {
+        "cmd": [
+          "forge",
+          "build"
+        ],
+        "cwd": "contracts"
+      }
+    ],
+    "tests": [
+      {
+        "cmd": [
+          "bun",
+          "run",
+          "typecheck"
+        ],
+        "cwd": "services"
+      },
+      {
+        "cmd": [
+          "bun",
+          "test"
+        ],
+        "cwd": "services"
+      },
+      {
+        "cmd": [
+          "forge",
+          "test"
+        ],
+        "cwd": "contracts"
+      },
+      {
+        "cmd": [
+          "bun",
+          "tools/banned-words.ts",
+          "."
+        ]
+      }
+    ],
+    "targets": [
+      {
+        "name": "testnet",
+        "chainId": 46630,
+        "root": "/srv/tourbillon-releases/testnet",
+        "baseUrl": "http://127.0.0.1:FILL_IN_TESTNET_API_PORT",
+        "enabled": true,
+        "restart": {
+          "api": [
+            [
+              "sudo",
+              "systemctl",
+              "restart",
+              "tourbillon-api"
+            ]
+          ],
+          "keeper": [
+            [
+              "sudo",
+              "systemctl",
+              "restart",
+              "tourbillon-poker",
+              "tourbillon-indexer",
+              "tourbillon-risk-monitor",
+              "tourbillon-receipts",
+              "tourbillon-hedger-onchain",
+              "tourbillon-hedger-cex",
+              "tourbillon-maker-gateway"
+            ]
+          ]
+        },
+        "migrate": [],
+        "checks": [
+          {
+            "name": "health",
+            "path": "/healthz",
+            "expect": "\"ok\":true"
+          },
+          {
+            "name": "status",
+            "path": "/v1/status",
+            "expect": "\"chainId\":46630"
+          }
+        ],
+        "links": [
+          [
+            "services/.env",
+            "/home/tourbillon/testnet/services/.env"
+          ]
+        ]
+      },
+      {
+        "name": "mainnet",
+        "chainId": 4663,
+        "root": "/srv/tourbillon-releases/mainnet",
+        "baseUrl": "http://127.0.0.1:FILL_IN_MAINNET_API_PORT",
+        "enabled": false,
+        "restart": {
+          "api": [
+            [
+              "sudo",
+              "systemctl",
+              "restart",
+              "tourbillon-mainnet-api"
+            ]
+          ],
+          "keeper": [
+            [
+              "sudo",
+              "systemctl",
+              "restart",
+              "tourbillon-mainnet-poker",
+              "tourbillon-mainnet-indexer",
+              "tourbillon-mainnet-risk-monitor",
+              "tourbillon-mainnet-receipts",
+              "tourbillon-mainnet-hedger-onchain",
+              "tourbillon-mainnet-hedger-cex",
+              "tourbillon-mainnet-maker-gateway",
+              "tourbillon-teambot"
+            ]
+          ]
+        },
+        "migrate": [],
+        "checks": [
+          {
+            "name": "health",
+            "path": "/healthz",
+            "expect": "\"ok\":true"
+          },
+          {
+            "name": "status",
+            "path": "/v1/status",
+            "expect": "\"chainId\":4663"
+          }
+        ],
+        "links": [
+          [
+            "services/.env",
+            "/home/tourbillon/mainnet/services/.env"
+          ]
+        ]
+      }
+    ],
+    "checkTimeoutMs": 90000,
+    "keepReleases": 12
+  },
+  "_notes": [
+    "RH9: written against the playbook's server defaults (owner queue Q12); RH12 fills the ports, paths and units.",
+    "The indexer creates its tables at start (CREATE TABLE IF NOT EXISTS), so migrate is empty: a db+ update's table appears at the restart.",
+    "The team bot is restarted with the mainnet keeper role, so its fresh heartbeat is checked after every mainnet deploy (teambotTarget: mainnet)."
+  ]
+}

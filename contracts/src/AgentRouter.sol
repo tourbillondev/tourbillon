@@ -50,7 +50,7 @@ interface IAgentBook {
 ///           the markets, the allowed shape families, a premium cap per trade and in total, USD delta and vega budgets,
 ///           an expiry, close-only, a nonce. The owner revokes a nonce on-chain at any time.
 ///         - The agent buys through the OpenBook (the cheapest of the pool, maker quotes and writer offers): it supplies
-///           legs, units and signed maker quotes or offer ids, never a price or a σ (law 5). The owner's USDC pays,
+///           legs, units and signed maker quotes or offer ids, never a price or a σ (law 5). The owner's settlement token pays,
 ///           through an allowance to this router, at most the caps; any unused amount goes straight back.
 ///         - Positions sit in this router in per-owner sub-accounts. The agent can sell only what it opened under the
 ///           same mandate (close-only included); **the owner can always sell any of its sub-account, whatever the
@@ -77,10 +77,10 @@ contract AgentRouter is EIP712, ReentrancyGuard {
         address agent;
         bytes32[] markets;
         uint256 shapes; // bitmask of families
-        uint256 maxPremiumPerTrade; // USDC (6 decimals), premium + fee
-        uint256 maxPremiumTotal; // USDC, over the mandate's life
-        uint256 deltaBudgetUsd; // USDC units of USD delta; UNLIMITED for none
-        uint256 vegaBudgetUsd; // USDC units per vol point; UNLIMITED for none
+        uint256 maxPremiumPerTrade; // settlement token (6 decimals), premium + fee
+        uint256 maxPremiumTotal; // settlement token, over the mandate's life
+        uint256 deltaBudgetUsd; // settlement token units of USD delta; UNLIMITED for none
+        uint256 vegaBudgetUsd; // settlement token units per vol point; UNLIMITED for none
         uint64 expiry;
         bool closeOnly;
         uint64 nonce;
@@ -105,12 +105,12 @@ contract AgentRouter is EIP712, ReentrancyGuard {
     IAgentOpenBook public immutable openBook;
     IAgentEngine public immutable engine;
     IAgentBook public immutable book;
-    IERC20 public immutable usdc;
+    IERC20 public immutable settlement;
     IMarkRouter public immutable marks;
     IVolSource public immutable vols;
 
     mapping(address => mapping(uint64 => bool)) public revoked; // owner => nonce
-    mapping(bytes32 => uint256) public premiumUsed; // mandate hash => USDC spent
+    mapping(bytes32 => uint256) public premiumUsed; // mandate hash => settlement token spent
     mapping(address => mapping(uint256 => uint256)) public rawOf; // owner => series => raw held here
     mapping(uint256 => uint256) public totalRaw; // series => Σ owners' raw (= this router's book balance)
     mapping(bytes32 => mapping(uint256 => uint256)) public mandateRaw; // mandate => series => raw it opened, still held
@@ -145,7 +145,7 @@ contract AgentRouter is EIP712, ReentrancyGuard {
         IAgentOpenBook openBook_,
         IAgentEngine engine_,
         IAgentBook book_,
-        IERC20 usdc_,
+        IERC20 settlement_,
         IMarkRouter marks_,
         IVolSource vols_
     ) EIP712("Tourbillon AgentRouter", "1") {
@@ -154,8 +154,8 @@ contract AgentRouter is EIP712, ReentrancyGuard {
         vols = vols_;
         engine = engine_;
         book = book_;
-        usdc = usdc_;
-        usdc_.forceApprove(address(engine_), type(uint256).max); // the Engine pulls each routed buy's cost from here
+        settlement = settlement_;
+        settlement_.forceApprove(address(engine_), type(uint256).max); // the Engine pulls each routed buy's cost from here
     }
 
     // ---------------------------------------------------------------- mandates
@@ -227,7 +227,7 @@ contract AgentRouter is EIP712, ReentrancyGuard {
         if (used >= m.maxPremiumTotal) revert OverTotalCap(used, m.maxPremiumTotal);
         uint256 cap = _min(a.maxCost, _min(m.maxPremiumPerTrade, m.maxPremiumTotal - used));
 
-        usdc.safeTransferFrom(m.owner, address(this), cap);
+        settlement.safeTransferFrom(m.owner, address(this), cap);
         uint8 kind;
         // the Engine pulls exactly `cost` (≤ cap) from this router
         (id, cost, kind) =
@@ -240,7 +240,7 @@ contract AgentRouter is EIP712, ReentrancyGuard {
         mandateRaw[h][id] += raw;
         _charge(m, h, id, a);
         emit AgentBought(h, m.owner, id, raw, cost, kind);
-        if (cap > cost) usdc.safeTransfer(m.owner, cap - cost);
+        if (cap > cost) settlement.safeTransfer(m.owner, cap - cost);
     }
 
     /// @notice The agent sells up to `units` of what it opened on series `id` under this mandate (also when close-only).
@@ -375,7 +375,7 @@ contract AgentRouter is EIP712, ReentrancyGuard {
         rawOf[owner][id] = held - raw;
         totalRaw[id] = total - raw;
         emit PositionSold(owner, id, raw, paid, net, mandate);
-        usdc.safeTransfer(owner, net);
+        settlement.safeTransfer(owner, net);
     }
 
     function _listed(bytes32[] calldata markets, bytes32 market) internal pure returns (bool) {

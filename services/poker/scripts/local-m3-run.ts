@@ -4,8 +4,10 @@ import { join, resolve } from "node:path";
 import { createPublicClient, createWalletClient, decodeErrorResult, decodeEventLog, formatUnits, http, parseEther, stringToHex, type Address, type Hex, type PublicClient } from "viem";
 import { foundry } from "viem/chains";
 import { revertName } from "@tourbillon/common/tx.ts";
-import { SimVenue } from "../../hedger/src/simvenue.ts";
+import { SimExchange } from "../../hedger/src/simexchange.ts";
 
+/// Superseded (RH7): kept for the record of its milestone, not run. Since RH3 the signers read feeds files, and since
+/// RH6 STK1 is hedged on-chain; the local end-to-end run is scripts/local-m7-run.ts, rebuilt for Robinhood Chain.
 /// M3 step 11: the whole M3 system for about an hour on anvil. Prices come from the simulated venue's scripted path
 /// (signers read them there; vol fixed at 50%), and the chain clock is moved forward an hour at set points so hourly
 /// epochs, EQUITY rounds and the drawdown check happen inside the run. The venue outage is in real minutes.
@@ -19,10 +21,9 @@ const SERVICES = resolve(import.meta.dir, "../..");
 const CONTRACTS = resolve(SERVICES, "../contracts");
 const PORT = 30545;
 const RPC = `http://127.0.0.1:${PORT}`;
-const MARKETS = ["BTC", "ETH", "HYPE"];
-const STEP: Record<string, number> = { BTC: 100, ETH: 5, HYPE: 0.1 };
-const SZ: Record<string, number> = { BTC: 5, ETH: 4, HYPE: 2 };
-const POOL_HL = "0x00000000000000000000000000000000000000E1" as Address;
+const MARKETS = ["BTC", "ETH", "STK1"];
+const STEP: Record<string, number> = { BTC: 100, ETH: 5, STK1: 0.1 };
+const SZ: Record<string, number> = { BTC: 5, ETH: 4, STK1: 2 };
 const USDC = 10n ** 6n;
 const out = mkdtempSync(join(tmpdir(), "tourbillon-m3-run-"));
 const T0 = Date.now();
@@ -172,7 +173,7 @@ const m3 = JSON.parse(readFileSync(m3File, "utf8")) as Record<string, Address>;
 const POOL = m3.MainspringPool!;
 const ENGINE = m3.Engine!;
 const BOOK = m3.PathFundingBook!;
-const MUSDC = m3.MockUSDC!;
+const MUSDC = m3.SettlementToken!;
 await rpc("evm_increaseTime", [3600]);
 await rpc("evm_mine");
 
@@ -226,9 +227,9 @@ say(`deployed; pool ${POOL}`);
 
 // ---------------------------------------------------------------- the simulated venue and the price path
 
-const PRICE: Record<string, number> = { BTC: 100_000, ETH: 3_000, HYPE: 40 };
-const sim = new SimVenue(MARKETS.map((n) => ({ name: n, szDecimals: SZ[n]!, mid: PRICE[n]! })));
-sim.deposit(1_000_000); // the pool's Hyperliquid account starts with margin of its own (a deposit, so P&L-only EQUITY is 0)
+const PRICE: Record<string, number> = { BTC: 100_000, ETH: 3_000, STK1: 40 };
+const sim = new SimExchange(MARKETS.map((n) => ({ name: n, szDecimals: SZ[n]!, mid: PRICE[n]! })));
+sim.deposit(1_000_000); // the pool's exchange account starts with margin of its own (a deposit, so P&L-only EQUITY is 0)
 let walking = true;
 let shockTarget: number | null = null;
 const pricer = (async () => {
@@ -262,12 +263,12 @@ function service(name: string, cwd: string, args: string[]): Proc {
 const statusFile = join(out, "hedger-status.json");
 const procs: Proc[] = [];
 for (const [i, s] of [S1!, S2!, S3!].entries()) {
-  procs.push(service(`signer-${i + 1}`, join(SERVICES, "quorum-signer"), ["--deployment", m1File, "--rpc", RPC, "--local-unlocked", s, "--hl-api", sim.url, "--test-vol", "0.5", "--equity-pool", POOL, "--equity-hl-user", POOL_HL]));
+  procs.push(service(`signer-${i + 1}`, join(SERVICES, "quorum-signer"), ["--deployment", m1File, "--rpc", RPC, "--local-unlocked", s, "--test-vol", "0.5", "--equity-pool", POOL, "--exchange", "sim", "--exchange-url", sim.url]));
 }
 procs.push(service("poker-primary", join(SERVICES, "poker"), ["--deployment", m3File, "--rpc", RPC, "--local-unlocked", POKER1!, "--role", "primary"]));
 procs.push(service("poker-backup", join(SERVICES, "poker"), ["--deployment", m3File, "--rpc", RPC, "--local-unlocked", POKER2!, "--role", "backup"]));
-procs.push(service("hedger", join(SERVICES, "hedger"), ["--deployment", m3File, "--rpc", RPC, "--hl-user", POOL_HL, "--venue", "sim", "--venue-url", sim.url, "--status-file", statusFile]));
-procs.push(service("risk-monitor", join(SERVICES, "risk-monitor"), ["--deployment", m3File, "--rpc", RPC, "--local-unlocked", RISK!, "--hl-api", sim.url, "--hl-user", POOL_HL, "--hedger-status", statusFile, "--equity-every-seconds", "300"]));
+procs.push(service("hedger", join(SERVICES, "hedger"), ["--deployment", m3File, "--rpc", RPC, "--exchange", "sim", "--exchange-url", sim.url, "--status-file", statusFile]));
+procs.push(service("risk-monitor", join(SERVICES, "risk-monitor"), ["--deployment", m3File, "--rpc", RPC, "--local-unlocked", RISK!, "--exchange", "sim", "--exchange-url", sim.url, "--hedger-status", statusFile, "--equity-every-seconds", "300"]));
 
 // ---------------------------------------------------------------- actors
 
@@ -385,7 +386,7 @@ async function waitFor(label: string, check: () => Promise<boolean>, maxMs: numb
   return false;
 }
 const settledRound = async (r: bigint) => (await read<bigint>(POOL, "round")) > r;
-/// Waits for the next settlement after now and returns the round that settled.
+/// Waits for the next settlement after now and gives the round that settled.
 async function nextSettlement(label: string, maxMs = 300_000): Promise<bigint> {
   const r = await read<bigint>(POOL, "round");
   await waitFor(label, () => settledRound(r), maxMs);
@@ -433,7 +434,7 @@ const sendAmt = ((await read<bigint>(POOL, "navNow")) * 25n) / 100n;
 await must(ADMIN!, POOL, "sendToTreasury", [sendAmt]);
 await snapNav("after send");
 await sleep(90_000 * scale);
-sim.deposit(usd(sendAmt)); // the bridge delivers to the pool's Hyperliquid account
+sim.deposit(usd(sendAmt)); // the bridge delivers to the pool's exchange account
 say(`landing: ${usd(sendAmt)} credited on the venue`);
 await sleep(60_000);
 await snapNav("after landing");
@@ -469,7 +470,7 @@ const drawdowns: string[] = [];
 if (await read<boolean>(POOL, "opensPaused")) {
   drawdowns.push("hour 2: the shock's loss (unhedged calls beyond the hedger's hard limit)");
   say("drawdown pause after the shock's loss; the admin resumes once staff are alerted (the 30-day window restarts)");
-  await alarmSeen("DRAWDOWN_PAUSED", "raised", 0);
+  await alarmSeen("drawdown-paused", "raised", 0);
   await must(ADMIN!, POOL, "resumeOpens");
 }
 await waitFor("router marks fresh", async () => (await Promise.all(MARKETS.map(routerMark))).every((x) => x !== null), 180_000);
@@ -496,13 +497,13 @@ await snapNav("before the loss");
 const nav0 = usd(await read<bigint>(POOL, "navNow"));
 // The pool counts the lower of the latest and previous EQUITY, so a venue gain not yet confirmed by two rounds is
 // not in NAV. The loss is sized against what NAV counts: wipe the uncounted gain, then 18% of NAV on top.
-const venuePnl = sim.accountValue() - sim.ledger.reduce((a, e) => a + (e.type === "deposit" ? e.usdc : -(e.usdc + e.fee)), 0);
+const venuePnl = sim.accountValue() - sim.ledger.reduce((a, e) => a + (e.type === "deposit" ? e.amount : -(e.amount + e.fee)), 0);
 const outside = usd(await read<bigint>(POOL, "sentOut")) - usd(await read<bigint>(POOL, "receivedBack"));
 const countedTerm = usd(await read<bigint>(POOL, "equityTerm")) - outside;
 const countedPnl = countedTerm > 0 ? countedTerm / 0.95 : countedTerm;
 const uncounted = Math.max(0, venuePnl - countedPnl);
 const loss = nav0 * 0.18 + uncounted;
-sim.cash -= loss; // a loss on the pool's Hyperliquid account
+sim.cash -= loss; // a loss on the pool's exchange account
 say(`loss of ${loss.toFixed(0)} on the venue (18% of NAV ${(nav0 * 0.18).toFixed(0)} + uncounted gain ${uncounted.toFixed(0)}; venue P&L ${venuePnl.toFixed(0)}, counted ${countedPnl.toFixed(0)})`);
 await warp("hour 3: EQUITY round with the loss, then settlement");
 await nextSettlement("hour 3 settled");
@@ -511,7 +512,7 @@ const drawdownPaused = await read<boolean>(POOL, "opensPaused");
 if (drawdownPaused) drawdowns.push("hour 3: the 18% loss on the venue");
 const pausedBuy = await buy(T1!, "BTC", true, 0, 0.1, 86_400n);
 say(`drawdown pause: ${drawdownPaused}; a buy now: ${pausedBuy.ok ? "accepted" : pausedBuy.reason}`);
-if (drawdownPaused) await alarmSeen("DRAWDOWN_PAUSED", "raised", drawdowns.length - 1); // the hour 3 entry is already listed
+if (drawdownPaused) await alarmSeen("drawdown-paused", "raised", drawdowns.length - 1); // the hour 3 entry is already listed
 await must(ADMIN!, POOL, "resumeOpens");
 say("admin resumed opens");
 
@@ -524,7 +525,7 @@ const back = usd(sendAmt) / 2;
 sim.withdraw(back, 1);
 await must(TREASURY!, POOL, "receiveFromTreasury", [BigInt(Math.round((back - 1) * 1e6))]);
 say(`return: ${back - 1} received back (fee 1)`);
-await alarmSeen("TREASURY_RETURNED", "event", 0);
+await alarmSeen("treasury-returned", "event", 0);
 for (const lp of LPS) {
   const sh = await read<bigint>(POOL, "balanceOf", [lp]);
   if (sh > 0n) await must(lp, POOL, "requestWithdraw", [sh / 2n]);
@@ -581,31 +582,31 @@ check(hedgeRows.length > 0 && hedgeErrors.length === 0 && inBand / Math.max(1, p
 
 // 5 risk-monitor
 const risk = lines("risk-monitor").filter((l) => l.msg === "alarm");
-const pausedAlarms = risk.filter((l) => l.name === "VENUE_DOWN_PAUSED");
+const pausedAlarms = risk.filter((l) => l.name === "venue-down-paused");
 const pauseDelays = pausedAlarms.map((l) => (Date.parse(String(l.t)) - outageStart) / 60_000);
-const recovered = risk.filter((l) => l.name === "VENUE_RECOVERED");
-const treasuryAlarms = risk.filter((l) => l.name === "TREASURY_SENT" || l.name === "TREASURY_RETURNED");
-const mismatch = risk.filter((l) => l.name === "EQUITY_MISMATCH" && l.state === "raised");
-const drawdownAlarm = risk.filter((l) => l.name === "DRAWDOWN_PAUSED" && l.state === "raised");
+const recovered = risk.filter((l) => l.name === "venue-recovered");
+const treasuryAlarms = risk.filter((l) => l.name === "treasury-sent" || l.name === "treasury-returned");
+const mismatch = risk.filter((l) => l.name === "equity-mismatch" && l.state === "raised");
+const drawdownAlarm = risk.filter((l) => l.name === "drawdown-paused" && l.state === "raised");
 report.push(`risk-monitor: pauses at ${pauseDelays.map((d) => d.toFixed(1)).join(", ")} min into the outage; ${recovered.length} recoveries; ${treasuryAlarms.length} treasury events; ${mismatch.length} EQUITY mismatches; drawdown alarm ${drawdownAlarm.length}`);
-const cleared = risk.filter((l) => l.name === "EQUITY_MISMATCH" && l.state === "cleared");
-report.push(`EQUITY_MISMATCH: ${mismatch.map((l) => `${new Date(String(l.t)).toISOString().slice(11, 19)} ${JSON.stringify(l.values)}`).join("; ") || "none"}; cleared ${cleared.length}`);
+const cleared = risk.filter((l) => l.name === "equity-mismatch" && l.state === "cleared");
+report.push(`equity-mismatch: ${mismatch.map((l) => `${new Date(String(l.t)).toISOString().slice(11, 19)} ${JSON.stringify(l.values)}`).join("; ") || "none"}; cleared ${cleared.length}`);
 check(
   pausedAlarms.length === 3 && pauseDelays.every((d) => d >= 15 && d <= 17.5) && recovered.length === 3 && treasuryAlarms.length >= 2 && drawdownAlarm.length === drawdowns.length && drawdowns.length >= 1,
   "risk-monitor: 3 pauses 15–17.5 min into the outage, 3 recoveries, treasury send and return announced, a drawdown alarm for every drawdown pause",
 );
-check(mismatch.length === cleared.length, `risk-monitor: every EQUITY_MISMATCH cleared once EQUITY caught up (${mismatch.length} raised, ${cleared.length} cleared; see the list above)`);
+check(mismatch.length === cleared.length, `risk-monitor: every equity-mismatch cleared once EQUITY caught up (${mismatch.length} raised, ${cleared.length} cleared; see the list above)`);
 
 // 6 keeper and poker
 const settles = lines("poker-primary").concat(lines("poker-backup")).filter((l) => l.msg === "keeper: settled");
-const settleStale = risk.filter((l) => l.name === "SETTLEMENT_STALE" && l.state === "raised");
+const settleStale = risk.filter((l) => l.name === "settlement-stale" && l.state === "raised");
 const nearWarp = (t: number) => warps.some((w) => t >= w && t <= w + 180_000);
 const sampleStaleOutside = risk.filter((l) => {
   const t = Date.parse(String(l.t));
-  return l.name === "SAMPLE_STALE" && l.state === "raised" && (t < outageStart || t > outageEnd + 300_000) && !nearWarp(t);
+  return l.name === "sample-stale" && l.state === "raised" && (t < outageStart || t > outageEnd + 300_000) && !nearWarp(t);
 });
 report.push(`drawdown pauses: ${drawdowns.join("; ") || "none"}`);
-report.push(`keeper: ${settles.length} settlements; SETTLEMENT_STALE ${settleStale.length}; SAMPLE_STALE outside the outage ${sampleStaleOutside.length}`);
+report.push(`keeper: ${settles.length} settlements; settlement-stale ${settleStale.length}; sample-stale outside the outage ${sampleStaleOutside.length}`);
 check(settles.length >= 5 && settleStale.length === 0 && sampleStaleOutside.length === 0, "keeper and poker: every hour settled, no stale-sample alarm outside the outage");
 
 // 7 accounting

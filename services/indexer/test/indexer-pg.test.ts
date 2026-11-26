@@ -5,6 +5,7 @@ import { havePostgres, startLocalPg, type LocalPg } from "@tourbillon/common/loc
 import { connect, migrate, labelKeys, type Db } from "../src/db.ts";
 import { boardKeys } from "../src/events.ts";
 import { indexOnce, loadDep } from "../src/main.ts";
+import { TEARDOWN_MS, hookLimit, within } from "@tourbillon/common/hooks.ts";
 
 // On a local anvil with DeployM7 and a throwaway Postgres: trades, then the indexer fills samples, board votes and
 // finals (labelled by market and kind) and positions equal to the book's balances; a second pass changes nothing; a
@@ -28,26 +29,26 @@ const abi = parseAbi([
 ]);
 const W = 10n ** 18n;
 
-beforeAll(async () => {
+beforeAll(within(import.meta.path, "setup", 240_000, async () => {
   if (!ok) return;
   L = await startLocalM7(PORT);
   P = await startLocalPg(PORT + 1000);
   db = connect(P.url);
   await migrate(db);
-}, 240_000);
-afterAll(async () => {
+}), hookLimit(240_000));
+afterAll(within(import.meta.path, "teardown", TEARDOWN_MS, async () => {
   await db?.close();
   P?.stop();
   L?.stop();
-});
+}), hookLimit(TEARDOWN_MS));
 
 test.skipIf(!ok)(
   "samples, votes and finals, and positions equal to the book's balances; idempotent; follows a partial sell",
   async () => {
     const { acc, m7, client, send } = L!;
     const T = acc[16]!;
-    await send(T, m7.MockUSDC!, abi, "mint", [T, 1_000_000n * 10n ** 6n]);
-    await send(T, m7.MockUSDC!, abi, "approve", [m7.Engine!, 1_000_000n * 10n ** 6n]);
+    await send(T, m7.SettlementToken!, abi, "mint", [T, 1_000_000n * 10n ** 6n]);
+    await send(T, m7.SettlementToken!, abi, "approve", [m7.Engine!, 1_000_000n * 10n ** 6n]);
     const legs = [
       { isCall: true, kWad: 74_000n * W, qty: W },
       { isCall: true, kWad: 76_000n * W, qty: -W },
@@ -61,9 +62,17 @@ test.skipIf(!ok)(
     expect(first.ops).toBeGreaterThan(0);
 
     const samples = await db!`SELECT market, count(*)::int AS n FROM samples GROUP BY market ORDER BY market`;
-    expect(samples.map((r: { market: string }) => r.market)).toEqual(["BTC", "ETH", "HYPE"]);
+    expect(samples.map((r: { market: string }) => r.market)).toEqual(["BTC", "ETH", "STK1"]);
     const finals = await db!`SELECT k.market, k.kind, count(*)::int AS n FROM board_finals f JOIN board_keys k ON k.key = f.key GROUP BY k.market, k.kind ORDER BY 1, 2`;
     expect(finals.length).toBe(6); // MARK and VOL for three markets
+    // RH7: every MARK final is a quorum row in the marks audit trail, accepted when nothing clamped it
+    const marks = await db!`SELECT m.market, m.px, m.accepted, f.published, f.median FROM marks m JOIN board_keys k ON k.market = m.market AND k.kind = 'MARK' JOIN board_finals f ON f.key = k.key AND f.round = m.round WHERE m.source = 'quorum' ORDER BY 1`;
+    const markFinals = finals.filter((r: { kind: string }) => r.kind === "MARK").reduce((n: number, r: { n: number }) => n + r.n, 0);
+    expect(marks.length).toBe(markFinals);
+    for (const r of marks as { px: string; accepted: boolean; published: string; median: string }[]) {
+      expect(r.px).toBe(r.published);
+      expect(r.accepted).toBe(r.published === r.median);
+    }
     const votes = await db!`SELECT count(DISTINCT signer)::int AS n FROM board_votes`;
     expect(votes[0].n).toBe(3);
     const pos = await db!`SELECT id, owner, held, raw, market, legs_json FROM positions WHERE raw > 0`;

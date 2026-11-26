@@ -58,7 +58,7 @@ contract Engine is AccessControl, ReentrancyGuard {
     ICounterparty public immutable counterparty;
     IMarkRouter public immutable marks;
     IVolSource public immutable vols;
-    IERC20 public immutable usdc;
+    IERC20 public immutable settlement;
 
     bool public buysPaused;
     address public openBook; // M6: the best-of-three router, set once
@@ -136,12 +136,12 @@ contract Engine is AccessControl, ReentrancyGuard {
         ) revert ZeroAddress();
         IERC20 token = counterparty_.asset();
         uint8 d = IERC20Metadata(address(token)).decimals();
-        if (d != EnginePricing.USDC_DECIMALS) revert NotSixDecimals(d);
+        if (d != EnginePricing.SETTLEMENT_DECIMALS) revert NotSixDecimals(d);
         book = book_;
         counterparty = counterparty_;
         marks = marks_;
         vols = vols_;
-        usdc = token;
+        settlement = token;
         _grantRole(DEFAULT_ADMIN_ROLE, admin);
         _grantRole(UNPAUSER_ROLE, admin); // until the M7 handover moves it to the Safe
     }
@@ -149,9 +149,9 @@ contract Engine is AccessControl, ReentrancyGuard {
     // ---------------------------------------------------------------- trading
 
     /// @notice Buys `units` (WAD) of the call or put on `market` at strike `kWad` with `movement` (a single tempo is
-    ///         a one-part Movement), paying at most `maxCost` USDC (6 decimals) before `deadline`.
+    ///         a one-part Movement), paying at most `maxCost` settlement token (6 decimals) before `deadline`.
     /// @return id   The book series.
-    /// @return cost Premium plus fee, USDC.
+    /// @return cost Premium plus fee, settlement token.
     function buy(
         bytes32 market,
         bool isCall,
@@ -187,14 +187,14 @@ contract Engine is AccessControl, ReentrancyGuard {
         book.mint(id, msg.sender, raw);
         emit Bought(msg.sender, id, market, units, raw, s, sigma, v, premium, fee);
 
-        usdc.safeTransferFrom(msg.sender, address(counterparty), premium + fee);
+        settlement.safeTransferFrom(msg.sender, address(counterparty), premium + fee);
         counterparty.onBuy(market, id, units, raw, s, sigma, premium, fee);
     }
 
     /// @notice Buys `units` (WAD) of a shape on `market`: `legs` from the buyer's side (+ long, − short), spelled the
-    ///         book's one way, with `movement`, paying at most `maxCost` USDC before `deadline`.
+    ///         book's one way, with `movement`, paying at most `maxCost` settlement token before `deadline`.
     /// @return id   The book's shape series.
-    /// @return cost Premium plus fee, USDC.
+    /// @return cost Premium plus fee, settlement token.
     function buyShape(
         bytes32 market,
         StrategyMath.Leg[] calldata legs,
@@ -231,15 +231,15 @@ contract Engine is AccessControl, ReentrancyGuard {
         book.mint(id, msg.sender, raw);
         emit ShapeBought(msg.sender, id, market, units, raw, s, sigma, v, premium, fee);
 
-        usdc.safeTransferFrom(msg.sender, address(counterparty), cost);
+        settlement.safeTransferFrom(msg.sender, address(counterparty), cost);
         counterparty.onBuy(market, id, units, raw, s, sigma, premium, fee);
     }
 
-    /// @notice Sells `units` (WAD; `type(uint256).max` = all held) of series `id`, receiving at least `minOut` USDC
+    /// @notice Sells `units` (WAD; `type(uint256).max` = all held) of series `id`, receiving at least `minOut` settlement token
     ///         before `deadline`. Never paused (law 3). Priced at the fresh mark and vol when available, else at the
     ///         book's last recorded sample, each input separately (law 2: sells use the last good sample).
     /// @return paidUnits Units paid for (at most `units`, capped at the holding).
-    /// @return net       USDC received.
+    /// @return net       settlement token received.
     function sell(uint256 id, uint256 units, uint256 minOut, uint256 deadline)
         external
         nonReentrant
@@ -342,7 +342,7 @@ contract Engine is AccessControl, ReentrancyGuard {
     ///         the value at `sigmaBps` and the router locks the source's collateral in the same transaction.
     /// @return id   The shape series.
     /// @return raw  The book balance minted to the buyer.
-    /// @return cost Premium plus fee, USDC, pulled from the buyer.
+    /// @return cost Premium plus fee, settlement token, pulled from the buyer.
     function openFor(
         address buyer,
         bytes32 market,
@@ -377,12 +377,12 @@ contract Engine is AccessControl, ReentrancyGuard {
         if (raw == 0) revert ZeroRaw();
         book.mint(id, buyer, raw);
         emit ShapeBought(buyer, id, market, units, raw, s, sigmaBps, v, premium, fee);
-        usdc.safeTransferFrom(buyer, address(counterparty), cost);
+        settlement.safeTransferFrom(buyer, address(counterparty), cost);
         if (payee == address(0)) {
             counterparty.onBuy(market, id, units, raw, s, sigmaBps, premium, fee);
         } else {
             int256 vDown = EnginePricing.shapeValue(legs, s, sigmaBps, movement, false);
-            uint256 credit = vDown > 0 ? Math.mulDiv(units, uint256(vDown), 1e18) / EnginePricing.WAD_PER_USDC_UNIT : 0;
+            uint256 credit = vDown > 0 ? Math.mulDiv(units, uint256(vDown), 1e18) / EnginePricing.WAD_PER_SETTLEMENT_UNIT : 0;
             IMatchedCounterparty(address(counterparty))
                 .onMatchedOpen(market, id, units, raw, s, premium, fee, credit, payee);
         }

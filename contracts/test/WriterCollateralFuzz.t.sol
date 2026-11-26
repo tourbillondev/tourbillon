@@ -9,18 +9,18 @@ import {TempoBlend} from "../src/TempoBlend.sol";
 
 contract CollateralHarness {
     function collateral(bytes32 market, StrategyMath.Leg[] memory legs, int256 cover) external pure returns (uint256) {
-        return StrategyMath.writerCollateral(market, legs, cover);
+        return StrategyMath.writerCollateral(market == "STK1", legs, cover); // STK1 has a covering asset (as listed in CoveringAssets)
     }
 }
 
 /// M4 step 8a, the T1 gate in pure maths: "no written position can owe more than its collateral".
 /// The collateral side is checked against the exact payoff (WAD × WAD scale) with no tolerance (owner, after the step 8
 /// finding). For random 1–4 leg shapes from the writer's side (signed amounts, mixed calls and puts, strikes around the price,
-/// optional WHYPE cover on HYPE) with collateral = StrategyMath's exact worst case:
+/// optional STK1 stock cover on STK1) with collateral = StrategyMath's exact worst case:
 ///   1. at every price (0, every strike, a dense grid, far above the top strike) the writer's loss ≤ the collateral;
 ///   2. at any price, vol and tempo, the buyback value (the pool's side) ≤ the collateral (+ the cover's value),
 ///      within the few-wei TempoMath tolerance (M4 step 6 finding);
-///   3. shapes that cannot be covered (a net short call without cover, cover off HYPE) are always refused;
+///   3. shapes that cannot be covered (a net short call without cover, cover off STK1) are always refused;
 ///   4. the collateral is exact: some price reaches it, so nothing is over-locked.
 contract WriterCollateralFuzzTest is Test {
     uint256 constant S0 = 100e18;
@@ -51,7 +51,7 @@ contract WriterCollateralFuzzTest is Test {
             c.legs[j] = StrategyMath.Leg(isCall, uint128(k), int128(q));
             if (isCall) callSlope += q;
         }
-        c.market = offHype ? bytes32("BTC") : bytes32("HYPE");
+        c.market = offHype ? bytes32("BTC") : bytes32("STK1");
         c.cover = wantCover && callSlope < 0;
         c.coverQty = c.cover ? -callSlope : int256(0);
     }
@@ -124,12 +124,12 @@ contract WriterCollateralFuzzTest is Test {
         assertGe(p, -int256(coll) * 1e18, "the writer never owes more than the collateral at this price");
     }
 
-    /// 3. cover counts only on HYPE: anywhere else it is refused.
+    /// 3. cover counts only on STK1: anywhere else it is refused.
     /// forge-config: default.fuzz.runs = 10000
     function testFuzz_coverOffHypeIsRefused(uint256 seed) public {
         Case memory c = _case(seed, true, true);
         if (!c.cover) return; // nothing to cover
-        vm.expectRevert(abi.encodeWithSelector(StrategyMath.CoverNotAllowed.selector, bytes32("BTC")));
+        vm.expectRevert(StrategyMath.CoverNotAllowed.selector);
         h.collateral(c.market, c.legs, c.coverQty);
     }
 

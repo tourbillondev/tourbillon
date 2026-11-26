@@ -6,9 +6,12 @@ import {MainspringPool} from "../src/MainspringPool.sol";
 import {Engine} from "../src/Engine.sol";
 import {TempoBlend} from "../src/TempoBlend.sol";
 import {IAccessControl} from "@openzeppelin/contracts/access/IAccessControl.sol";
+import {SessionCalendar} from "../src/SessionCalendar.sol";
+import {MockSessionCalendar} from "./mocks/MockSessionCalendar.sol";
+import {M1Core} from "../script/M1Core.sol";
 
 /// M3 step 5: the risk rules on opens (coverage, caps, drawdown pause, market pauses).
-contract MainspringPoolRiskTest is MainspringPoolBase {
+contract MainspringPoolRiskTest is MainspringPoolBase, M1Core {
     address constant RISK = address(0x815C);
 
     function _buyAs(bytes32 m, bool isCall, uint128 k, uint256 units, uint256 tempo) internal returns (uint256 id) {
@@ -18,7 +21,7 @@ contract MainspringPoolRiskTest is MainspringPoolBase {
 
     // ---------------------------------------------------------------- coverage
 
-    /// A buy is refused once Elysium USDC would no longer cover the stressed liability.
+    /// A buy is refused once the settlement token held on Robinhood Chain would no longer cover the stressed liability.
     function test_coverageRefusesTheBuyThatWouldBreachIt() public {
         _seed(500_000e6);
         uint256 bought;
@@ -36,9 +39,9 @@ contract MainspringPoolRiskTest is MainspringPoolBase {
     }
 
     /// Equity, queued deposits and owed USDC never count towards coverage.
-    function test_coverageCountsElysiumUsdcOnly() public {
+    function test_coverageCountsOnChainSettlementOnly() public {
         _seed(200_000e6);
-        _postEquity(5_000_000e6); // a large P&L on Hyperliquid
+        _postEquity(5_000_000e6); // a large P&L at the exchange
         _set(nowT + 1 hours);
         _postEquity(5_000_000e6);
         _lp(B, 10_000_000e6); // queued deposit
@@ -102,6 +105,65 @@ contract MainspringPoolRiskTest is MainspringPoolBase {
         vm.prank(TRADER);
         vm.expectRevert(abi.encodeWithSelector(MainspringPool.NotionalCapExceeded.selector, ETH, 2_000e6, 0));
         engine.buy(ETH, true, 2_000e18, TempoBlend.single(1 days), 1e18, ALL, nowT);
+    }
+
+    /// RH4 (G3): on a weekend or holiday a tokenized-stock market's opens get 25% of the caps; sells are never capped.
+    /// The real calendar from the data file. The fixture only has BTC and ETH, so this test calendar lists BTC as a
+    /// stock market: the pool only asks the calendar for the share.
+    function test_weekendOpensGetAQuarterOfTheCapsAndSellsAreNeverCapped() public {
+        _seed(5_000_000e6);
+        pool.setCaps(BTC, 210_000e6, 1e15);
+        pool.setCaps(ETH, 4_000e6, 1e15);
+        SessionCalendar cal = new SessionCalendar(address(this));
+        CalendarData memory d = loadCalendar(CALENDAR_FILE);
+        for (uint256 i; i < d.yearList.length; ++i) {
+            CalYear memory y = d.yearList[i];
+            cal.setYear(y.year, y.dstStart, y.dstEnd, y.holidays, y.earlyCloses);
+        }
+        cal.setStockMarket(BTC, true);
+        pool.setSessionCalendar(cal);
+        // T0 is Monday 00:00 UTC = Sunday 19:00 New York: a closed day
+        assertTrue(cal.isClosedDay(nowT));
+        vm.prank(TRADER);
+        vm.expectRevert(abi.encodeWithSelector(MainspringPool.NotionalCapExceeded.selector, BTC, 70_000e6, 52_500e6));
+        engine.buy(BTC, true, 70_000e18, TempoBlend.single(1 days), 1e18, ALL, nowT);
+        uint256 id = _buyAs(BTC, true, 70_000e18, 0.5e18, 1 days); // 35,000 fits under 52,500
+        _buyAs(ETH, true, 2_000e18, 2e18, 1 days); // crypto: the full 4,000
+        vm.prank(TRADER);
+        engine.sell(id, ALL, 0, nowT); // a sell on the closed day: never capped
+        assertEq(pool.openNotional(BTC), 0);
+        // Tuesday 10:00 New York: full caps again
+        _set(T0 + 39 hours);
+        assertFalse(cal.isClosedDay(nowT));
+        book.record(BTC, 70_000e18, 4500);
+        book.record(ETH, 2_000e18, 6000);
+        _buyAs(BTC, true, 70_000e18, 3e18, 1 days); // 210,000: the whole cap
+        assertEq(pool.openNotional(BTC), 210_000e6);
+    }
+
+    /// The directional cap is scaled the same way (a stand-in calendar gives the share).
+    function test_weekendShareAppliesToTheDirectionalCapToo() public {
+        _seed(5_000_000e6);
+        MockSessionCalendar mc = new MockSessionCalendar();
+        pool.setSessionCalendar(mc);
+        uint256 snap = vm.snapshotState();
+        _buyAs(BTC, true, 70_000e18, 1e18, 1 days);
+        uint256 dir = pool.directional(BTC); // USDC units, as the cap is set
+        vm.revertToState(snap);
+        pool.setCaps(BTC, 1e15, dir * 2); // at 100% the buy fits
+        mc.setCapBps(BTC, 2_500); // at 25% the cap is dir / 2: refused
+        vm.prank(TRADER);
+        vm.expectPartialRevert(MainspringPool.DirectionalCapExceeded.selector);
+        engine.buy(BTC, true, 70_000e18, TempoBlend.single(1 days), 1e18, ALL, nowT);
+        mc.setCapBps(BTC, 10_000);
+        _buyAs(BTC, true, 70_000e18, 1e18, 1 days);
+    }
+
+    function test_onlyGovernanceSetsTheSessionCalendar() public {
+        MockSessionCalendar mc = new MockSessionCalendar(); // made first: a call inside the arguments would take the expectRevert
+        vm.prank(ATTACKER);
+        vm.expectRevert(abi.encodeWithSelector(IAccessControl.AccessControlUnauthorizedAccount.selector, ATTACKER, bytes32(0)));
+        pool.setSessionCalendar(mc);
     }
 
     /// Owner rule: directional cap ≤ hedger delta cap × 2 × shock, on every setter that moves one side of it.
@@ -182,7 +244,7 @@ contract MainspringPoolRiskTest is MainspringPoolBase {
         pool.sendToTreasury(200_000e6);
         uint256 id = _buyAs(BTC, true, 70_000e18, 1e18, 1 days);
 
-        // a 14% loss on Hyperliquid: no pause
+        // a 14% loss at the exchange: no pause
         _set(nowT + 1 hours);
         _postEquity(-140_000e6);
         _epochAndSettle();

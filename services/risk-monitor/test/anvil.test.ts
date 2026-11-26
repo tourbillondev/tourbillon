@@ -1,19 +1,21 @@
 import { afterAll, beforeAll, expect, test } from "bun:test";
+import { TEARDOWN_MS, hookLimit, within } from "@tourbillon/common/hooks.ts";
 import { copyFileSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { createPublicClient, createWalletClient, http, parseEther, stringToHex, type Address, type PublicClient } from "viem";
 import { foundry } from "viem/chains";
-import { SimVenue } from "../../hedger/src/simvenue.ts";
+import { SimExchange } from "../../hedger/src/simexchange.ts";
 
 // On a local anvil: DeployM1 + DeployM3 (risk pauser = its own account) + ListEquityFeed, votes sent by the test, an LP
-// round and two trades, a simulated Hyperliquid venue, and the real risk-monitor process with a 3-second outage window.
+// round and two trades, the simulated crypto hedge exchange (read-only key), and the real risk-monitor process with a
+// 3-second outage window. DeployM3 lists no covering asset, so every market here counts as an exchange market (stock
+// markets and hedger-onchain's status are covered in the M7 run and in hedger's anvil test).
 const haveTools = Bun.which("anvil") !== null && Bun.which("forge") !== null;
 const CONTRACTS = resolve(import.meta.dir, "../../../contracts");
 const PORT = 22545 + Math.floor(Math.random() * 1000);
 const RPC = `http://127.0.0.1:${PORT}`;
-const PX: Record<string, string> = { BTC: "100000", ETH: "3000", HYPE: "40" };
-const HL_USER = "0x00000000000000000000000000000000000000E1";
+const PX: Record<string, string> = { BTC: "100000", ETH: "3000", STK1: "40" };
 const OFFSET = 10n ** 30n;
 const part = { type: "tuple[]", components: [{ type: "uint256", name: "tempo" }, { type: "uint256", name: "weight" }] } as const;
 const abi = [
@@ -42,7 +44,7 @@ const abi = [
 ] as const;
 
 let anvil: ReturnType<typeof Bun.spawn> | undefined;
-let sim: SimVenue | undefined;
+let sim: SimExchange | undefined;
 let tmp = "";
 let m3File = "";
 let statusFile = "";
@@ -86,11 +88,11 @@ async function postEquity(pnlUsd: bigint): Promise<void> {
 }
 
 function writeHedgerStatus(failing: string[]): void {
-  const markets = Object.fromEntries(["BTC", "ETH", "HYPE"].map((m) => [m, { ok: !failing.includes(m), lastOkAt: null }]));
+  const markets = Object.fromEntries(["BTC", "ETH", "STK1"].map((m) => [m, { ok: !failing.includes(m), lastOkAt: null }]));
   writeFileSync(statusFile, JSON.stringify({ updatedAt: new Date().toISOString(), markets }));
 }
 
-const monitorArgs = () => ["src/main.ts", "--deployment", m3File, "--rpc", RPC, "--local-unlocked", acc[6]!, "--hl-api", sim!.url, "--hl-user", HL_USER, "--hedger-status", statusFile, "--equity-every-seconds", "0"];
+const monitorArgs = () => ["src/main.ts", "--deployment", m3File, "--rpc", RPC, "--local-unlocked", acc[6]!, "--exchange", "sim", "--exchange-url", sim!.url, "--hedger-status", statusFile, "--equity-every-seconds", "0"];
 
 async function monitorOnce(): Promise<Record<string, unknown>[]> {
   const p = Bun.spawn(["bun", ...monitorArgs(), "--once"], { cwd: resolve(import.meta.dir, ".."), stdout: "pipe", stderr: "pipe" });
@@ -114,12 +116,12 @@ async function monitorFor(ms: number, during?: () => void): Promise<Record<strin
 
 const alarms = (lines: Record<string, unknown>[], name: string, state?: string) => lines.filter((l) => l.msg === "alarm" && l.name === name && (!state || l.state === state));
 
-beforeAll(async () => {
+beforeAll(within(import.meta.path, "setup", 300_000, async () => {
   if (!haveTools) return;
   tmp = mkdtempSync(join(tmpdir(), "risk-anvil-"));
   statusFile = join(tmp, "hedger-status.json");
-  sim = new SimVenue(["BTC", "ETH", "HYPE"].map((n) => ({ name: n, szDecimals: { BTC: 5, ETH: 4, HYPE: 2 }[n]!, mid: Number(PX[n]) })));
-  sim.deposit(1_000_000); // the pool's Hyperliquid account: 1,000,000 deposited, no P&L yet
+  sim = new SimExchange(["BTC", "ETH", "STK1"].map((n) => ({ name: n, szDecimals: { BTC: 5, ETH: 4, STK1: 2 }[n]!, mid: Number(PX[n]) })));
+  sim.deposit(1_000_000); // the pool's exchange account: 1,000,000 deposited, no P&L yet
   anvil = Bun.spawn(["anvil", "--port", String(PORT), "--silent", "--accounts", "12"], { stdout: "ignore", stderr: "ignore" });
   for (let i = 0; i < 50; i++) {
     try {
@@ -142,29 +144,29 @@ beforeAll(async () => {
   m3 = await Bun.file(m3File).json();
   await rpc("evm_increaseTime", [3600]);
   await rpc("evm_mine");
-  for (const m of ["BTC", "ETH", "HYPE"]) await send(acc[5]!, m1.MarkRouter!, "applyRoute", [b32(m)]);
-  await vote(["BTC", "ETH", "HYPE"]);
-  for (const m of ["BTC", "ETH", "HYPE"]) await send(acc[9]!, m3.PathFundingBook!, "poke", [b32(m)]);
+  for (const m of ["BTC", "ETH", "STK1"]) await send(acc[5]!, m1.MarkRouter!, "applyRoute", [b32(m)]);
+  await vote(["BTC", "ETH", "STK1"]);
+  for (const m of ["BTC", "ETH", "STK1"]) await send(acc[9]!, m3.PathFundingBook!, "poke", [b32(m)]);
   const LP = acc[7]!;
-  await send(LP, m3.MockUSDC!, "mint", [LP, 5_000_000n * 10n ** 6n]);
-  await send(LP, m3.MockUSDC!, "approve", [m3.MainspringPool!, 5_000_000n * 10n ** 6n]);
+  await send(LP, m3.SettlementToken!, "mint", [LP, 5_000_000n * 10n ** 6n]);
+  await send(LP, m3.SettlementToken!, "approve", [m3.MainspringPool!, 5_000_000n * 10n ** 6n]);
   await send(LP, m3.MainspringPool!, "deposit", [5_000_000n * 10n ** 6n]);
   await send(acc[9]!, m3.MainspringPool!, "startEpoch");
   await send(acc[9]!, m3.MainspringPool!, "markChunk", [100n]);
   await send(acc[9]!, m3.MainspringPool!, "settle");
   const T = acc[8]!;
-  await send(T, m3.MockUSDC!, "mint", [T, 1_000_000n * 10n ** 6n]);
-  await send(T, m3.MockUSDC!, "approve", [m3.Engine!, 1_000_000n * 10n ** 6n]);
+  await send(T, m3.SettlementToken!, "mint", [T, 1_000_000n * 10n ** 6n]);
+  await send(T, m3.SettlementToken!, "approve", [m3.Engine!, 1_000_000n * 10n ** 6n]);
   await send(T, m3.Engine!, "buy", [b32("BTC"), true, parseEther("100000"), [{ tempo: 86_400n, weight: parseEther("1") }], parseEther("1"), 10n ** 12n, 99_999_999_999n]);
   await send(T, m3.Engine!, "buy", [b32("ETH"), true, parseEther("3000"), [{ tempo: 86_400n, weight: parseEther("1") }], parseEther("10"), 10n ** 12n, 99_999_999_999n]);
   writeHedgerStatus([]);
-}, 300_000);
+}), hookLimit(300_000));
 
-afterAll(() => {
+afterAll(within(import.meta.path, "teardown", TEARDOWN_MS, () => {
   anvil?.kill();
   sim?.stop();
   if (tmp) rmSync(tmp, { recursive: true, force: true });
-});
+}), hookLimit(TEARDOWN_MS));
 
 test.skipIf(!haveTools)("a healthy system raises no alarm", async () => {
   const lines = await monitorOnce();
@@ -172,31 +174,32 @@ test.skipIf(!haveTools)("a healthy system raises no alarm", async () => {
   expect(lines.some((l) => l.msg === "started")).toBe(true);
 }, 60_000);
 
-test.skipIf(!haveTools)("a treasury send is announced; EQUITY that disagrees with Hyperliquid raises EQUITY_MISMATCH", async () => {
+test.skipIf(!haveTools)("a treasury send is announced; EQUITY that disagrees with the exchange raises equity-mismatch", async () => {
   await postEquity(0n);
   await postEquity(0n);
   await send(acc[1]!, m3.MainspringPool!, "setTreasury", [acc[10]!]);
   await send(acc[1]!, m3.MainspringPool!, "sendToTreasury", [100_000n * 10n ** 6n]);
   const a = await monitorOnce();
-  const sent = alarms(a, "TREASURY_SENT", "event")[0]!;
+  const sent = alarms(a, "treasury-sent", "event")[0]!;
   expect(sent).toBeDefined();
   expect(sent.who).toContain("treasury operator");
   expect((sent.values as { amount: number }).amount).toBe(100_000);
-  expect(alarms(a, "EQUITY_MISMATCH")).toEqual([]);
+  expect(alarms(a, "equity-mismatch")).toEqual([]);
 
-  await postEquity(50_000n); // the board says +50,000; Hyperliquid's account shows 0 P&L
+  await postEquity(50_000n); // the board says +50,000; the exchange account shows 0 P&L
   const b = await monitorOnce();
-  const mm = alarms(b, "EQUITY_MISMATCH", "raised")[0]!;
+  const mm = alarms(b, "equity-mismatch", "raised")[0]!;
   expect(mm).toBeDefined();
-  expect(mm.values).toMatchObject({ boardPnl: 50_000, hyperliquidPnl: 0, accountValue: 1_000_000 });
+  expect(mm.values).toMatchObject({ boardPnl: 50_000, exchangePnl: 0, accountValue: 1_000_000 });
+  expect(sim!.rejected).toEqual([]); // a read-only key, reads only
   await postEquity(0n);
 }, 120_000);
 
 test.skipIf(!haveTools)("the hedger failing on ETH for the window pauses opens on ETH only; buys there refused, sells work", async () => {
-  await vote(["BTC", "ETH", "HYPE"]); // fresh router marks
+  await vote(["BTC", "ETH", "STK1"]); // fresh router marks
   const lines = await monitorFor(7_000, () => writeHedgerStatus(["ETH"]));
-  expect(alarms(lines, "MONITOR_ERROR")).toEqual([]); // every pass worked, also on a quiet chain with no new blocks
-  const paused = alarms(lines, "VENUE_DOWN_PAUSED", "event");
+  expect(alarms(lines, "monitor-error")).toEqual([]); // every pass worked, also on a quiet chain with no new blocks
+  const paused = alarms(lines, "venue-down-paused", "event");
   expect(paused.map((l) => l.market)).toEqual(["ETH"]);
   expect(paused[0]!.who).toContain("automatic pause done");
   expect(await client.readContract({ address: m3.MainspringPool!, abi, functionName: "marketPaused", args: [b32("ETH")] })).toBe(true);
@@ -212,10 +215,10 @@ test.skipIf(!haveTools)("the hedger failing on ETH for the window pauses opens o
 }, 120_000);
 
 test.skipIf(!haveTools)("a venue outage pauses the other markets; recovery is announced", async () => {
-  await vote(["BTC", "ETH", "HYPE"]);
+  await vote(["BTC", "ETH", "STK1"]);
   sim!.outage = "http500";
   const down = await monitorFor(7_000, () => writeHedgerStatus([]));
-  expect(alarms(down, "VENUE_DOWN_PAUSED", "event").map((l) => l.market).sort()).toEqual(["BTC", "HYPE"]); // ETH was already paused
+  expect(alarms(down, "venue-down-paused", "event").map((l) => l.market).sort()).toEqual(["BTC", "STK1"]); // ETH was already paused
   sim!.outage = "none";
   const p = Bun.spawn(["bun", ...monitorArgs(), "--outage-minutes", "0.01", "--tick-seconds", "1"], { cwd: resolve(import.meta.dir, ".."), stdout: "pipe", stderr: "pipe" });
   // a fresh process starts with no trip, so trip it again on the outage, then recover
@@ -225,23 +228,23 @@ test.skipIf(!haveTools)("a venue outage pauses the other markets; recovery is an
   await Bun.sleep(3_000);
   p.kill("SIGTERM");
   const lines = (await new Response(p.stdout).text()).trim().split("\n").filter(Boolean).map((l) => JSON.parse(l));
-  expect(alarms(lines, "VENUE_RECOVERED", "event").length).toBeGreaterThanOrEqual(1);
-  expect(alarms(lines, "VENUE_RECOVERED", "event")[0]!.who).toContain("admin");
+  expect(alarms(lines, "venue-recovered", "event").length).toBeGreaterThanOrEqual(1);
+  expect(alarms(lines, "venue-recovered", "event")[0]!.who).toContain("admin");
 }, 120_000);
 
 test.skipIf(!haveTools)("caps near their limit, then two hours without signers, poker or keeper: every liveness alarm", async () => {
   await send(acc[1]!, m3.MainspringPool!, "setHedgerDeltaCap", [b32("BTC"), 10n ** 16n]); // the pool refuses a directional cap the hedger cannot carry
   await send(acc[1]!, m3.MainspringPool!, "setCaps", [b32("BTC"), 105_000n * 10n ** 6n, 10n ** 15n]); // 100,000 open of 105,000
   const caps = await monitorOnce();
-  expect(alarms(caps, "CAP_HIGH", "raised").map((l) => l.market)).toEqual(["BTC"]);
+  expect(alarms(caps, "cap-high", "raised").map((l) => l.market)).toEqual(["BTC"]);
 
   await rpc("evm_increaseTime", [2 * 3600 + 60]);
   await rpc("evm_mine");
   const late = await monitorOnce();
-  expect(alarms(late, "MARK_STALE", "raised").map((l) => l.market).sort()).toEqual(["BTC", "ETH", "HYPE"]);
-  expect(alarms(late, "SAMPLE_STALE", "raised").length).toBe(3);
-  expect(alarms(late, "SETTLEMENT_STALE", "raised").length).toBe(1);
-  const nr = alarms(late, "EQUITY_NOT_READY", "raised")[0]!;
+  expect(alarms(late, "mark-stale", "raised").map((l) => l.market).sort()).toEqual(["BTC", "ETH", "STK1"]);
+  expect(alarms(late, "sample-stale", "raised").length).toBe(3);
+  expect(alarms(late, "settlement-stale", "raised").length).toBe(1);
+  const nr = alarms(late, "equity-not-ready", "raised")[0]!;
   expect(nr.values).toMatchObject({ sentOut: 100_000, receivedBack: 0 });
   for (const l of late.filter((x) => x.msg === "alarm")) {
     expect(typeof l.name).toBe("string");

@@ -1,0 +1,21 @@
+name: invariants-deep
+# The playbook's depth for stateful invariants (03 §2): 100,000 calls per suite. Too slow for every push, so it runs
+# once a week and on demand; every push still runs the shorter default depth in ci.yml.
+on:
+  schedule:
+    - cron: "17 3 * * 1" # Mondays 03:17 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  invariants:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    defaults: { run: { working-directory: contracts } }
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with: { persist-credentials: false, submodules: recursive }
+      - uses: foundry-rs/foundry-toolchain@dba66c27052e63476d886f22216e119ba7e615bf # v1.9.2
+      - run: FOUNDRY_PROFILE=deep forge test --match-path 'test/invariant/*'

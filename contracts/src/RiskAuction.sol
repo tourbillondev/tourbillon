@@ -48,7 +48,7 @@ contract RiskAuction is ReentrancyGuard {
     uint256 public constant COMMIT_PERIOD = 3 days;
     uint256 public constant REVEAL_PERIOD = 1 days;
     uint256 public constant INTERVAL = 7 days;
-    uint256 public constant LOT_CAP = 1_000_000e6; // USDC notional
+    uint256 public constant LOT_CAP = 1_000_000e6; // settlement token notional
     uint256 public constant BOND_BPS = 500;
     uint256 public constant RESERVE_BPS = 11_000;
     uint256 public constant MAX_BIDDERS = 32;
@@ -58,7 +58,7 @@ contract RiskAuction is ReentrancyGuard {
         bytes32 market;
         uint256 seriesId;
         uint256 raw;
-        uint256 bond; // USDC per bidder
+        uint256 bond; // settlement token per bidder
         uint64 commitEnd;
         uint64 revealEnd;
         bool settled;
@@ -79,7 +79,7 @@ contract RiskAuction is ReentrancyGuard {
     MakerVault public immutable vault;
     IMarkRouter public immutable marks;
     IVolSource public immutable vols;
-    IERC20 public immutable usdc;
+    IERC20 public immutable settlement;
 
     Lot[] internal _lots;
     mapping(uint256 => mapping(address => Bid)) public bids;
@@ -123,7 +123,7 @@ contract RiskAuction is ReentrancyGuard {
         vault = vault_;
         marks = marks_;
         vols = vols_;
-        usdc = vault_.usdc();
+        settlement = vault_.settlement();
     }
 
     // ---------------------------------------------------------------- start
@@ -182,7 +182,7 @@ contract RiskAuction is ReentrancyGuard {
         if (bestNotional > LOT_CAP) raw = Math.mulDiv(raw, LOT_CAP, bestNotional);
     }
 
-    /// @dev The writer's worst case per unit (WAD USDC) and units of underlying per unit; not ok if unbounded.
+    /// @dev The writer's worst case per unit (WAD settlement token) and units of underlying per unit; not ok if unbounded.
     function _terms(uint256 id, bytes32 market) internal view returns (bool ok, uint256 worst, uint256 underlying) {
         (, StrategyMath.Leg[] memory h,) = _holderTerms(id);
         StrategyMath.Leg[] memory w = new StrategyMath.Leg[](h.length);
@@ -191,9 +191,11 @@ contract RiskAuction is ReentrancyGuard {
             w[j] = StrategyMath.Leg(h[j].isCall, h[j].kWad, -h[j].qty);
             if (w[j].isCall) slope += w[j].qty;
         }
-        uint256 cover = market == StrategyMath.COVER_MARKET && slope < 0 ? uint256(-slope) : 0;
+        (IERC20 t,) = vault.covers().coverOf(market);
+        bool coverable = address(t) != address(0); // a stock covers Rises on its own market only (CoveringAssets)
+        uint256 cover = coverable && slope < 0 ? uint256(-slope) : 0;
         if (slope + int256(cover) < 0) return (false, 0, 0);
-        worst = StrategyMath.writerCollateral(market, w, int256(cover));
+        worst = StrategyMath.writerCollateral(coverable, w, int256(cover));
         underlying = EnginePricing.shapeNotionalPerUnit(h);
         ok = true;
     }
@@ -224,7 +226,7 @@ contract RiskAuction is ReentrancyGuard {
         b.hash = hash;
         _bidders[lotId].push(msg.sender);
         emit Committed(lotId, msg.sender);
-        if (l.bond > 0) vault.lock(msg.sender, usdc, l.bond);
+        if (l.bond > 0) vault.lock(msg.sender, settlement, l.bond);
     }
 
     function reveal(uint256 lotId, uint64 sigmaBps, bytes32 salt) external {
@@ -283,7 +285,7 @@ contract RiskAuction is ReentrancyGuard {
             Bid storage b = bids[lotId][order[i]];
             uint256 price = _price(c, b.sigmaBps, false);
             if (price > c.reserve) break; // above the reserve: no fill from this bid or any higher one
-            if (l.bond > 0) vault.unlock(order[i], usdc, l.bond);
+            if (l.bond > 0) vault.unlock(order[i], settlement, l.bond);
             b.closed = true;
             // the pool's NAV side uses the board's σ (how it carried the slice); the bid's σ only sets the price
             try this.fillLot(l.seriesId, order[i], c.raw, c.units, c.s, c.sigmaBoard, price) {
@@ -292,7 +294,7 @@ contract RiskAuction is ReentrancyGuard {
                 return;
             } catch {
                 // could not lock its collateral: the bond goes to the pool (owner)
-                if (l.bond > 0) vault.slash(order[i], usdc, l.bond, address(pool));
+                if (l.bond > 0) vault.slash(order[i], settlement, l.bond, address(pool));
                 emit Forfeited(lotId, order[i], l.bond, "no collateral");
             }
         }
@@ -307,7 +309,7 @@ contract RiskAuction is ReentrancyGuard {
         pool.onAuctionFill(id, raw, units, s, sigma, price, winner);
     }
 
-    /// @dev The slice's value at σ in USDC: rounded up for the reserve (the pool's own value), down for a bid's price.
+    /// @dev The slice's value at σ in settlement token: rounded up for the reserve (the pool's own value), down for a bid's price.
     function _price(Ctx memory c, uint256 sigma, bool up) internal pure returns (uint256) {
         int256 v = EnginePricing.shapeValue(c.legs, c.s, sigma, c.mv, up);
         if (v <= 0) return 0;
@@ -348,9 +350,9 @@ contract RiskAuction is ReentrancyGuard {
             b.closed = true;
             if (bond == 0) continue;
             if (b.revealed) {
-                vault.unlock(all[i], usdc, bond);
+                vault.unlock(all[i], settlement, bond);
             } else {
-                vault.pay(all[i], usdc, bond, address(pool));
+                vault.pay(all[i], settlement, bond, address(pool));
                 emit Forfeited(lotId, all[i], bond, "not revealed");
             }
         }

@@ -11,14 +11,16 @@ import {MakerVault} from "../src/MakerVault.sol";
 import {MatchBook} from "../src/MatchBook.sol";
 import {OpenBook, IEngineOpenFor} from "../src/OpenBook.sol";
 import {IEngineConfig} from "../src/WriterBook.sol";
-import {MockWHYPE} from "./mocks/MockWHYPE.sol";
+import {MockStockToken} from "./mocks/MockStockToken.sol";
+import {CoverFixture} from "./mocks/CoverFixture.sol";
+import {CoveringAssets} from "../src/CoveringAssets.sol";
 import {AgentRouter, IAgentOpenBook, IAgentEngine, IAgentBook} from "../src/AgentRouter.sol";
 import {IMarkRouter, IVolSource} from "../src/PathFundingBook.sol";
 
 /// M7 step 7: AgentRouter (G12, G13, G15, G16) on the full stack: owner-signed mandates, routed agent buys, per-owner
 /// sub-accounts, agent sells within the mandate, the owner's sell always (law 3).
 abstract contract AgentRouterBase is MainspringPoolBase {
-    MockWHYPE whype;
+    MockStockToken stock;
     MakerVault vault;
     MatchBook mb;
     VolQuoteBook qb;
@@ -35,8 +37,8 @@ abstract contract AgentRouterBase is MainspringPoolBase {
     function setUp() public virtual override {
         super.setUp();
         _seed(5_000_000e6);
-        whype = new MockWHYPE();
-        vault = new MakerVault(address(this), IERC20(address(usdc)), IERC20(address(whype)));
+        stock = new MockStockToken("Mock Stock One", "STK1", 18);
+        vault = new MakerVault(address(this), IERC20(address(settlement)), CoverFixture.listed(address(this), address(marks), IERC20(address(stock))));
         mb = new MatchBook(address(this), book, IEngineConfig(address(engine)), vault, marks, vols);
         address obAt = vm.computeCreateAddress(address(this), vm.getNonce(address(this)) + 1);
         qb = new VolQuoteBook(obAt);
@@ -51,7 +53,7 @@ abstract contract AgentRouterBase is MainspringPoolBase {
             IAgentOpenBook(address(ob)),
             IAgentEngine(address(engine)),
             IAgentBook(address(book)),
-            IERC20(address(usdc)),
+            IERC20(address(settlement)),
             IMarkRouter(address(marks)),
             IVolSource(address(vols))
         );
@@ -60,14 +62,14 @@ abstract contract AgentRouterBase is MainspringPoolBase {
         (maker, makerPk) = makeAddrAndKey("maker");
         address[2] memory os = [owner, owner2];
         for (uint256 i; i < 2; ++i) {
-            usdc.mint(os[i], 1_000_000e6);
+            settlement.mint(os[i], 1_000_000e6);
             vm.prank(os[i]);
-            usdc.approve(address(ar), type(uint256).max);
+            settlement.approve(address(ar), type(uint256).max);
         }
-        usdc.mint(maker, 50_000_000e6);
+        settlement.mint(maker, 50_000_000e6);
         vm.startPrank(maker);
-        usdc.approve(address(vault), type(uint256).max);
-        vault.deposit(IERC20(address(usdc)), 10_000_000e6);
+        settlement.approve(address(vault), type(uint256).max);
+        vault.deposit(IERC20(address(settlement)), 10_000_000e6);
         vm.stopPrank();
     }
 
@@ -129,11 +131,11 @@ contract AgentRouterTest is AgentRouterBase {
     function test_agentBuysForTheOwnerWhoPaysExactlyTheRoutedCost() public {
         AgentRouter.Mandate memory m = _mandate(owner);
         bytes memory sig = _sign(m, ownerPk);
-        uint256 before = usdc.balanceOf(owner);
+        uint256 before = settlement.balanceOf(owner);
         (uint256 id, uint256 raw, uint256 cost) = _agentBuy(m, sig, _args(_spread(), 2e18, 20_000e6));
         assertGt(cost, 0);
-        assertEq(before - usdc.balanceOf(owner), cost, "the owner pays the routed cost and the rest comes back");
-        assertEq(usdc.balanceOf(address(ar)), 0, "the router keeps no USDC");
+        assertEq(before - settlement.balanceOf(owner), cost, "the owner pays the routed cost and the rest comes back");
+        assertEq(settlement.balanceOf(address(ar)), 0, "the router keeps no USDC");
         assertEq(ar.rawOf(owner, id), raw);
         assertEq(ar.totalRaw(id), raw);
         assertEq(book.balanceOf(id, address(ar)), raw, "the router holds exactly the sub-accounts");
@@ -282,11 +284,11 @@ contract AgentRouterTest is AgentRouterBase {
         vm.prank(AGENT);
         vm.expectRevert(abi.encodeWithSelector(AgentRouter.NothingHeld.selector, id));
         ar.agentSell(c, csig, id, 1e18, 0, nowT); // c opened nothing
-        uint256 ownerBefore = usdc.balanceOf(owner);
+        uint256 ownerBefore = settlement.balanceOf(owner);
         vm.prank(AGENT);
         (uint256 sold, uint256 net) = ar.agentSell(m, sig, id, 1e18, 0, nowT);
         assertGt(net, 0);
-        assertEq(usdc.balanceOf(owner) - ownerBefore, net, "proceeds go to the owner");
+        assertEq(settlement.balanceOf(owner) - ownerBefore, net, "proceeds go to the owner");
         assertEq(ar.rawOf(owner, id), ar.mandateRaw(ar.hashMandate(m), id));
         assertLt(ar.rawOf(owner, id), raw + raw);
         assertGt(sold, 0);
@@ -306,10 +308,10 @@ contract AgentRouterTest is AgentRouterBase {
         // the owner is not: even with buys paused
         engine.grantRole(engine.PAUSER_ROLE(), address(this));
         engine.pauseBuys();
-        uint256 before = usdc.balanceOf(owner);
+        uint256 before = settlement.balanceOf(owner);
         vm.prank(owner);
         (, uint256 net) = ar.ownerSell(id, type(uint256).max, 0, nowT);
-        assertEq(usdc.balanceOf(owner) - before, net);
+        assertEq(settlement.balanceOf(owner) - before, net);
         assertEq(ar.rawOf(owner, id), 0);
     }
 
@@ -353,14 +355,14 @@ contract AgentRouterTest is AgentRouterBase {
         units = bound(units, 1e17, 5e18);
         move = bound(move, 50_000, 95_000);
         AgentRouter.Mandate memory m = _mandate(owner);
-        uint256 before = usdc.balanceOf(owner);
+        uint256 before = settlement.balanceOf(owner);
         (uint256 id,, uint256 cost) = _agentBuy(m, _sign(m, ownerPk), _args(_spread(), units, 20_000e6));
         marks.set(BTC, move * 1e18);
         _set(nowT + 1 hours);
         book.record(BTC, move * 1e18, 4500);
         vm.prank(owner);
         ar.ownerSell(id, type(uint256).max, 0, nowT);
-        uint256 afterBal = usdc.balanceOf(owner);
+        uint256 afterBal = settlement.balanceOf(owner);
         assertGe(afterBal + cost, before, "never more than the cost");
     }
 }

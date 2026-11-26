@@ -3,13 +3,15 @@ pragma solidity 0.8.28;
 
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
-import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 import {PathFundingBook, IMarkRouter, IVolSource} from "./PathFundingBook.sol";
 import {TempoBlend} from "./TempoBlend.sol";
 import {TempoMath} from "./TempoMath.sol";
 import {EnginePricing} from "./EnginePricing.sol";
 import {StrategyMath} from "./StrategyMath.sol";
+import {ICoveringAssets} from "./CoveringAssets.sol";
+import {CoverLedger, ICoverOutage} from "./CoverLedger.sol";
+import {ShapeQuote} from "./ShapeQuote.sol";
 import {MakerVault} from "./MakerVault.sol";
 import {IEngineConfig} from "./WriterBook.sol";
 
@@ -34,29 +36,33 @@ interface IMatchPool {
 ///         with M4's exact collateral (law 4). Matched writes are aggregated per (source, series); a source is one maker
 ///         (its MakerVault account) or one writer offer (collateral held here). A series holds at most 8 sources.
 /// @dev    - `match` / `fillOffer` (router only) lock the exact worst case × units: StrategyMath on the writer's side of
-///           the series' legs; on HYPE a maker's net short calls are covered with WHYPE from its vault.
+///           the series' legs; on a tokenized-stock market a maker's net short calls are covered with that stock from
+///           its vault (CoveringAssets: a stock covers Rises on its own market only).
 ///         - `buyback` (pool only, on every sell): the matched raw closed is min(raw sold, matched raw), pro rata across
 ///           every source on the series; each pays the pool the seller's gross per raw (rounded up) from the collateral
-///           released for those units (USDC, then WHYPE at the sell's mark); the rest returns to the source. Backstop: a
-///           shortfall is slashed from the maker's free vault funds, then left to the pool; the source is flagged and its
+///           released for those units (settlement token, then the cover at the sell's mark); the rest goes back to the source. Backstop: a
+///           shortfall is slashed from the maker's free vault balance, then left to the pool; the source is flagged and its
 ///           remaining raw on the series is reported uncovered (the pool counts it in coverage from then on). A shortfall
-///           of at most `DUST` (1 micro-USDC) per source is rounding: the pool absorbs it, nothing is flagged.
+///           of at most `DUST` (1 micro-settlement token) per source is rounding: the pool absorbs it, nothing is flagged.
 ///           The raw closed is exactly min(raw sold, matched raw): pro rata rounded down, the few wei left closed from the
 ///           first source that holds them.
-///         - `claim`: collateral above units now (raw × the series' factor) × worst case returns to the source.
+///         - `claim`: collateral above units now (raw × the series' factor) × worst case goes back to the source.
 ///         - `earlyClose` (D3): the source buys back at the pool's ask, capped at its collateral; the pool may refuse.
 ///         - Writer offers (D9): `postOffer` locks collateral for `maxUnits` here (plus a few micro-units of slack for
-///           per-fill rounding); fills consume it; `cancelOffer` returns the rest.
-contract MatchBook is ReentrancyGuard {
+///           per-fill rounding); fills consume it; `cancelOffer` sends back the rest.
+///         - Covering tokens (owner D3): a covering token that cannot move during a buyback, a claim, a close or a cancel
+///           stays owed (here or in the vault; anyone settles it once transfers work), and opens on that market pause.
+///           settlement token payments and the buyer's sell go on (law 3).
+contract MatchBook is CoverLedger {
     using SafeERC20 for IERC20;
 
     uint256 internal constant WAD = 1e18;
-    uint256 internal constant WAD_PER_USDC_UNIT = 1e12;
+    uint256 internal constant WAD_PER_SETTLEMENT_UNIT = 1e12;
     uint256 public constant MAX_SOURCES = 8;
     uint256 public constant MAX_OFFER_FILLS = 64; // per offer; each fill may round its lock up by one smallest unit
     uint8 public constant KIND_MAKER = 1;
     uint8 public constant KIND_OFFER = 2;
-    uint256 public constant DUST = 1; // USDC units: a buyback shortfall up to this per source is rounding, not a default
+    uint256 public constant DUST = 1; // settlement token units: a buyback shortfall up to this per source is rounding, not a default
 
     struct Source {
         uint8 kind;
@@ -66,10 +72,10 @@ contract MatchBook is ReentrancyGuard {
 
     struct Entry {
         uint256 raw;
-        uint256 usdcPerUnit; // WAD USDC per unit
-        uint256 coverPerUnit; // WAD WHYPE per unit
-        uint256 usdcLocked; // USDC (6 decimals)
-        uint256 whypeLocked; // WHYPE (18 decimals)
+        uint256 settlementPerUnit; // WAD settlement token per unit
+        uint256 coverPerUnit; // WAD covering units (of the stock) per unit
+        uint256 settlementLocked; // settlement token (6 decimals)
+        uint256 coverLocked; // the market's covering token, in its own units
         bool flagged; // a buyback fell short: its raw is uncovered
     }
 
@@ -84,10 +90,10 @@ contract MatchBook is ReentrancyGuard {
         bool closed;
         uint128 maxUnits;
         uint128 filled;
-        uint256 usdcPerUnit;
+        uint256 settlementPerUnit;
         uint256 coverPerUnit;
-        uint256 usdcEscrow;
-        uint256 whypeEscrow;
+        uint256 settlementEscrow;
+        uint256 coverEscrow;
     }
 
     PathFundingBook public immutable book;
@@ -95,8 +101,8 @@ contract MatchBook is ReentrancyGuard {
     MakerVault public immutable vault;
     IMarkRouter public immutable marks;
     IVolSource public immutable vols;
-    IERC20 public immutable usdc;
-    IERC20 public immutable whype;
+    IERC20 public immutable settlement;
+    ICoveringAssets public immutable covers;
     address public immutable admin;
 
     address public router; // set once
@@ -112,28 +118,29 @@ contract MatchBook is ReentrancyGuard {
     mapping(uint256 => StrategyMath.Leg[]) internal _offerLegs; // the writer's side
     mapping(uint256 => TempoBlend.Part[]) internal _offerMovement;
     uint256 public nextOfferId = 1;
-    uint256 public heldUsdc; // USDC this contract holds for offers (escrow + offer entries)
-    uint256 public heldWhype;
+    uint256 public heldSettlement; // settlement token this contract holds for offers (escrow + offer entries)
+    mapping(IERC20 => uint256) public heldCover; // covering tokens held for offers, per token
+    mapping(uint256 => bytes32) public seriesMarket; // set at a series' first match
 
     event Matched(
         bytes32 indexed key,
         uint256 indexed seriesId,
         uint256 units,
         uint256 raw,
-        uint256 usdcLocked,
-        uint256 whypeLocked
+        uint256 settlementLocked,
+        uint256 coverLocked
     );
     event BoughtBack(
         bytes32 indexed key,
         uint256 indexed seriesId,
         uint256 raw,
-        uint256 paidUsdc,
-        uint256 paidWhype,
+        uint256 paidSettlement,
+        uint256 paidCover,
         uint256 shortfall
     );
     event Flagged(bytes32 indexed key, uint256 indexed seriesId, uint256 uncoveredRaw);
-    event DustAbsorbed(bytes32 indexed key, uint256 indexed seriesId, uint256 usdc);
-    event Claimed(bytes32 indexed key, uint256 indexed seriesId, uint256 usdcReleased, uint256 whypeReleased);
+    event DustAbsorbed(bytes32 indexed key, uint256 indexed seriesId, uint256 settlement);
+    event Claimed(bytes32 indexed key, uint256 indexed seriesId, uint256 settlementReleased, uint256 coverReleased);
     event EarlyClosed(
         bytes32 indexed key, uint256 indexed seriesId, uint256 raw, uint256 units, int256 cost, uint256 fee
     );
@@ -146,7 +153,7 @@ contract MatchBook is ReentrancyGuard {
         uint64 validUntil
     );
     event OfferFilled(uint256 indexed offerId, uint256 units, uint256 raw);
-    event OfferCancelled(uint256 indexed offerId, uint256 usdcReturned, uint256 whypeReturned);
+    event OfferCancelled(uint256 indexed offerId, uint256 settlementReturned, uint256 coverReturned);
     event RoleSet(string role, address who);
 
     error ZeroAddress();
@@ -185,8 +192,8 @@ contract MatchBook is ReentrancyGuard {
         vault = vault_;
         marks = marks_;
         vols = vols_;
-        usdc = vault_.usdc();
-        whype = vault_.whype();
+        settlement = vault_.settlement();
+        covers = vault_.covers();
     }
 
     modifier onlyRouter() {
@@ -211,13 +218,17 @@ contract MatchBook is ReentrancyGuard {
         key = keccak256(abi.encode(KIND_MAKER, maker, uint256(0)));
         if (sources[key].kind == 0) sources[key] = Source(KIND_MAKER, maker, 0);
         (bytes32 market, StrategyMath.Leg[] memory wLegs) = _writerTerms(seriesId);
-        uint256 cover = market == StrategyMath.COVER_MARKET ? _netShortCalls(wLegs) : 0;
-        uint256 perUnit = StrategyMath.writerCollateral(market, wLegs, int256(cover));
-        uint256 u = _usdcFor(units, perUnit);
-        uint256 h = Math.mulDiv(units, cover, WAD, Math.Rounding.Ceil);
-        _add(key, seriesId, raw, perUnit, cover, u, h);
-        if (u > 0) vault.lock(maker, usdc, u);
-        if (h > 0) vault.lock(maker, whype, h);
+        (IERC20 t, uint256 scale) = covers.coverOf(market);
+        uint256 cover = address(t) != address(0) ? _netShortCalls(wLegs) : 0;
+        uint256 perUnit = StrategyMath.writerCollateral(address(t) != address(0), wLegs, int256(cover));
+        uint256 u = _settlementFor(units, perUnit);
+        uint256 h = _coverFor(units, cover, scale);
+        _add(key, seriesId, market, raw, perUnit, cover, u, h);
+        if (u > 0) vault.lock(maker, settlement, u);
+        if (h > 0) {
+            covers.checkCover(market, address(vault), pool, h);
+            vault.lock(maker, t, h);
+        }
         emit Matched(key, seriesId, units, raw, u, h);
     }
 
@@ -234,26 +245,35 @@ contract MatchBook is ReentrancyGuard {
         if (seriesId != o.seriesId) revert OfferSeries(offerId, seriesId);
         uint256 left = o.maxUnits - o.filled;
         if (units > left || o.fills >= MAX_OFFER_FILLS) revert OfferTooSmall(offerId, left);
-        uint256 u = _usdcFor(units, o.usdcPerUnit);
-        uint256 h = Math.mulDiv(units, o.coverPerUnit, WAD, Math.Rounding.Ceil);
-        o.usdcEscrow -= u; // the slack posted with the offer covers per-fill rounding
-        o.whypeEscrow -= h;
+        uint256 u = _settlementFor(units, o.settlementPerUnit);
+        (, uint256 scale) = covers.coverOf(o.market);
+        uint256 h = _coverFor(units, o.coverPerUnit, scale);
+        o.settlementEscrow -= u; // the slack posted with the offer covers per-fill rounding
+        o.coverEscrow -= h;
         o.filled += uint128(units);
         o.fills += 1;
         key = keccak256(abi.encode(KIND_OFFER, o.writer, offerId));
         if (sources[key].kind == 0) sources[key] = Source(KIND_OFFER, o.writer, offerId);
-        _add(key, seriesId, raw, o.usdcPerUnit, o.coverPerUnit, u, h);
+        _add(key, seriesId, o.market, raw, o.settlementPerUnit, o.coverPerUnit, u, h);
         emit OfferFilled(offerId, units, raw);
         emit Matched(key, seriesId, units, raw, u, h);
         return (key, o.sigmaBps);
     }
 
-    function _add(bytes32 key, uint256 seriesId, uint256 raw, uint256 perUnit, uint256 cover, uint256 u, uint256 h)
-        internal
-    {
+    function _add(
+        bytes32 key,
+        uint256 seriesId,
+        bytes32 market,
+        uint256 raw,
+        uint256 perUnit,
+        uint256 cover,
+        uint256 u,
+        uint256 h
+    ) internal {
         Entry storage e = entries[key][seriesId];
         if (e.flagged) revert SourceFlagged(key);
-        if (e.raw == 0 && e.usdcLocked == 0 && e.whypeLocked == 0) {
+        if (seriesMarket[seriesId] == bytes32(0)) seriesMarket[seriesId] = market;
+        if (e.raw == 0 && e.settlementLocked == 0 && e.coverLocked == 0) {
             bytes32[] storage list = _seriesSources[seriesId];
             bool listed;
             for (uint256 i; i < list.length; ++i) {
@@ -265,10 +285,10 @@ contract MatchBook is ReentrancyGuard {
             }
         }
         e.raw += raw;
-        e.usdcPerUnit = perUnit;
+        e.settlementPerUnit = perUnit;
         e.coverPerUnit = cover;
-        e.usdcLocked += u;
-        e.whypeLocked += h;
+        e.settlementLocked += u;
+        e.coverLocked += h;
         matchedRaw[seriesId] += raw;
     }
 
@@ -276,25 +296,35 @@ contract MatchBook is ReentrancyGuard {
 
     struct Closing {
         uint256 rawSold;
-        uint256 gross; // USDC the pool paid the seller for rawSold
+        uint256 gross; // settlement token the pool paid the seller for rawSold
         uint256 sWad;
         uint256 closeTotal;
         uint256 total;
         bool all;
     }
 
-    /// @notice On a sell of `rawSold` (the pool paid `gross` USDC at mark `sWad`): closes min(rawSold, matched raw)
+    /// @dev The covering token of the series being settled, and whether any of it could not move.
+    struct Cov {
+        bytes32 market;
+        IERC20 token;
+        uint256 scale;
+        bool stuck;
+    }
+
+    /// @notice On a sell of `rawSold` (the pool paid `gross` settlement token at mark `sWad`): closes min(rawSold, matched raw)
     ///         pro rata across every source on the series, each paying the pool the seller's gross per raw.
-    /// @return paidUsdc   USDC paid to the pool.
-    /// @return paidWhype  WHYPE paid to the pool (valued at `sWad`).
-    /// @return shortfall  USDC the sources could not pay (the pool absorbs it).
+    /// @return paidSettlement   settlement token paid to the pool.
+    /// @return paidCover  covering tokens paid to the pool (own units, valued at `sWad`); a part that could not move is
+    ///                    owed to the pool and settles later.
+    /// @return shortfall  settlement token the sources could not pay (the pool absorbs it).
     function buyback(uint256 seriesId, uint256 rawSold, uint256 gross, uint256 sWad)
         external
         nonReentrant
         onlyPool
-        returns (uint256 paidUsdc, uint256 paidWhype, uint256 shortfall)
+        returns (uint256 paidSettlement, uint256 paidCover, uint256 shortfall)
     {
         Closing memory c = Closing(rawSold, gross, sWad, 0, matchedRaw[seriesId], false);
+        Cov memory cv = _cov(seriesId);
         if (c.total == 0 || rawSold == 0) return (0, 0, 0);
         c.all = rawSold >= c.total;
         c.closeTotal = c.all ? c.total : rawSold;
@@ -317,32 +347,33 @@ contract MatchBook is ReentrancyGuard {
                 }
                 if (rc == 0) continue;
                 closed += rc;
-                (uint256 pu, uint256 ph, uint256 sf) = _closeRaw(key, seriesId, rc, c);
-                paidUsdc += pu;
-                paidWhype += ph;
+                (uint256 pu, uint256 ph, uint256 sf) = _closeRaw(key, seriesId, rc, c, cv);
+                paidSettlement += pu;
+                paidCover += ph;
                 shortfall += sf;
-                if (e.raw == 0 && e.usdcLocked == 0 && e.whypeLocked == 0) {
+                if (e.raw == 0 && e.settlementLocked == 0 && e.coverLocked == 0) {
                     list[i - 1] = list[list.length - 1];
                     list.pop();
                 }
             }
             if (c.all) break;
         }
+        if (cv.stuck) ICoverOutage(pool).onCoverStuck(cv.market);
     }
 
-    function _closeRaw(bytes32 key, uint256 seriesId, uint256 rc, Closing memory c)
+    function _closeRaw(bytes32 key, uint256 seriesId, uint256 rc, Closing memory c, Cov memory cv)
         internal
         returns (uint256 pu, uint256 ph, uint256 sf)
     {
         Entry storage e = entries[key][seriesId];
         uint256 due = Math.mulDiv(c.gross, rc, c.rawSold, Math.Rounding.Ceil);
-        uint256 partU = rc == e.raw ? e.usdcLocked : Math.mulDiv(e.usdcLocked, rc, e.raw);
-        uint256 partH = rc == e.raw ? e.whypeLocked : Math.mulDiv(e.whypeLocked, rc, e.raw);
+        uint256 partU = rc == e.raw ? e.settlementLocked : Math.mulDiv(e.settlementLocked, rc, e.raw);
+        uint256 partH = rc == e.raw ? e.coverLocked : Math.mulDiv(e.coverLocked, rc, e.raw);
         e.raw -= rc;
-        e.usdcLocked -= partU;
-        e.whypeLocked -= partH;
+        e.settlementLocked -= partU;
+        e.coverLocked -= partH;
         matchedRaw[seriesId] -= rc;
-        (pu, ph, sf) = _settle(sources[key], partU, partH, due, c.sWad, pool);
+        (pu, ph, sf) = _settle(sources[key], partU, partH, due, c.sWad, pool, cv);
         if (sf > 0 && sf <= DUST) {
             // rounding (the source's due rounds up, its released collateral down): the pool absorbs it (owner, M6 step 7)
             emit DustAbsorbed(key, seriesId, sf);
@@ -356,75 +387,88 @@ contract MatchBook is ReentrancyGuard {
         emit BoughtBack(key, seriesId, rc, pu, ph, sf);
     }
 
-    /// @dev Pays `due` USDC to `to` from the released collateral (USDC, then WHYPE at `sWad`), returns the rest to the
-    ///      source, and for a maker slashes free vault funds for any shortfall (USDC, then WHYPE).
-    function _settle(Source memory src, uint256 partU, uint256 partH, uint256 due, uint256 sWad, address to)
-        internal
-        returns (uint256 pu, uint256 ph, uint256 left)
-    {
+    /// @dev Pays `due` settlement token to `to` from the released collateral (settlement token, then the cover at `sWad`), sends the rest back to
+    ///      the source, and for a maker slashes free vault balance for any shortfall (settlement token, then cover). Cover that cannot
+    ///      move is kept owed and marks `cv.stuck`.
+    function _settle(
+        Source memory src,
+        uint256 partU,
+        uint256 partH,
+        uint256 due,
+        uint256 sWad,
+        address to,
+        Cov memory cv
+    ) internal returns (uint256 pu, uint256 ph, uint256 left) {
         pu = due < partU ? due : partU;
         left = due - pu;
         if (left > 0 && partH > 0) {
-            ph = _usdcToWhype(left, sWad);
+            ph = _settlementToCover(left, cv.scale, sWad);
             if (ph > partH) ph = partH;
-            uint256 covered = _whypeToUsdc(ph, sWad);
+            uint256 covered = _coverToSettlement(ph, cv.scale, sWad);
             left = covered >= left ? 0 : left - covered;
         }
-        _move(src, usdc, pu, partU - pu, to);
-        _move(src, whype, ph, partH - ph, to);
+        _move(src, settlement, pu, partU - pu, to);
+        if (!_move(src, cv.token, ph, partH - ph, to)) cv.stuck = true;
         if (left > 0 && src.kind == KIND_MAKER) {
-            uint256 takenU = vault.slash(src.owner, usdc, left, to);
+            (uint256 takenU,) = vault.slash(src.owner, settlement, left, to);
             pu += takenU;
             left -= takenU;
-            if (left > 0) {
-                uint256 takenH = vault.slash(src.owner, whype, _usdcToWhype(left, sWad), to);
+            if (left > 0 && address(cv.token) != address(0)) {
+                (uint256 takenH, bool sent) = vault.slash(src.owner, cv.token, _settlementToCover(left, cv.scale, sWad), to);
+                if (!sent) cv.stuck = true;
                 ph += takenH;
-                uint256 covered = _whypeToUsdc(takenH, sWad);
+                uint256 covered = _coverToSettlement(takenH, cv.scale, sWad);
                 left = covered >= left ? 0 : left - covered;
             }
         }
     }
 
-    /// @dev Pays `pay` of `token` to `to` and returns `rest` to the source: a maker's from its vault (pay / unlock), an
-    ///      offer's from here (to the pool / to the writer).
-    function _move(Source memory src, IERC20 token, uint256 pay, uint256 rest, address to) internal {
+    /// @dev Pays `pay` of `token` to `to` and sends `rest` back to the source: a maker's from its vault (pay / unlock), an
+    ///      offer's from here (to the pool / to the writer). False when a covering token could not move (kept owed).
+    function _move(Source memory src, IERC20 token, uint256 pay, uint256 rest, address to) internal returns (bool ok) {
+        ok = true;
+        if (pay == 0 && rest == 0) return true;
         if (src.kind == KIND_MAKER) {
-            if (pay > 0) vault.pay(src.owner, token, pay, to);
+            if (pay > 0) ok = vault.pay(src.owner, token, pay, to);
             if (rest > 0) vault.unlock(src.owner, token, rest);
-        } else {
-            if (token == usdc) heldUsdc -= pay + rest;
-            else heldWhype -= pay + rest;
+        } else if (token == settlement) {
+            heldSettlement -= pay + rest;
             if (pay > 0) token.safeTransfer(to, pay);
             if (rest > 0) token.safeTransfer(src.owner, rest);
+        } else {
+            heldCover[token] -= pay + rest;
+            ok = _sendCover(token, to, pay);
+            ok = _sendCover(token, src.owner, rest) && ok;
         }
     }
 
     // ---------------------------------------------------------------- claims
 
-    /// @notice Returns the collateral no longer required as the series decays (the funding received) to the source.
-    function claim(bytes32 key, uint256 seriesId) external nonReentrant returns (uint256 usdcOut, uint256 whypeOut) {
+    /// @notice Sends back the collateral no longer required as the series decays (the funding received) to the source.
+    function claim(bytes32 key, uint256 seriesId) external nonReentrant returns (uint256 settlementOut, uint256 coverOut) {
         Source memory src = sources[key];
         if (msg.sender != src.owner) revert NotOwner();
         Entry storage e = entries[key][seriesId];
         (uint256 reqU, uint256 reqH) = required(key, seriesId);
-        if (e.usdcLocked > reqU) usdcOut = e.usdcLocked - reqU;
-        if (e.whypeLocked > reqH) whypeOut = e.whypeLocked - reqH;
-        e.usdcLocked -= usdcOut;
-        e.whypeLocked -= whypeOut;
-        emit Claimed(key, seriesId, usdcOut, whypeOut);
-        _move(src, usdc, 0, usdcOut, address(0));
-        _move(src, whype, 0, whypeOut, address(0));
+        if (e.settlementLocked > reqU) settlementOut = e.settlementLocked - reqU;
+        if (e.coverLocked > reqH) coverOut = e.coverLocked - reqH;
+        e.settlementLocked -= settlementOut;
+        e.coverLocked -= coverOut;
+        emit Claimed(key, seriesId, settlementOut, coverOut);
+        _move(src, settlement, 0, settlementOut, address(0));
+        Cov memory cv = _cov(seriesId);
+        if (!_move(src, cv.token, 0, coverOut, address(0))) ICoverOutage(pool).onCoverStuck(cv.market);
     }
 
     /// @notice The collateral an entry requires now: units now (raw × the series' factor, rounded up) × per unit.
-    function required(bytes32 key, uint256 seriesId) public view returns (uint256 usdcReq, uint256 whypeReq) {
+    function required(bytes32 key, uint256 seriesId) public view returns (uint256 settlementReq, uint256 coverReq) {
         Entry storage e = entries[key][seriesId];
         if (e.raw == 0) return (0, 0);
         uint256 unitsNow = Math.mulDiv(e.raw, book.normNow(seriesId), WAD, Math.Rounding.Ceil);
-        usdcReq = _usdcFor(unitsNow, e.usdcPerUnit);
-        whypeReq = Math.mulDiv(unitsNow, e.coverPerUnit, WAD, Math.Rounding.Ceil);
-        if (usdcReq > e.usdcLocked) usdcReq = e.usdcLocked;
-        if (whypeReq > e.whypeLocked) whypeReq = e.whypeLocked;
+        settlementReq = _settlementFor(unitsNow, e.settlementPerUnit);
+        if (e.coverPerUnit > 0) coverReq = _coverFor(unitsNow, e.coverPerUnit, _cov(seriesId).scale);
+        if (settlementReq > e.settlementLocked) settlementReq = e.settlementLocked;
+        if (coverReq > e.coverLocked) coverReq = e.coverLocked;
     }
 
     // ---------------------------------------------------------------- early close (D3)
@@ -461,12 +505,14 @@ contract MatchBook is ReentrancyGuard {
         _quoteClose(seriesId, e, c);
         if (c.cost > maxCost) revert CostAboveMax(c.cost, maxCost);
         e.raw -= c.raw;
-        e.usdcLocked -= c.partU;
-        e.whypeLocked -= c.partH;
+        e.settlementLocked -= c.partU;
+        e.coverLocked -= c.partH;
         matchedRaw[seriesId] -= c.raw;
         uint256 due = c.cost > 0 ? uint256(c.cost) : 0;
-        (,, uint256 left) = _settle(src, c.partU, c.partH, due, c.s, pool);
+        Cov memory cv = _cov(seriesId);
+        (,, uint256 left) = _settle(src, c.partU, c.partH, due, c.s, pool, cv);
         if (left > 0) revert CostAboveMax(c.cost, maxCost); // unreachable: the cost is capped at the collateral
+        if (cv.stuck) ICoverOutage(pool).onCoverStuck(cv.market);
         IMatchPool(pool).onEarlyClose(c.market, seriesId, c.raw, c.units, c.s, c.sigma, c.cost, c.fee, src.owner);
         emit EarlyClosed(key, seriesId, c.raw, c.units, c.cost, c.fee);
         return (c.units, c.cost);
@@ -478,12 +524,11 @@ contract MatchBook is ReentrancyGuard {
         (c.market, poolLegs, mv) = _holderTerms(seriesId);
         (c.s, c.sigma) = _inputs(c.market);
         (, uint16 spreadBps,) = engine.markets(c.market);
-        int256 v = EnginePricing.shapeValue(poolLegs, c.s, c.sigma, mv, true);
-        (c.cost, c.fee) = EnginePricing.shapeUnwriteQuote(v, c.units, poolLegs, c.s, spreadBps);
+        (c.cost, c.fee) = ShapeQuote.unwriteQuote(poolLegs, c.s, c.sigma, mv, c.units, spreadBps);
         bool all = c.raw == e.raw;
-        c.partU = all ? e.usdcLocked : Math.mulDiv(e.usdcLocked, c.raw, e.raw);
-        c.partH = all ? e.whypeLocked : Math.mulDiv(e.whypeLocked, c.raw, e.raw);
-        uint256 cap = c.partU + _whypeToUsdc(c.partH, c.s);
+        c.partU = all ? e.settlementLocked : Math.mulDiv(e.settlementLocked, c.raw, e.raw);
+        c.partH = all ? e.coverLocked : Math.mulDiv(e.coverLocked, c.raw, e.raw);
+        uint256 cap = c.partU + _coverToSettlement(c.partH, _cov(seriesId).scale, c.s);
         if (c.cost > int256(cap)) c.cost = int256(cap);
     }
 
@@ -507,9 +552,10 @@ contract MatchBook is ReentrancyGuard {
             maxUnits == 0 || validUntil < block.timestamp || sigmaBps < TempoMath.DEFAULT_MIN_SIGMA_BPS
                 || sigmaBps > TempoMath.DEFAULT_MAX_SIGMA_BPS
         ) revert BadOffer();
+        (IERC20 t, uint256 scale) = covers.coverOf(market);
         uint256 cover = useCover ? _netShortCallsCd(legs) : 0;
         if (useCover && cover == 0) revert BadOffer();
-        uint256 perUnit = StrategyMath.writerCollateral(market, legs, int256(cover));
+        uint256 perUnit = StrategyMath.writerCollateral(address(t) != address(0), legs, int256(cover));
         offerId = nextOfferId++;
         Offer storage o = offers[offerId];
         o.writer = msg.sender;
@@ -519,37 +565,44 @@ contract MatchBook is ReentrancyGuard {
         o.validUntil = validUntil;
         o.cover = useCover;
         o.maxUnits = maxUnits;
-        o.usdcPerUnit = perUnit;
+        o.settlementPerUnit = perUnit;
         o.coverPerUnit = cover;
-        o.usdcEscrow = perUnit > 0 ? _usdcFor(maxUnits, perUnit) + MAX_OFFER_FILLS : 0;
-        o.whypeEscrow = cover > 0 ? Math.mulDiv(maxUnits, cover, WAD, Math.Rounding.Ceil) + MAX_OFFER_FILLS : 0;
+        o.settlementEscrow = perUnit > 0 ? _settlementFor(maxUnits, perUnit) + MAX_OFFER_FILLS : 0;
+        o.coverEscrow = cover > 0 ? _coverFor(maxUnits, cover, scale) + MAX_OFFER_FILLS : 0;
         for (uint256 j; j < legs.length; ++j) {
             _offerLegs[offerId].push(legs[j]);
         }
         for (uint256 i; i < movement.length; ++i) {
             _offerMovement[offerId].push(movement[i]);
         }
-        heldUsdc += o.usdcEscrow;
-        heldWhype += o.whypeEscrow;
+        heldSettlement += o.settlementEscrow;
+        if (o.coverEscrow > 0) {
+            heldCover[t] += o.coverEscrow;
+            covers.checkCover(market, msg.sender, address(this), o.coverEscrow);
+            covers.checkCover(market, address(this), pool, o.coverEscrow);
+        }
         emit OfferPosted(offerId, msg.sender, o.seriesId, sigmaBps, maxUnits, validUntil);
-        if (o.usdcEscrow > 0) usdc.safeTransferFrom(msg.sender, address(this), o.usdcEscrow);
-        if (o.whypeEscrow > 0) whype.safeTransferFrom(msg.sender, address(this), o.whypeEscrow);
+        if (o.settlementEscrow > 0) settlement.safeTransferFrom(msg.sender, address(this), o.settlementEscrow);
+        _pullCoverExact(t, msg.sender, o.coverEscrow);
     }
 
-    /// @notice Closes an offer (the writer, any time) and returns its unfilled escrow. Filled parts stay matched.
+    /// @notice Closes an offer (the writer, any time) and sends back its unfilled escrow. Filled parts stay matched.
     function cancelOffer(uint256 offerId) external nonReentrant {
         Offer storage o = offers[offerId];
         if (msg.sender != o.writer) revert NotOwner();
         if (o.closed) revert OfferClosed(offerId);
         o.closed = true;
-        (uint256 u, uint256 h) = (o.usdcEscrow, o.whypeEscrow);
-        o.usdcEscrow = 0;
-        o.whypeEscrow = 0;
-        heldUsdc -= u;
-        heldWhype -= h;
+        (uint256 u, uint256 h) = (o.settlementEscrow, o.coverEscrow);
+        o.settlementEscrow = 0;
+        o.coverEscrow = 0;
+        heldSettlement -= u;
         emit OfferCancelled(offerId, u, h);
-        if (u > 0) usdc.safeTransfer(o.writer, u);
-        if (h > 0) whype.safeTransfer(o.writer, h);
+        if (u > 0) settlement.safeTransfer(o.writer, u);
+        if (h > 0) {
+            (IERC20 t,) = covers.coverOf(o.market);
+            heldCover[t] -= h;
+            if (!_sendCover(t, o.writer, h)) ICoverOutage(pool).onCoverStuck(o.market);
+        }
     }
 
     /// @notice An offer's legs (the writer's side) and movement, for the router.
@@ -654,15 +707,27 @@ contract MatchBook is ReentrancyGuard {
         }
     }
 
-    function _usdcFor(uint256 units, uint256 perUnit) internal pure returns (uint256) {
-        return Math.ceilDiv(Math.mulDiv(units, perUnit, WAD, Math.Rounding.Ceil), WAD_PER_USDC_UNIT);
+    function _settlementFor(uint256 units, uint256 perUnit) internal pure returns (uint256) {
+        return Math.ceilDiv(Math.mulDiv(units, perUnit, WAD, Math.Rounding.Ceil), WAD_PER_SETTLEMENT_UNIT);
     }
 
-    function _whypeToUsdc(uint256 amount, uint256 s) internal pure returns (uint256) {
-        return Math.mulDiv(amount, s, WAD) / WAD_PER_USDC_UNIT;
+    /// @dev The series' market, its covering token and scale (none on a market without cover).
+    function _cov(uint256 seriesId) internal view returns (Cov memory cv) {
+        cv.market = seriesMarket[seriesId];
+        (cv.token, cv.scale) = covers.coverOf(cv.market);
     }
 
-    function _usdcToWhype(uint256 usdcAmount, uint256 s) internal pure returns (uint256) {
-        return Math.mulDiv(usdcAmount * WAD_PER_USDC_UNIT, WAD, s, Math.Rounding.Ceil);
+    /// @dev Covering tokens (own units) for `units` at `perUnit` WAD covering units, rounded up.
+    function _coverFor(uint256 units, uint256 perUnit, uint256 scale) internal pure returns (uint256) {
+        if (perUnit == 0) return 0;
+        return Math.ceilDiv(Math.mulDiv(units, perUnit, WAD, Math.Rounding.Ceil), scale);
+    }
+
+    function _coverToSettlement(uint256 amount, uint256 scale, uint256 s) internal pure returns (uint256) {
+        return Math.mulDiv(amount * scale, s, WAD) / WAD_PER_SETTLEMENT_UNIT;
+    }
+
+    function _settlementToCover(uint256 settlementAmount, uint256 scale, uint256 s) internal pure returns (uint256) {
+        return Math.ceilDiv(Math.mulDiv(settlementAmount * WAD_PER_SETTLEMENT_UNIT, WAD, s, Math.Rounding.Ceil), scale);
     }
 }

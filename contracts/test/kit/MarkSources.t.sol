@@ -9,44 +9,47 @@ pragma solidity 0.8.28;
 ///      the kit's m = 2 of n = 3, steps and heartbeats are kept.
 ///   3. _mark has all three signers vote, with the round number: a key's first round needs all n (our rule),
 ///      and a full round finalises at once without the 30 s window.
-///   4. CoreReadMarkSource.setAsset replaces list.
-///   5. MarkRouter.markWad returns the price only (as in the spec), not (price, updatedAt).
+///   4. NativeMarkSource.setAsset replaces list.
+///   5. MarkRouter.markWad gives the price only (as in the spec), not (price, updatedAt).
 ///   6. Errors carry arguments (NoRoute(market), TooEarly(market, eta), Stale(market, source),
 ///      Disagree(market, primary, secondary)).
 ///   7. test_poke_takes_price_from_router_not_caller: one VOL key per market, volKey(name), voted as a WAD
 ///      fraction (0.5e18 = 50%) by all three signers (first round needs all n); the book takes our
 ///      IMarkRouter / IVolSource types.
+///   8. Robinhood Chain (RH3): the kit's precompile reader becomes NativeMarkSource, which reads an adapter that gives
+///      the price in WAD with its time (the first-party interface is (U)); the mock adapter replaces the mock
+///      precompile, so the raw-units scaling step is gone. The test names keep "core" from the kit.
 ///   Scenarios, prices and the 2% refusal are otherwise unchanged.
 
 import {Test} from "forge-std/Test.sol";
 import {QuorumBoard} from "../../src/QuorumBoard.sol";
 import {IMarkSource} from "../../src/IMarkSource.sol";
 import {QuorumMarkSource} from "../../src/QuorumMarkSource.sol";
-import {CoreReadMarkSource} from "../../src/CoreReadMarkSource.sol";
+import {NativeMarkSource, INativeMarkAdapter} from "../../src/NativeMarkSource.sol";
 import {MarkRouter} from "../../src/MarkRouter.sol";
 import {PathFundingBook, IMarkRouter, IVolSource} from "../../src/PathFundingBook.sol";
 
-contract KitMockCorePx {
-    uint64 public px;
+contract KitMockCorePx is INativeMarkAdapter {
+    uint256 public px;
 
-    function set(uint64 p) external {
+    function set(uint256 p) external {
         px = p;
     }
 
-    fallback(bytes calldata) external returns (bytes memory) {
-        return abi.encode(px);
+    function mark(bytes32) external view returns (uint256, uint256) {
+        return (px, block.timestamp);
     }
 }
 
 contract KitMarkSourcesTest is Test {
     QuorumBoard board;
     QuorumMarkSource qsrc;
-    CoreReadMarkSource csrc;
+    NativeMarkSource csrc;
     MarkRouter router;
     KitMockCorePx core;
     address[] signers;
     bytes32 constant BTC = "BTC";
-    address constant PRECOMPILE = address(0x0000000000000000000000000000000000000807); // placeholder until Elysium publishes
+    address constant PRECOMPILE = address(0x0000000000000000000000000000000000000807); // placeholder until the chain publishes
     uint256 nowT = 1_794_236_400;
 
     function _adv(uint256 dt) internal {
@@ -66,8 +69,8 @@ contract KitMarkSourcesTest is Test {
         KitMockCorePx impl = new KitMockCorePx();
         vm.etch(PRECOMPILE, address(impl).code);
         core = KitMockCorePx(payable(PRECOMPILE));
-        csrc = new CoreReadMarkSource(address(this), PRECOMPILE);
-        csrc.setAsset(BTC, 0, 5); // BTC-style szDecimals 5: raw / 10
+        csrc = new NativeMarkSource(address(this), PRECOMPILE);
+        csrc.setAsset(BTC, keccak256("native:BTC"));
         router = new MarkRouter(address(this), 1 days);
     }
 
@@ -92,7 +95,7 @@ contract KitMarkSourcesTest is Test {
 
     function test_quorum_and_core_sources_agree_in_units() public {
         _mark(93_120e18);
-        core.set(931_200); // 931200 / 10 = 93120.0
+        core.set(93_120e18);
         (uint256 a,) = qsrc.markWad(BTC);
         (uint256 b,) = csrc.markWad(BTC);
         assertEq(a, 93_120e18);
@@ -107,11 +110,11 @@ contract KitMarkSourcesTest is Test {
         router.applyRoute(BTC);
         _adv(1 days);
         router.applyRoute(BTC);
-        core.set(931_200);
+        core.set(93_120e18);
         _mark(93_100e18); // 2 bps apart: fine
         uint256 px = router.markWad(BTC);
         assertEq(px, 93_120e18);
-        core.set(950_000); // 2% apart from the quorum: refused
+        core.set(95_000e18); // 2% apart from the quorum: refused
         vm.expectRevert(abi.encodeWithSelector(MarkRouter.Disagree.selector, BTC, 95_000e18, 93_100e18));
         router.markWad(BTC);
     }

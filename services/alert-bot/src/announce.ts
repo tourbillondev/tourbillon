@@ -27,7 +27,7 @@ export function parseAnnounceArgs(argv: string[]): AnnounceArgs {
 
 export const groupName = (test: boolean) => (test ? "Alert Test group" : "STAFF group");
 
-/// Preview, wording warnings, the typed confirmation, then one send to the chosen group. Returns what happened.
+/// Preview, wording warnings, the typed confirmation, then one send to the chosen group. The result says what happened.
 export async function announce(
   text: string,
   test: boolean,

@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.28;
 
+import {HedgeKeeperGate, IPoolHedgeSwap} from "../src/HedgeKeeperGate.sol";
+import {UniswapV4HedgeRouter, IPoolManagerV4} from "../src/UniswapV4HedgeRouter.sol";
 import {console} from "forge-std/Script.sol";
 import {TimelockController} from "@openzeppelin/contracts/governance/TimelockController.sol";
 import {DeployM6} from "./DeployM6.s.sol";
@@ -33,9 +35,9 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 ///           RECEIPTS_POSTER    the receipts service key (posts hourly roots only)
 ///           PROTOCOL_RECIPIENT receives the protocol's 10% of fees
 ///           SIGNERS            comma-separated quorum signers (at least 3)
-///           TIMELOCK_DELAY     seconds; default 1 h (anvil and the Elysium testnet only; elsewhere ≥ 48 h)
+///           TIMELOCK_DELAY     seconds; default 1 h (anvil and the Robinhood Chain testnet only; elsewhere ≥ 48 h)
 ///           SAFE_SINGLETON, SAFE_FACTORY   existing Safe v1.4.1 contracts (optional)
-///           OPEN_BOOK_CAP_BTC / _ETH / _HYPE  as DeployM6
+///           OPEN_BOOK_CAP_BTC / _ETH / _STK1  as DeployM6
 ///         Writes deployments/<chainId>-m7.json: every key of the M6 file plus Safe, Guardian, Timelock and the Safe
 ///         build and factory. Mainnet is refused by the chain check until the owner says otherwise.
 contract DeployM7 is DeployM6, M1Core {
@@ -57,7 +59,10 @@ contract DeployM7 is DeployM6, M1Core {
         uint256 delay;
         address singleton;
         address factory;
+        IERC20 settlement; // RH7b (D1): SETTLEMENT_TOKEN, the settlement token (USDG on Robinhood Chain)
+        address poolManager; // RH7b (Q4): UNISWAP_V4_POOL_MANAGER; the v4 hedge router is deployed when set
         Caps6 caps;
+        bytes32[] stockMarkets; // listed on the SessionCalendar, MARK keys bound to the session rule
     }
 
     struct Deployed7 {
@@ -66,10 +71,12 @@ contract DeployM7 is DeployM6, M1Core {
         Deployed6 m6;
         ReceiptRoots receipts;
         AgentRouter agents;
+        UniswapV4HedgeRouter hedgeRouter; // RH7b (Q4): set when a v4 PoolManager is given; zero otherwise
+        HedgeKeeperGate hedgeGate; // RH8b (C63): holds the pool's HEDGER_ROLE; the guardian can freeze it
     }
 
     function run() external override(DeployM6) returns (Deployed memory d) {
-        if (block.chainid != ANVIL_ID && block.chainid != ELYSIUM_TESTNET_ID) revert WrongChain(block.chainid);
+        if (block.chainid != ANVIL_ID && block.chainid != ROBINHOOD_TESTNET_ID) revert WrongChain(block.chainid);
         Config7 memory c = config7FromEnv();
         vm.startBroadcast();
         (, address deployer,) = vm.readCallers();
@@ -85,7 +92,7 @@ contract DeployM7 is DeployM6, M1Core {
     }
 
     uint256 internal constant ANVIL_ID = 31337;
-    uint256 internal constant ELYSIUM_TESTNET_ID = 99801;
+    uint256 internal constant ROBINHOOD_TESTNET_ID = 46630; // (U) until probed
 
     function config7FromEnv() public view returns (Config7 memory c) {
         c.safeOwners = vm.envAddress("SAFE_OWNERS", ",");
@@ -98,11 +105,36 @@ contract DeployM7 is DeployM6, M1Core {
         c.singleton = vm.envOr("SAFE_SINGLETON", address(0));
         c.factory = vm.envOr("SAFE_FACTORY", address(0));
         c.caps = capsFromEnv();
+        // the settlement token: required on a real chain (a mock only on anvil, or when MOCK_SETTLEMENT=1 is set for a
+        // testnet rehearsal without the token); its decimals are checked by the adapter, the Engine and the pool
+        c.settlement = IERC20(vm.envOr("SETTLEMENT_TOKEN", address(0)));
+        c.poolManager = vm.envOr("UNISWAP_V4_POOL_MANAGER", address(0));
+        if (address(c.settlement) == address(0) && block.chainid != 31337 && !vm.envOr("MOCK_SETTLEMENT", false)) {
+            revert BadConfig("SETTLEMENT_TOKEN");
+        }
+        // STOCK_MARKETS: comma-separated, default STK1 (the production shape); "none" binds none (local test harnesses,
+        // so a service test does not depend on the time of day; the session rule has its own tests)
+        string memory sm = vm.envOr("STOCK_MARKETS", string("STK1"));
+        if (keccak256(bytes(sm)) == keccak256("none") || bytes(sm).length == 0) {
+            c.stockMarkets = new bytes32[](0);
+        } else {
+            string[] memory names = vm.split(sm, ",");
+            c.stockMarkets = new bytes32[](names.length);
+            for (uint256 i; i < names.length; ++i) {
+                c.stockMarkets[i] = bytes32(bytes(names[i]));
+            }
+        }
     }
 
     function markets7() public pure returns (bytes32[] memory m) {
         m = new bytes32[](3);
-        (m[0], m[1], m[2]) = (bytes32("BTC"), bytes32("ETH"), bytes32("HYPE"));
+        (m[0], m[1], m[2]) = (bytes32("BTC"), bytes32("ETH"), bytes32("STK1"));
+    }
+
+    /// @notice The tokenized-stock markets among markets7: STK1, the placeholder for the launch stocks (owner queue Q2).
+    function stockMarkets7() public pure returns (bytes32[] memory m) {
+        m = new bytes32[](1);
+        m[0] = "STK1";
     }
 
     /// @notice Deploys everything as `deployer`, then hands every role over (see the contract notice).
@@ -124,13 +156,15 @@ contract DeployM7 is DeployM6, M1Core {
         d7.gov.timelock = Governance.deployTimelock(d7.gov.safe, c.delay);
 
         // 2. M1, then M6 on top of it; the EQUITY feed listed while the deployer still administers the board
-        d7.m1 = m1Core(deployer, c.signers, markets7());
+        d7.m1 = m1Core(deployer, c.signers, markets7(), c.stockMarkets, loadCalendar(CALENDAR_FILE));
         Config memory c6;
         c6.admin = address(d7.gov.timelock);
         c6.riskPauser = c.riskPauser;
         c6.protocolRecipient = c.protocolRecipient;
         c6.router = IMarkRouter(address(d7.m1.router));
         c6.board = IVolSource(address(d7.m1.board));
+        c6.calendar = d7.m1.calendar;
+        c6.settlement = c.settlement;
         d7.m6 = deployCore6(c6, c.caps, deployer);
         d7.m1.board.setFeed(d7.m6.m4.m3.pool.equityKey(), 5000, 2 hours);
         // receipts: the timelock administers, the receipts service posts (G10)
@@ -140,10 +174,21 @@ contract DeployM7 is DeployM6, M1Core {
             IAgentOpenBook(address(d7.m6.openBook)),
             IAgentEngine(address(d7.m6.m4.m3.engine)),
             IAgentBook(address(d7.m6.m4.m3.book)),
-            IERC20(address(d7.m6.m4.m3.usdc)),
+            IERC20(address(d7.m6.m4.m3.settlement)),
             IMarkRouter(address(d7.m1.router)),
             IVolSource(address(d7.m1.board))
         );
+
+        // the hedge keeper gate (C63): the only holder of the pool's HEDGER_ROLE, never a key; its hedger key is set
+        // through the timelock later
+        d7.hedgeGate = new HedgeKeeperGate(deployer, IPoolHedgeSwap(address(d7.m6.m4.m3.pool)));
+        d7.m6.m4.m3.pool.grantRole(d7.m6.m4.m3.pool.HEDGER_ROLE(), address(d7.hedgeGate));
+
+        // the stock hedge's swap path (Q4): administered by the timelock from the start; listing its pools, setting it on
+        // the pool and granting the keeper are timelocked steps (RH12, with the real pool addresses)
+        if (c.poolManager != address(0)) {
+            d7.hedgeRouter = new UniswapV4HedgeRouter(address(d7.gov.timelock), IPoolManagerV4(c.poolManager));
+        }
 
         // 3. the handover
         handOver7(d7, c.riskPauser, deployer);
@@ -161,6 +206,9 @@ contract DeployM7 is DeployM6, M1Core {
         d7.m1.board.renounceRole(adminRole, deployer);
         d7.m1.router.grantRole(adminRole, tl);
         d7.m1.router.renounceRole(adminRole, deployer);
+        d7.m1.calendar.grantRole(adminRole, tl);
+        d7.m1.calendar.renounceRole(adminRole, deployer);
+        handOverCovers(d7.m6.m4.covers, tl, deployer); // covering-asset listings go through the timelock (Backend §5)
 
         d.engine.grantRole(d.engine.PAUSER_ROLE(), guardian);
         d.engine.grantRole(d.engine.UNPAUSER_ROLE(), safe);
@@ -178,6 +226,12 @@ contract DeployM7 is DeployM6, M1Core {
         d.pool.renounceRole(d.pool.TREASURER_ROLE(), deployer);
         d.pool.grantRole(adminRole, tl);
         d.pool.renounceRole(adminRole, deployer);
+
+        // the hedge keeper gate: the guardian freezes, the Safe unfreezes, the timelock sets the hedger key
+        d7.hedgeGate.grantRole(d7.hedgeGate.FREEZER_ROLE(), guardian);
+        d7.hedgeGate.grantRole(d7.hedgeGate.UNFREEZER_ROLE(), safe);
+        d7.hedgeGate.grantRole(adminRole, tl);
+        d7.hedgeGate.renounceRole(adminRole, deployer);
     }
 
     function _write7(Config7 memory c, Deployed7 memory d7, address deployer) internal {
@@ -195,14 +249,18 @@ contract DeployM7 is DeployM6, M1Core {
         vm.serializeAddress(k, "riskPauser", c.riskPauser);
         vm.serializeAddress(k, "receiptsPoster", c.receiptsPoster);
         vm.serializeAddress(k, "ReceiptRoots", address(d7.receipts));
+        vm.serializeAddress(k, "HedgeRouterV4", address(d7.hedgeRouter));
+        vm.serializeAddress(k, "HedgeKeeperGate", address(d7.hedgeGate));
         vm.serializeAddress(k, "AgentRouter", address(d7.agents));
         vm.serializeAddress(k, "protocolRecipient", c.protocolRecipient);
         vm.serializeAddress(k, "MarkRouter", address(d7.m1.router));
         vm.serializeAddress(k, "QuorumBoard", address(d7.m1.board));
         vm.serializeAddress(k, "QuorumMarkSource", address(d7.m1.quorumSource));
         vm.serializeUint(k, "routeEta", d7.m1.routeEta);
-        vm.serializeAddress(k, "MockUSDC", address(d.usdc));
-        vm.serializeAddress(k, "MockWHYPE", address(d7.m6.m4.whype));
+        writeSettlement(k, d);
+        vm.serializeAddress(k, "MockStockToken", address(d7.m6.m4.stock));
+        vm.serializeAddress(k, "CoveringAssets", address(d7.m6.m4.covers));
+        vm.serializeAddress(k, "SessionCalendar", address(d7.m1.calendar));
         vm.serializeAddress(k, "MainspringPool", address(d.pool));
         vm.serializeAddress(k, "PathFundingBook", address(d.book));
         vm.serializeAddress(k, "WriterBook", address(d7.m6.m4.writerBook));
@@ -214,7 +272,7 @@ contract DeployM7 is DeployM6, M1Core {
         vm.serializeAddress(k, "RiskAuction", address(d7.m6.auction));
         vm.serializeBytes32(k, "equityKey", d.pool.equityKey());
         string[] memory markets = new string[](3);
-        (markets[0], markets[1], markets[2]) = ("BTC", "ETH", "HYPE");
+        (markets[0], markets[1], markets[2]) = ("BTC", "ETH", "STK1");
         vm.serializeString(k, "markets", markets);
         vm.serializeAddress(k, "signers", c.signers);
         vm.serializeUint(k, "deployBlock", block.number);

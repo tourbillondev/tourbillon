@@ -1,0 +1,34 @@
+Tourbillon Alerts: what each post means (part 2 of 2)
+
+OPEN BOOK AND AUCTION
+🔴 buyback-failed: a buyback from a maker failed; the pool paid the seller and now carries that raw. Who: admin.
+🔴 matched-uncovered: a matched source was flagged and its raw now counts in the pool's stress. Who: admin.
+🟡 buyback-shortfall: a buyback fell short beyond rounding; slashed from the source, then absorbed by the pool. Who: admin.
+🟡 vault-slashed (information): a maker's vault was slashed (a shortfall or a forfeited bond).
+🟡 auction-started / auction-forfeit: a weekly risk auction lot opened, or a bond went to the pool. Who: makers bid.
+🟡 auction-settled (information): a lot settled, with or without a winner.
+🟡 auction-settle-due: a lot's reveal ended an hour ago, unsettled. Who: keeper operator (anyone can settle).
+
+GOVERNANCE
+🟡 timelock-queued: an admin action was queued, with the contract, the call and when it can run. Who: everyone reviews; the Safe can cancel it.
+🟡 timelock-executed / timelock-cancelled (information): a queued action ran, or was cancelled.
+🔴 role-changed: a role was granted or revoked on a governed contract. Who: admin confirms it was announced.
+🟡 paused: opens, a market or deposits were paused, and by whom. Who: the Safe reviews and unpauses when satisfied.
+🟢 unpaused (information): a pause was lifted, and by whom.
+🟡 monitor-error: the risk-monitor's own check failed. Who: risk-monitor operator.
+
+WHERE POSTS GO
+Alert Test (this group): every alarm and information post in parts 1 and 2. Nothing else.
+Staff group: everything else. Nothing is copied here and nothing alternates.
+• Release lines (below).
+• Each hour: "Tech Updates: Update NN Released", the square poster with the Telegram text, its zip, the wide poster with the X text, its zip. The zips keep full quality.
+• The pinned board "TOURBILLON LAUNCH live", edited in place, plus a board poster 30 minutes after each release.
+• Shipped today, at 23:55 UAE (19:55 UTC): each update released that UAE day with its link, plus a buyback-rounding line on days with some.
+/schedule in either group: the full schedule in UTC, Moscow and New York.
+
+RELEASES (staff group)
+✅ SHIPPED AND RELEASED · Update NN: deployed, checks passed, public copy and GitHub release out.
+🟡 RELEASE DELAYED · Update NN: live; the public copy and GitHub release are retrying, then SHIPPED AND RELEASED.
+🟡 HELD · Update NN: a pre-release check failed; nothing deployed; the next update stays on time. Who: release owner.
+🔴 ROLLED BACK · Update NN: deployed, a post-deploy check failed, the previous version is back. Who: release owner.
+Update NN goes out at launch + (NN - 1) hours: Update 01 at launch, Update 62 at launch + 61 hours.

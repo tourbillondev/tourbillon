@@ -18,7 +18,7 @@ contract EngineSellTest is EngineBase {
         return engine.sell(id, units, 0, nowT);
     }
 
-    /// Walks the series so normNow is exact, then returns it.
+    /// Walks the series so normNow is exact, then gives it.
     function _norm(uint256 id) internal returns (uint256) {
         (, bool done) = book.accrue(id, type(uint256).max); // 0 would mean the default 64-interval limit
         assertTrue(done);
@@ -38,17 +38,17 @@ contract EngineSellTest is EngineBase {
 
     function test_roundTripPaysExactlyAndReleasesEverything() public {
         (uint256 id, uint256 cost) = _buy(true, K, _day(), 2e18);
-        uint256 buyFee = usdc.balanceOf(FEES);
+        uint256 buyFee = settlement.balanceOf(FEES);
         (uint256 gross, uint256 fee) = _expectedNet(true, 2e18, 50_000e18, 5000, _day());
-        uint256 poolBefore = usdc.balanceOf(address(pool));
+        uint256 poolBefore = settlement.balanceOf(address(pool));
 
         (uint256 paid, uint256 net) = _sell(id, ALL);
         assertEq(paid, 2e18);
         assertEq(net, gross - fee);
-        assertEq(usdc.balanceOf(BUYER), 1_000_000e6 - cost + net);
-        assertEq(usdc.balanceOf(address(pool)), poolBefore - gross, "the pool pays the gross");
-        assertEq(usdc.balanceOf(FEES), buyFee + fee);
-        assertEq(usdc.balanceOf(address(engine)), 0, "the engine holds no money");
+        assertEq(settlement.balanceOf(BUYER), 1_000_000e6 - cost + net);
+        assertEq(settlement.balanceOf(address(pool)), poolBefore - gross, "the pool pays the gross");
+        assertEq(settlement.balanceOf(FEES), buyFee + fee);
+        assertEq(settlement.balanceOf(address(engine)), 0, "the engine holds no money");
         assertEq(book.balanceOf(id, BUYER), 0);
         assertEq(pool.openNotional(BTC), 0);
         assertLt(net, cost, "a round trip loses exactly the two fees");
@@ -221,7 +221,7 @@ contract EngineSellTest is EngineBase {
     /// INTERIM LIMIT (mainnet blocker, M2_NOTES): a drained HousePool cannot pay, and the sell reverts.
     function test_drainedPoolRevertsInsolvent() public {
         (uint256 id,) = _buy(true, K, _day(), 1e18);
-        deal(address(usdc), address(pool), 0);
+        deal(address(settlement), address(pool), 0);
         (uint256 g,) = _expectedNet(true, 1e18, 50_000e18, 5000, _day());
         vm.prank(BUYER);
         vm.expectRevert(abi.encodeWithSelector(HousePool.Insolvent.selector, g, 0));
@@ -266,14 +266,14 @@ contract EngineSellTest is EngineBase {
             vm.prank(PAUSER);
             engine.pauseBuys();
         }
-        uint256 before = usdc.balanceOf(BUYER);
+        uint256 before = settlement.balanceOf(BUYER);
         (uint256 paid, uint256 net) = _sell(id, ALL);
         assertGt(paid, 0);
-        assertEq(usdc.balanceOf(BUYER) - before, net);
+        assertEq(settlement.balanceOf(BUYER) - before, net);
         assertEq(book.balanceOf(id, BUYER), 0);
     }
 
-    /// Buying and selling straight back with the same inputs never returns more than was paid.
+    /// Buying and selling straight back with the same inputs never pays back more than was paid.
     function testFuzz_immediateRoundTripNeverProfits(uint256 s, uint256 sigma, uint256 units, bool isCall) public {
         s = bound(s, 30_000e18, 90_000e18);
         sigma = bound(sigma, 1000, 20_000);

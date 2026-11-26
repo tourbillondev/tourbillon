@@ -32,7 +32,7 @@ interface IVolSource {
 ///           walk without limit, so a sell never waits for a keeper.
 ///         - If a series was left unwalked past the daily ring, `accrue` and `mint` revert with HistoryGone,
 ///           but `burn` charges the lost stretch at the maximum rate and goes on (not in the spec; to confirm).
-///         - The norm never goes below MIN_NORM. This safety floor is not in the spec.
+///         - The norm never goes below MIN_NORM. This floor is not in the spec.
 ///         - σ bounds are TempoMath's defaults (5% to 500%) in M0.
 ///         - Shapes (M4): a series can also be a shape of 1–4 legs on one market with one shared decay factor
 ///           (ShapeFunding; M4 decision D2). Its id is tagged "SHAPE" so it never meets a single-leg id, and its
@@ -44,7 +44,7 @@ contract PathFundingBook {
     uint256 public constant TRADE_MAX_STEPS = 16;
     /// @notice A shape's legs × Movement parts (owner, M4 step 5): no shape costs more to walk than the most complex
     ///         single leg (1 leg × 4 parts), so a sell after 60 days untouched fits in one block. Revisit once
-    ///         Elysium's block gas limit is confirmed (U).
+    ///         Robinhood Chain's block gas limit is measured (U; RobinhoodProbe).
     uint256 public constant MAX_SHAPE_EVALS = 4;
 
     struct Series {

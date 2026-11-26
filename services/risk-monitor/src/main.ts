@@ -1,23 +1,31 @@
 import { existsSync, readFileSync } from "node:fs";
-import { createPublicClient, formatEther, formatUnits, getAddress, http, parseEventLogs, stringToHex, type Address, type PublicClient } from "viem";
+import { createPublicClient, encodeAbiParameters, formatEther, formatUnits, getAddress, http, keccak256, parseEventLogs, stringToHex, zeroAddress, type Address, type Hex, type PublicClient } from "viem";
 import { chainFor, LOCAL_CHAIN_ID } from "@tourbillon/common/chain.ts";
-import { accountValueFrom, EQUITY_OFFSET, transfersFromLedger } from "@tourbillon/common/equity.ts";
+import { EQUITY_OFFSET } from "@tourbillon/common/equity.ts";
+import { openExchange, type ExchangeRead } from "@tourbillon/common/exchange.ts";
+import { stockToken } from "@tourbillon/common/covers.ts";
+import { amountOf, settlementOf, type Settlement } from "@tourbillon/common/settlement.ts";
 import { MAX_FEE_PER_GAS, POLL_MS, withHeadroom } from "@tourbillon/common/gas.ts";
-import { fetchMetaAndAssetCtxs, HL_API, parseMarks, TIMEOUT_MS } from "@tourbillon/common/hyperliquid.ts";
 import { log } from "@tourbillon/common/log.ts";
 import { loadSigner, type KeyInput, type Signer } from "@tourbillon/common/signer.ts";
-import { Conditions, emit } from "./alarm.ts";
-import { capHigh, coverageState, DEFAULTS, equityMismatch, hlMarketDown, type Thresholds } from "./checks.ts";
+import { Conditions, emit, type AlarmName } from "./alarm.ts";
+import { capHigh, coverageState, DEFAULTS, equityMismatch, exchangeMarketDown, type Thresholds } from "./checks.ts";
 import { m6Abi, m6Alarms, settleDue, type M6Event, type OpenLot } from "./m6.ts";
 import { m7Abi, m7Alarms, receiptsAgeHours, type M7Addresses, type M7Event } from "./m7.ts";
 import { OutageTracker } from "./outage.ts";
+import { inventoryMismatch, markRound, quarterCapHigh, splitRatio } from "./rh.ts";
 import { loadKeys, lowKeys, type WatchedKey } from "./keys.ts";
 
-/// The risk-monitor (M3 step 9). Every pass it checks the venue, the pool's risk state and the services' liveness, and
+/// The risk-monitor (M3 step 9; RH6: two venues, Backend §6). Every pass it checks the venues (the crypto hedge
+/// exchange for crypto markets; hedger-onchain's status for stock markets), the pool's risk state and the services'
+/// liveness, and
 /// writes alarm lines in a stable shape (src/alarm.ts). With an M6 deployment file it also watches the open book
 /// (buybacks, uncovered matched raw, dust, vault slashes) and the weekly risk auction (src/m6.ts); with an M7 file, the
-/// timelock queue, role changes, pauses and receipts liveness (src/m7.ts). Its only on-chain action: after 15 minutes of continuous venue
-/// outage on a market it pauses opens there with the pause-only RISK_PAUSER key. It can never unpause.
+/// timelock queue, role changes, pauses and receipts liveness (src/m7.ts); and the Robinhood Chain checks (src/rh.ts:
+/// splits, out-of-session anchoring, quarter caps, the on-chain hedge inventory, stuck covering tokens). Its only
+/// on-chain action: pausing opens on one market with the pause-only RISK_PAUSER key, after 15 minutes of continuous
+/// venue outage there, or at once on a split (G9). It can never unpause. Alarm names follow the playbook: lower-dash,
+/// the market joined with a dash when the bot posts them.
 
 const poolAbi = [
   ...["available", "stressedLiability", "sentOut", "receivedBack", "round"].map(
@@ -31,6 +39,8 @@ const poolAbi = [
   ),
   { type: "function", name: "marketPaused", stateMutability: "view", inputs: [{ type: "bytes32" }], outputs: [{ type: "bool" }] },
   { type: "function", name: "pauseMarket", stateMutability: "nonpayable", inputs: [{ type: "bytes32" }], outputs: [] },
+  { type: "function", name: "sessionCalendar", stateMutability: "view", inputs: [], outputs: [{ type: "address" }] },
+  { type: "event", name: "CoverStuckPaused", inputs: [{ type: "bytes32", name: "market", indexed: true }, { type: "address", name: "book" }] },
   {
     type: "function",
     name: "rounds",
@@ -62,6 +72,17 @@ const poolAbi = [
     ],
   },
 ] as const;
+const calendarAbi = [
+  { type: "function", name: "isRegularSession", stateMutability: "view", inputs: [{ type: "uint256" }], outputs: [{ type: "bool" }] },
+  { type: "function", name: "openCapBps", stateMutability: "view", inputs: [{ type: "bytes32" }], outputs: [{ type: "uint256" }] },
+] as const;
+const finalisedAbi = [
+  { type: "event", name: "Finalised", inputs: [{ type: "bytes32", name: "key", indexed: true }, { type: "uint80", name: "round", indexed: true }, { type: "uint256", name: "median" }, { type: "uint256", name: "published" }, { type: "uint256", name: "votes" }] },
+] as const;
+const markKeyOf = (m: string): Hex => keccak256(encodeAbiParameters([{ type: "string" }, { type: "bytes32" }], ["MARK", stringToHex(m, { size: 32 })]));
+/// A venue counts as down for a warning (dex-down / cex-down) after this share of the pause window (5 of 15 minutes).
+const DOWN_WARN_SHARE = 1 / 3;
+
 const viewAbi = [
   { type: "function", name: "markWad", stateMutability: "view", inputs: [{ type: "bytes32" }], outputs: [{ type: "uint256" }] },
   { type: "function", name: "volBps", stateMutability: "view", inputs: [{ type: "bytes32" }], outputs: [{ type: "uint256" }] },
@@ -73,9 +94,9 @@ type Config = {
   deployment: string;
   rpc?: string;
   key: KeyInput;
-  hlUser?: Address;
-  hlApi?: string;
-  hedgerStatus?: string;
+  exchange?: string; // the crypto hedge exchange (read-only key); "sim" on anvil; others refused until Q5
+  exchangeUrl?: string;
+  hedgerStatus: string[]; // the hedgers' status files (hedger-cex, hedger-onchain)
   keys: WatchedKey[];
   outageMs: number;
   tickSeconds: number;
@@ -97,7 +118,7 @@ function parseArgs(argv: string[]): Config {
       a.set(f, v);
     }
   }
-  const known = ["deployment", "rpc", "keystore", "keystore-dir", "local-unlocked", "watch", "hl-user", "hl-api", "hedger-status", "keys", "outage-minutes", "tick-seconds", "equity-every-seconds", "once"];
+  const known = ["deployment", "rpc", "keystore", "keystore-dir", "local-unlocked", "watch", "exchange", "exchange-url", "hedger-status", "keys", "outage-minutes", "tick-seconds", "equity-every-seconds", "once"];
   for (const k of a.keys()) if (!known.includes(k)) throw new Error(`unknown flag --${k}`);
   const s = (k: string) => (typeof a.get(k) === "string" ? (a.get(k) as string) : undefined);
   if (!s("deployment")) throw new Error("--deployment is required");
@@ -112,9 +133,9 @@ function parseArgs(argv: string[]): Config {
     deployment: s("deployment")!,
     rpc: s("rpc"),
     key,
-    hlUser: s("hl-user") ? getAddress(s("hl-user")!) : undefined,
-    hlApi: s("hl-api"),
-    hedgerStatus: s("hedger-status"),
+    exchange: s("exchange"),
+    exchangeUrl: s("exchange-url"),
+    hedgerStatus: s("hedger-status") ? s("hedger-status")!.split(",") : [],
     keys: s("keys") ? loadKeys(s("keys")!) : [],
     outageMs: Number(s("outage-minutes") ?? 15) * 60_000,
     tickSeconds: Math.max(1, Number(s("tick-seconds") ?? 60)),
@@ -133,7 +154,7 @@ type Dep = {
   markets: string[];
   deployBlock: bigint;
   // M6 (absent in older deployment files)
-  usdc: Address | null;
+  settlement: Settlement;
   matchBook: Address | null;
   auction: Address | null;
   vault: Address | null;
@@ -154,7 +175,7 @@ function loadDep(path: string): Dep {
     book: need("PathFundingBook"),
     markets: d.markets as string[],
     deployBlock: BigInt(Number(d.deployBlock ?? 0)),
-    usdc: maybe("MockUSDC"),
+    settlement: settlementOf(d),
     matchBook: maybe("MatchBook"),
     auction: maybe("RiskAuction"),
     vault: maybe("MakerVault"),
@@ -164,10 +185,11 @@ function loadDep(path: string): Dep {
       receipts: maybe("ReceiptRoots"),
       safe: maybe("Safe"),
       guardian: maybe("Guardian"),
+      gate: maybe("HedgeKeeperGate"),
       riskPauser: typeof d.riskPauser === "string" && d.Timelock ? getAddress(d.riskPauser as string) : null,
       deployer: typeof d.deployer === "string" && d.Timelock ? getAddress(d.deployer as string) : null,
       names: new Map(
-        ["MainspringPool", "Engine", "QuorumBoard", "MarkRouter", "Timelock", "ReceiptRoots", "OpenBook", "MatchBook", "RiskAuction", "MakerVault", "AgentRouter", "PathFundingBook"]
+        ["MainspringPool", "Engine", "QuorumBoard", "MarkRouter", "Timelock", "ReceiptRoots", "OpenBook", "MatchBook", "RiskAuction", "MakerVault", "AgentRouter", "PathFundingBook", "HedgeKeeperGate", "SessionCalendar", "CoveringAssets", "HedgeRouterV4"]
           .filter((k) => typeof d[k] === "string")
           .map((k) => [(d[k] as string).toLowerCase(), k] as const),
       ),
@@ -175,43 +197,42 @@ function loadDep(path: string): Dep {
   };
 }
 
-const usdc = (v: bigint) => Number(formatUnits(v, 6));
+/// The settlement token (owner D1), from the deployment file: every amount and sentence uses its symbol and decimals.
+let S: Settlement;
+const usdc = (v: bigint) => amountOf(v, S);
 const b32 = (m: string) => stringToHex(m, { size: 32 });
-
-async function info(base: string, body: object): Promise<unknown> {
-  const res = await fetch(new URL("/info", base), { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body), signal: AbortSignal.timeout(TIMEOUT_MS) });
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
-  return res.json();
-}
 
 async function main(): Promise<void> {
   const cfg = parseArgs(process.argv.slice(2));
   const dep = loadDep(cfg.deployment);
+  S = dep.settlement;
   const client = createPublicClient({ chain: chainFor(dep.chainId), transport: http(cfg.rpc), pollingInterval: POLL_MS }) as PublicClient;
   const chainId = await client.getChainId();
   if (chainId !== dep.chainId) throw new Error(`RPC is chain ${chainId}, deployment file is chain ${dep.chainId}`);
-  if ((cfg.hlApi || cfg.key.type === "local-unlocked") && chainId !== LOCAL_CHAIN_ID) throw new Error("--hl-api and --local-unlocked work only on a local anvil (31337)");
+  if (cfg.key.type === "local-unlocked" && chainId !== LOCAL_CHAIN_ID) throw new Error("--local-unlocked works only on a local anvil (31337)");
   const signer = await loadSigner(cfg.key, dep.chainId, cfg.rpc);
-  const base = cfg.hlApi ?? HL_API;
+  const ex = cfg.exchange ? await openExchange(cfg.exchange, cfg.exchangeUrl, "read", chainId === LOCAL_CHAIN_ID) : null;
+  const stocks = new Set<string>();
+  for (const m of dep.markets) if (await stockToken(client, dep.pool, m)) stocks.add(m);
   const outage = new OutageTracker(cfg.outageMs);
   const cond = new Conditions();
   let nextBlock = dep.deployBlock;
   const lots = new Map<bigint, OpenLot>();
   let lastEquityCheck = -Infinity;
-  log("info", "started", { pool: dep.pool, markets: dep.markets, pauses: signer.wallet !== undefined, outageMinutes: cfg.outageMs / 60_000 });
+  log("info", "started", { pool: dep.pool, markets: dep.markets, stockMarkets: [...stocks], exchange: ex?.name ?? null, pauses: signer.wallet !== undefined, outageMinutes: cfg.outageMs / 60_000 });
 
   let stopping = false;
   process.on("SIGINT", () => (stopping = true));
   process.on("SIGTERM", () => (stopping = true));
   while (!stopping) {
     try {
-      nextBlock = await pass(cfg, client, dep, base, signer, outage, cond, nextBlock, lots, () => {
+      nextBlock = await pass(cfg, client, dep, ex, stocks, signer, outage, cond, nextBlock, lots, () => {
         const due = Date.now() - lastEquityCheck >= cfg.equityEveryS * 1000;
         if (due) lastEquityCheck = Date.now();
         return due;
       });
     } catch (e) {
-      emit({ name: "MONITOR_ERROR", state: "event", level: "alarm", what: "The risk-monitor's pass failed.", who: "risk-monitor operator", market: null, values: { error: (e as Error).message.split("\n")[0] } });
+      emit({ name: "monitor-error", state: "event", level: "alarm", what: "The risk-monitor's pass failed.", who: "risk-monitor operator", market: null, values: { error: (e as Error).message.split("\n")[0] } });
     }
     if (cfg.once) break;
     for (let i = 0; i < cfg.tickSeconds && !stopping; i++) await Bun.sleep(1000);
@@ -223,7 +244,8 @@ async function pass(
   cfg: Config,
   client: PublicClient,
   dep: Dep,
-  base: string,
+  ex: ExchangeRead | null,
+  stocks: Set<string>,
   signer: Signer,
   outage: OutageTracker,
   cond: Conditions,
@@ -242,9 +264,40 @@ async function pass(
   for (const l of parseEventLogs({ abi: poolAbi, logs, strict: false })) {
     const v = l.args as Record<string, bigint>;
     if (l.eventName === "TreasurySent") {
-      emit({ name: "TREASURY_SENT", state: "event", level: "alarm", what: "The pool sent USDC to the treasury (bound for Hyperliquid).", who: "treasury operator: confirm the move was planned", market: null, values: { amount: usdc(v.amount!), sentOut: usdc(v.sentOut!), sentToday: usdc(v.sentToday!), navBefore: usdc(v.navBefore!), tx: l.transactionHash } });
+      emit({ name: "treasury-sent", state: "event", level: "alarm", what: `The pool sent ${S.symbol} to the treasury (bound for the crypto hedge exchange).`, who: "treasury operator: confirm the move was planned", market: null, values: { amount: usdc(v.amount!), sentOut: usdc(v.sentOut!), sentToday: usdc(v.sentToday!), navBefore: usdc(v.navBefore!), tx: l.transactionHash } });
+    } else if (l.eventName === "CoverStuckPaused") {
+      const m = (l.args as { market: Hex }).market;
+      emit({ name: "transfer-stuck", state: "event", level: "alarm", what: "A tokenized stock could not move during a sell, an unwrite or a claim: it is kept owed and settles once it moves; new positions on this market are paused (sells and USDC go on).", who: "admin: check the token issuer (pause, freeze or whitelist), then unpause once settled", market: b32name(m), values: { book: (l.args as { book: Address }).book, tx: l.transactionHash } });
     } else if (l.eventName === "TreasuryReturned") {
-      emit({ name: "TREASURY_RETURNED", state: "event", level: "warn", what: "USDC came back to the pool from the treasury.", who: "treasury operator: confirm", market: null, values: { amount: usdc(v.amount!), receivedBack: usdc(v.receivedBack!), tx: l.transactionHash } });
+      emit({ name: "treasury-returned", state: "event", level: "warn", what: `${S.symbol} came back to the pool from the treasury.`, who: "treasury operator: confirm", market: null, values: { amount: usdc(v.amount!), receivedBack: usdc(v.receivedBack!), tx: l.transactionHash } });
+    }
+  }
+
+  // ---- stock MARK rounds: splits (G9: pause opens at once) and out-of-session anchoring (information)
+  const calendar = stocks.size > 0 ? await read<Address>(dep.pool, poolAbi, "sessionCalendar") : zeroAddress;
+  if (stocks.size > 0 && fromBlock <= block.number) {
+    const keys = new Map([...stocks].map((m) => [markKeyOf(m), m]));
+    const fl = await client.getLogs({ address: dep.board, fromBlock, toBlock: block.number });
+    for (const l of parseEventLogs({ abi: finalisedAbi, logs: fl, strict: false })) {
+      const a = l.args as { key: Hex; median: bigint; published: bigint };
+      const m = keys.get(a.key);
+      if (!m) continue;
+      const at = Number((await client.getBlock({ blockNumber: l.blockNumber })).timestamp);
+      const inSession = calendar === zeroAddress ? true : await read<boolean>(calendar, calendarAbi, "isRegularSession", [BigInt(at)]);
+      const kind = markRound(a.median, a.published, inSession);
+      const values = { median: Number(formatEther(a.median)), published: Number(formatEther(a.published)), tx: l.transactionHash };
+      if (kind === "split") {
+        const r = splitRatio(a.median, a.published)!;
+        await pauseOnce(dep, client, signer, read, m, {
+          name: "split-mismatch",
+          paused: "The signers' price moved by a split ratio: new positions on this market are paused until the change is reviewed (sells unaffected).",
+          watch: "The signers' price moved by a split ratio; watch mode, so opens were NOT paused.",
+          who: "admin: review the corporate action; the Safe unpauses once the mark is right",
+          values: { ...values, ratio: r },
+        });
+      } else if (kind === "anchored") {
+        emit({ name: "session-anchored", state: "event", level: "warn", what: "Outside the stock session the mark was held within its band of the last session value.", who: "nobody", market: m, values });
+      }
     }
   }
 
@@ -253,14 +306,14 @@ async function pass(
   if (m6At.length > 0) {
     const m6Logs = fromBlock <= block.number ? await client.getLogs({ address: [dep.pool, ...m6At], fromBlock, toBlock: block.number }) : [];
     const events = parseEventLogs({ abi: m6Abi, logs: m6Logs, strict: false }).map((l) => ({ eventName: l.eventName, args: l.args as Record<string, unknown>, transactionHash: l.transactionHash }) as M6Event);
-    for (const a of m6Alarms(events, lots, dep.usdc)) emit({ ...a, state: "event" });
+    for (const a of m6Alarms(events, lots, dep.settlement)) emit({ ...a, state: "event" });
     const due = settleDue(lots, now, cfg.t.auctionSettleGraceS);
-    cond.set(due.length > 0, { name: "AUCTION_SETTLE_DUE", level: "alarm", what: "A risk auction lot's reveal ended and nobody has settled it: bonds stay locked and the pool keeps the risk.", who: "anyone (keeper operator): call settle on the lot", market: null, values: { lots: due.map((l) => ({ lotId: l.lotId, market: l.market, revealEnd: l.revealEnd })) } }, "Every finished auction lot is settled.");
+    cond.set(due.length > 0, { name: "auction-settle-due", level: "alarm", what: "A risk auction lot's reveal ended and nobody has settled it: bonds stay locked and the pool keeps the risk.", who: "anyone (keeper operator): call settle on the lot", market: null, values: { lots: due.map((l) => ({ lotId: l.lotId, market: l.market, revealEnd: l.revealEnd })) } }, "Every finished auction lot is settled.");
   }
 
   // ---- governance and receipts (M7)
   if (dep.m7.timelock) {
-    const at = [dep.m7.timelock, dep.pool, dep.board, dep.router, ...(dep.engine ? [dep.engine] : []), ...(dep.m7.receipts ? [dep.m7.receipts] : [])];
+    const at = [dep.m7.timelock, dep.pool, dep.board, dep.router, ...(dep.engine ? [dep.engine] : []), ...(dep.m7.receipts ? [dep.m7.receipts] : []), ...(dep.m7.gate ? [dep.m7.gate] : [])];
     const m7Logs = fromBlock <= block.number ? await client.getLogs({ address: at, fromBlock, toBlock: block.number }) : [];
     const ts = new Map<bigint, number>();
     const events: M7Event[] = [];
@@ -277,7 +330,7 @@ async function pass(
       const [anyPosted, lastEpoch] = await Promise.all([read<boolean>(dep.m7.receipts, receiptsAbi, "anyPosted"), read<bigint>(dep.m7.receipts, receiptsAbi, "lastEpoch")]);
       const deployTs = Number((await client.getBlock({ blockNumber: dep.deployBlock })).timestamp);
       const age = receiptsAgeHours(anyPosted, Number(lastEpoch), deployTs, now);
-      cond.set(age > cfg.t.receiptsStaleHours, { name: "RECEIPTS_STALE", level: "alarm", what: "No receipt root has been posted for too long: trades, vol finals and NAV snapshots are not being committed.", who: "receipts operator", market: null, values: { hoursSinceLastRoot: Math.round(age * 10) / 10, lastEpoch: anyPosted ? Number(lastEpoch) : null } }, "Receipt roots are being posted again.");
+      cond.set(age > cfg.t.receiptsStaleHours, { name: "receipts-stale", level: "alarm", what: "No receipt root has been posted for too long: trades, vol finals and NAV snapshots are not being committed.", who: "receipts operator", market: null, values: { hoursSinceLastRoot: Math.round(age * 10) / 10, lastEpoch: anyPosted ? Number(lastEpoch) : null } }, "Receipt roots are being posted again.");
     }
   }
 
@@ -288,7 +341,7 @@ async function pass(
     const low = new Map(lowKeys(cfg.keys, balances).map((k) => [k.name, k]));
     for (const k of cfg.keys) {
       const l = low.get(k.name);
-      cond.set(l !== undefined, { name: "KEY_BALANCE_LOW", level: "warn", what: `The ${k.name} key is low on gas: its service stops when it runs dry.`, who: `${k.name} operator: top up the key`, market: k.name, values: { address: k.address, balanceHype: l?.balance ?? null, minHype: l?.min ?? null } }, `The ${k.name} key has enough gas again.`);
+      cond.set(l !== undefined, { name: "key-balance-low", level: "warn", what: `The ${k.name} key is low on gas: its service stops when it runs dry.`, who: `${k.name} operator: top up the key`, market: k.name, values: { address: k.address, balance: l?.balance ?? null, min: l?.min ?? null } }, `The ${k.name} key has enough gas again.`);
     }
   }
 
@@ -303,33 +356,33 @@ async function pass(
   ]);
   const cov = coverageState(usdc(available), usdc(stressed), cfg.t);
   const covValues = { available: usdc(available), stressedLiability: usdc(stressed) };
-  cond.set(cov === "breached", { name: "COVERAGE_BREACHED", level: "alarm", what: "Elysium USDC no longer covers the stressed liability: new opens are refused on-chain; sells beyond the stress band could fail (Insolvent).", who: "admin: add capital or bring capital back from Hyperliquid", market: null, values: covValues }, "Coverage restored.");
-  cond.set(cov === "low", { name: "COVERAGE_LOW", level: "warn", what: "Free USDC above the stressed liability is under the headroom threshold.", who: "admin: watch; consider adding capital", market: null, values: covValues }, "Coverage headroom back above the threshold.");
-  cond.set(opensPaused, { name: "DRAWDOWN_PAUSED", level: "alarm", what: "NAV per share fell more than 15% below its 30-day high: all opens are paused.", who: "admin: review, then resume opens", market: null, values: {} }, "Opens resumed.");
+  cond.set(cov === "breached", { name: "coverage-breached", level: "alarm", what: `Available ${S.symbol} no longer covers the stressed liability: new opens are refused on-chain; sells beyond the stress band could fail (Insolvent).`, who: "admin: add capital or bring capital back from the exchange", market: null, values: covValues }, "Coverage restored.");
+  cond.set(cov === "low", { name: "coverage-low", level: "warn", what: `Free ${S.symbol} above the stressed liability is under the headroom threshold.`, who: "admin: watch; consider adding capital", market: null, values: covValues }, "Coverage headroom back above the threshold.");
+  cond.set(opensPaused, { name: "drawdown-paused", level: "alarm", what: "NAV per share fell more than 15% below its 30-day high: all opens are paused.", who: "admin: review, then resume opens", market: null, values: {} }, "Opens resumed.");
   if (round > 0n) {
     const r = await read<readonly unknown[]>(dep.pool, poolAbi, "rounds", [round - 1n]);
     const age = now - Number(r[9] as bigint);
-    cond.set(age > cfg.t.settlementAgeS, { name: "SETTLEMENT_STALE", level: "alarm", what: "The pool has not settled a round for too long: deposits and withdrawals wait.", who: "keeper operator", market: null, values: { lastSettlementAgeS: age } }, "Settlements running again.");
+    cond.set(age > cfg.t.settlementAgeS, { name: "settlement-stale", level: "alarm", what: "The pool has not settled a round for too long: deposits and withdrawals wait.", who: "keeper operator", market: null, values: { lastSettlementAgeS: age } }, "Settlements running again.");
   }
 
-  // ---- Hyperliquid probe and the hedger's status
-  let hl: Map<string, number | null> = new Map();
-  try {
-    const marks = parseMarks(await fetchMetaAndAssetCtxs(base), dep.markets);
-    for (const m of dep.markets) {
-      const r = marks.get(m);
-      hl.set(m, r && r.ok ? Number(formatEther(r.mark)) : null);
+  // ---- the crypto hedge exchange (crypto markets) and the hedgers' status files (both venues)
+  let exMarks: Map<string, number | null> | null = null;
+  if (ex) {
+    try {
+      const mk = await ex.markets();
+      exMarks = new Map(dep.markets.filter((m) => !stocks.has(m)).map((m) => [m, mk.get(m)?.mark ?? null]));
+    } catch {
+      exMarks = new Map(dep.markets.filter((m) => !stocks.has(m)).map((m) => [m, null]));
     }
-  } catch {
-    hl = new Map(dep.markets.map((m) => [m, null]));
   }
-  let hedger: Record<string, { ok: boolean }> | null = null;
-  if (cfg.hedgerStatus && existsSync(cfg.hedgerStatus)) {
-    const st = JSON.parse(readFileSync(cfg.hedgerStatus, "utf8")) as { updatedAt: string; markets: Record<string, { ok: boolean }> };
+  let hedger: Record<string, HedgerMarket> | null = null;
+  for (const file of cfg.hedgerStatus) {
+    if (!existsSync(file)) continue;
+    const st = JSON.parse(readFileSync(file, "utf8")) as { updatedAt: string; venue?: string; markets: Record<string, HedgerMarket> };
     const age = (Date.now() - Date.parse(st.updatedAt)) / 1000;
     const silent = age > cfg.t.hedgerSilentS;
-    cond.set(silent, { name: "HEDGER_SILENT", level: "alarm", what: "The hedger has not reported for too long.", who: "hedger operator", market: null, values: { statusAgeS: Math.round(age) } }, "The hedger is reporting again.");
-    if (!silent) hedger = st.markets;
+    cond.set(silent, { name: "hedger-silent", level: "alarm", what: "A hedger has not reported for too long.", who: "hedger operator", market: st.venue ?? null, values: { statusAgeS: Math.round(age) } }, "The hedger is reporting again.", file);
+    if (!silent) hedger = { ...(hedger ?? {}), ...st.markets };
   }
 
   // ---- per market
@@ -347,12 +400,12 @@ async function pass(
     } catch {
       volOk = false;
     }
-    cond.set(routerMark === null || !volOk, { name: "MARK_STALE", level: "alarm", what: "The router's mark or the board's vol is stale: opens on this market are closed (law 2).", who: "signer operators", market: m, values: { markFresh: routerMark !== null, volFresh: volOk } }, "Mark and vol fresh again.");
+    cond.set(routerMark === null || !volOk, { name: "mark-stale", level: "alarm", what: "The router's mark or the board's vol is stale: opens on this market are closed (law 2).", who: "signer operators", market: m, values: { markFresh: routerMark !== null, volFresh: volOk } }, "Mark and vol fresh again.");
 
     try {
       const [t] = await read<readonly [bigint, bigint, bigint]>(dep.book, viewAbi, "latestSample", [name]);
       const age = now - Number(t);
-      cond.set(age > cfg.t.sampleAgeS, { name: "SAMPLE_STALE", level: "alarm", what: "No price sample recorded for too long: funding runs on an old sample.", who: "keeper operator (poker)", market: m, values: { lastSampleAgeS: age } }, "Samples recorded again.");
+      cond.set(age > cfg.t.sampleAgeS, { name: "sample-stale", level: "alarm", what: "No price sample recorded for too long: funding runs on an old sample.", who: "keeper operator (poker)", market: m, values: { lastSampleAgeS: age } }, "Samples recorded again.");
     } catch {
       // no sample yet on this market
     }
@@ -361,54 +414,87 @@ async function pass(
       ["notionalCap", "openNotional", "directionalCap", "directional"].map((f) => read<bigint>(dep.pool, poolAbi, f, [name])),
     );
     const high = capHigh(usdc(nUse!), usdc(nCap!), cfg.t) || capHigh(usdc(dUse!), usdc(dCap!), cfg.t);
-    cond.set(high, { name: "CAP_HIGH", level: "warn", what: "A cap is nearly used up on this market.", who: "admin: decide whether to raise the cap", market: m, values: { notional: usdc(nUse!), notionalCap: usdc(nCap!), directional: usdc(dUse!), directionalCap: usdc(dCap!) } }, "Cap use back below the threshold.");
+    if (stocks.has(m) && calendar !== zeroAddress) {
+      const bps = Number(await read<bigint>(calendar, calendarAbi, "openCapBps", [name]));
+      const qHigh = quarterCapHigh(usdc(nUse!), usdc(nCap!), bps, cfg.t.capUse) || quarterCapHigh(usdc(dUse!), usdc(dCap!), bps, cfg.t.capUse);
+      cond.set(qHigh, { name: "quarter-cap-high", level: "warn", what: "The US stock session is closed today (the equity reference is shut; the token itself still trades), so open caps are a quarter: one is nearly used up.", who: "nobody before the next session; admin if it persists", market: m, values: { capShareBps: bps, notional: usdc(nUse!), directional: usdc(dUse!) } }, "Use back below the reduced cap, or the session reopened.");
+      const h = hedger?.[m];
+      const mismatch = h?.ok === true && typeof h.held === "number" && typeof h.target === "number" && typeof h.band === "number" && inventoryMismatch(h.held, h.target, h.band);
+      cond.set(mismatch, { name: "inventory-mismatch", level: "warn", what: "The pool's tokenized-stock holding is off the on-chain hedge's target by more than twice the band.", who: "hedger operator: check the router, the caps and free USDC", market: m, values: { held: h?.held ?? null, target: h?.target ?? null, band: h?.band ?? null } }, "The holding is back near its target.");
+    }
+    cond.set(high, { name: "cap-high", level: "warn", what: "A cap is nearly used up on this market.", who: "admin: decide whether to raise the cap", market: m, values: { notional: usdc(nUse!), notionalCap: usdc(nCap!), directional: usdc(dUse!), directionalCap: usdc(dCap!) } }, "Cap use back below the threshold.");
 
-    // venue outage
-    const hlDown = hlMarketDown(hl.get(m) ?? null, routerMark, cfg.t);
+    // venue outage: the exchange for a crypto market, hedger-onchain (swaps, router) for a stock market
+    const exDown = exMarks !== null && exMarks.has(m) && exchangeMarketDown(exMarks.get(m) ?? null, routerMark, cfg.t);
     const hedgerDown = hedger !== null && hedger[m]?.ok === false;
-    const ev = outage.update(m, hlDown || hedgerDown, Date.now());
+    const ev = outage.update(m, exDown || hedgerDown, Date.now());
+    const downMs = outage.downFor(m, Date.now());
+    const venue = stocks.has(m) ? "onchain" : "cex";
+    cond.set(downMs >= cfg.outageMs * DOWN_WARN_SHARE, { name: venue === "onchain" ? "dex-down" : "cex-down", level: "warn", what: venue === "onchain" ? "The on-chain stock hedge cannot trade on this market (no router, or swaps failing)." : "The crypto hedge exchange is down or disagrees with the router on this market.", who: "hedger operator", market: m, values: { downMinutes: Math.round(downMs / 6_000) / 10, exchange: exDown, hedger: hedgerDown } }, "The venue answers again on this market.");
     if (ev === "trip") {
-      const values = { downMinutes: outage.downFor(m, Date.now()) / 60_000, hyperliquid: hlDown, hedger: hedgerDown };
-      if (await read<boolean>(dep.pool, poolAbi, "marketPaused", [name])) continue;
-      if (!signer.wallet || !signer.account) {
-        emit({ name: "VENUE_DOWN_PAUSED", state: "event", level: "alarm", what: "Venue down for 15 minutes; watch mode, so opens were NOT paused.", who: "admin: pause opens on this market", market: m, values });
-        continue;
-      }
-      try {
-        const call = { address: dep.pool, abi: poolAbi, functionName: "pauseMarket", args: [name], account: signer.account, maxFeePerGas: MAX_FEE_PER_GAS, maxPriorityFeePerGas: 0n } as const;
-        const gas = await client.estimateContractGas(call);
-        const hash = await signer.wallet.writeContract({ ...call, chain: signer.wallet.chain, gas: withHeadroom(gas) });
-        const receipt = await client.waitForTransactionReceipt({ hash, timeout: 30_000 });
-        if (receipt.status !== "success") throw new Error("pauseMarket reverted");
-        emit({ name: "VENUE_DOWN_PAUSED", state: "event", level: "alarm", what: "Venue down for 15 minutes on this market: opens paused here (sells unaffected).", who: "nobody: automatic pause done; admin unpauses after recovery", market: m, values: { ...values, tx: hash } });
-      } catch (e) {
-        emit({ name: "PAUSE_FAILED", state: "event", level: "alarm", what: "Venue down for 15 minutes, but pausing opens failed.", who: "admin: pause opens on this market now", market: m, values: { ...values, error: (e as Error).message.split("\n")[0] } });
-      }
+      const values = { downMinutes: downMs / 60_000, venue, exchange: exDown, hedger: hedgerDown };
+      await pauseOnce(dep, client, signer, read, m, {
+        name: "venue-down-paused",
+        paused: "Venue down for 15 minutes on this market: opens paused here (sells unaffected).",
+        watch: "Venue down for 15 minutes; watch mode, so opens were NOT paused.",
+        who: "nobody: automatic pause done; admin unpauses after recovery",
+        values,
+      });
     } else if (ev === "recovered") {
-      emit({ name: "VENUE_RECOVERED", state: "event", level: "warn", what: "The venue is healthy again on this market.", who: "admin: unpause opens when satisfied (the risk key cannot)", market: m, values: {} });
+      emit({ name: "venue-recovered", state: "event", level: "warn", what: "The venue is healthy again on this market.", who: "admin: unpause opens when satisfied (the risk key cannot)", market: m, values: {} });
     }
   }
 
   // ---- hourly equity check
-  if (cfg.hlUser && equityDue()) {
+  if (ex && equityDue()) {
     const ready = await read<boolean>(dep.pool, poolAbi, "equityReady");
     const outside = sentOut > receivedBack;
-    cond.set(!ready && outside, { name: "EQUITY_NOT_READY", level: "alarm", what: "Capital is outside Elysium but EQUITY is not ready (fewer than two finals or 2 h old): NAV leaves it uncounted.", who: "signer operators", market: null, values: { sentOut: usdc(sentOut), receivedBack: usdc(receivedBack) } }, "EQUITY ready again.");
+    cond.set(!ready && outside, { name: "equity-not-ready", level: "alarm", what: "Capital is at the crypto hedge exchange but EQUITY is not ready (fewer than two finals or 2 h old): NAV leaves it uncounted.", who: "signer operators", market: null, values: { sentOut: usdc(sentOut), receivedBack: usdc(receivedBack) } }, "EQUITY ready again.");
     try {
       const key = await read<`0x${string}`>(dep.pool, poolAbi, "equityKey");
       const [boardValue] = await read<readonly [bigint, bigint]>(dep.board, viewAbi, "latestValue", [key]);
-      const [state, ledger] = await Promise.all([info(base, { type: "clearinghouseState", user: cfg.hlUser }), info(base, { type: "userNonFundingLedgerUpdates", user: cfg.hlUser, startTime: 0 })]);
-      const av = accountValueFrom(state);
-      const { deposits, withdrawalsNet } = transfersFromLedger(ledger);
+      const [av, { deposits, withdrawalsNet }] = await Promise.all([ex.accountValue(), ex.transfers()]);
       const own = Number(formatEther(av - deposits + withdrawalsNet));
       const board = Number(formatEther(boardValue - EQUITY_OFFSET));
       const accountValue = Number(formatEther(av));
-      cond.set(equityMismatch(board, own, accountValue, cfg.t), { name: "EQUITY_MISMATCH", level: "alarm", what: "The board's EQUITY differs from Hyperliquid's account by more than the tolerance.", who: "signer operators and admin: check the signers' EQUITY job and the account", market: null, values: { boardPnl: board, hyperliquidPnl: own, accountValue } }, "EQUITY agrees with Hyperliquid again.");
+      cond.set(equityMismatch(board, own, accountValue, cfg.t), { name: "equity-mismatch", level: "alarm", what: "The board's EQUITY differs from the exchange account by more than the tolerance.", who: "signer operators and admin: check the signers' EQUITY job and the account", market: null, values: { boardPnl: board, exchangePnl: own, accountValue } }, "EQUITY agrees with the exchange again.");
     } catch {
-      // no EQUITY final yet, or Hyperliquid unreachable (raised by the venue checks)
+      // no EQUITY final yet, or the exchange unreachable (raised by the venue checks)
     }
   }
   return block.number + 1n;
+}
+
+type HedgerMarket = { ok: boolean; held?: number; target?: number; band?: number };
+
+const b32name = (h: Hex) => Buffer.from(h.slice(2), "hex").toString("utf8").replace(/\0+$/, "");
+
+/// Pauses opens on one market with the pause-only key, once (already paused: nothing), and announces it. Watch mode
+/// announces without pausing; a failed pause is its own red alarm.
+async function pauseOnce(
+  dep: Dep,
+  client: PublicClient,
+  signer: Signer,
+  read: <T>(address: Address, abi: readonly unknown[], functionName: string, args?: readonly unknown[]) => Promise<T>,
+  m: string,
+  a: { name: AlarmName; paused: string; watch: string; who: string; values: Record<string, unknown> },
+): Promise<void> {
+  const name = stringToHex(m, { size: 32 });
+  if (await read<boolean>(dep.pool, poolAbi, "marketPaused", [name])) return;
+  if (!signer.wallet || !signer.account) {
+    emit({ name: a.name, state: "event", level: "alarm", what: a.watch, who: "admin: pause opens on this market", market: m, values: a.values });
+    return;
+  }
+  try {
+    const call = { address: dep.pool, abi: poolAbi, functionName: "pauseMarket", args: [name], account: signer.account, maxFeePerGas: MAX_FEE_PER_GAS, maxPriorityFeePerGas: 0n } as const;
+    const gas = await client.estimateContractGas(call);
+    const hash = await signer.wallet.writeContract({ ...call, chain: signer.wallet.chain, gas: withHeadroom(gas) });
+    const receipt = await client.waitForTransactionReceipt({ hash, timeout: 30_000 });
+    if (receipt.status !== "success") throw new Error("pauseMarket reverted");
+    emit({ name: a.name, state: "event", level: "alarm", what: a.paused, who: a.who, market: m, values: { ...a.values, tx: hash } });
+  } catch (e) {
+    emit({ name: "pause-failed", state: "event", level: "alarm", what: `${a.name}: pausing opens failed.`, who: "admin: pause opens on this market now", market: m, values: { ...a.values, error: (e as Error).message.split("\n")[0] } });
+  }
 }
 
 main().catch((e) => {

@@ -26,8 +26,8 @@ export class EwmaVol {
     public variance: number, // per 5-minute step
     public lastT: number,
     public lastPx: number,
-    public steps: number, // returns absorbed, counted in steps
-    public capped: number, // returns that hit the cap
+    public steps: number, // price changes absorbed, counted in steps
+    public capped: number, // price changes that hit the cap
   ) {}
 
   /// Starts from a run of boundary prices (candle closes), oldest first. The variance starts at the mean
@@ -99,4 +99,73 @@ export function clipBps(bps: number): number {
 export function bpsToWad(bps: number): bigint {
   if (!Number.isInteger(bps) || bps < MIN_SIGMA_BPS || bps > MAX_SIGMA_BPS) throw new Error(`bps out of range: ${bps}`);
   return BigInt(bps) * 10n ** 14n;
+}
+
+/// Follows one market's vol from this signer's own accepted marks (owner queue Q8: no outside vol source yet). It keeps
+/// the first price of each 5-minute boundary, warms up until one day of steps is in (MIN_START_RETURNS), then votes.
+///
+/// Gaps (choice C3): a gap longer than MAX_GAP_STEPS normally starts again from nothing (a stale history must not set
+/// vol). For a tokenized-stock market, a gap that holds no regular-session minute (a night, a weekend, a holiday) counts
+/// as a single step instead: closed time is not trading time, and without this every Monday would start a fresh day of
+/// warm-up with no vol vote. A long gap during regular hours still starts again. Crypto has no session: any long gap
+/// starts again. Pure: the session test is passed in.
+export class VolTracker {
+  private warm: Point[] = [];
+  private est: EwmaVol | null = null;
+  private lastRealT = -1; // seconds, real boundary time of the last price kept
+  private shiftS = 0; // closed time skipped so far, taken off every later boundary
+  lastPointMs = 0; // wall-clock time of the last price kept, for the reading's age
+  restarts = 0;
+
+  constructor(
+    readonly sessionAware: boolean,
+    private readonly overlapsSession: (fromMs: number, toMs: number) => boolean,
+  ) {}
+
+  /// Absorbs a price seen at `atMs`; only the first price of each 5-minute boundary counts.
+  sample(px: number, atMs: number): void {
+    if (!(px > 0) || !Number.isFinite(px)) return;
+    const t = Math.floor(atMs / 1000 / STEP_S) * STEP_S;
+    if (this.lastRealT >= 0) {
+      if (t <= this.lastRealT) return; // same boundary, or out of order
+      const k = (t - this.lastRealT) / STEP_S;
+      if (k > MAX_GAP_STEPS) {
+        if (this.sessionAware && !this.overlapsSession(this.lastRealT * 1000, t * 1000)) this.shiftS += (k - 1) * STEP_S;
+        else this.restart();
+      }
+    }
+    const p = { t: t - this.shiftS, px };
+    this.lastRealT = t;
+    this.lastPointMs = atMs;
+    if (this.est) {
+      this.est.update(p);
+      return;
+    }
+    this.warm.push(p);
+    if (this.warm.length >= MIN_START_RETURNS + 1) {
+      this.est = EwmaVol.start(this.warm);
+      this.warm = [];
+    }
+  }
+
+  private restart(): void {
+    this.est = null;
+    this.warm = [];
+    this.shiftS = 0;
+    this.restarts++;
+  }
+
+  /// Vol in whole bps (clipped to 5–500%), or null while warming up.
+  sigmaBps(): number | null {
+    return this.est ? this.est.sigmaBps() : null;
+  }
+
+  /// Unclipped σ in bps, for the "clipped" warning.
+  rawBps(): number | null {
+    return this.est ? Math.round(this.est.sigma() * 10_000) : null;
+  }
+
+  get warmSteps(): number {
+    return this.est ? MIN_START_RETURNS : Math.max(0, this.warm.length - 1);
+  }
 }

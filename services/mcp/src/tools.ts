@@ -1,3 +1,4 @@
+import { settlementOf, type Settlement } from "@tourbillon/common/settlement.ts";
 import { readFileSync } from "node:fs";
 import { encodeFunctionData, formatEther, formatUnits, getAddress, parseAbi, parseAbiItem, parseEther, stringToHex, type Address, type Hex, type PublicClient } from "viem";
 import { blendValue } from "@tourbillon/common/tempo.ts";
@@ -19,6 +20,7 @@ export type M7 = {
   volFeed: Address;
   markets: string[];
   deployBlock: bigint;
+  settlement: Settlement; // the settlement token's symbol and decimals (owner D1)
 };
 
 export function loadM7(path: string): M7 {
@@ -38,6 +40,7 @@ export function loadM7(path: string): M7 {
     volFeed: need("VolFeed"),
     markets: d.markets as string[],
     deployBlock: BigInt(Number(d.deployBlock ?? 0)),
+    settlement: settlementOf(d),
   };
 }
 
@@ -197,18 +200,18 @@ export function makeTools(client: PublicClient, d: M7, gateway?: string): Tool[]
     },
     {
       name: "mandates",
-      description: "A mandate's hash and usage: premium spent (USDC), USD delta and vega in use, whether its nonce is revoked.",
+      description: `A mandate's hash and usage: premium spent (${d.settlement.symbol}), USD delta and vega in use, whether its nonce is revoked.`,
       inputSchema: { type: "object", properties: { mandate: { type: "object" } }, required: ["mandate"] },
       async run(a) {
         const m = mandateOf(a.mandate as Record<string, unknown>);
         const h = await read<Hex>(d.agents, "hashMandate", [m]);
         const [p, dl, vg, rv] = await Promise.all([read<bigint>(d.agents, "premiumUsed", [h]), read<bigint>(d.agents, "deltaUsed", [h]), read<bigint>(d.agents, "vegaUsed", [h]), read<boolean>(d.agents, "revoked", [m.owner, m.nonce])]);
-        return { hash: h, premiumUsedUsdc: formatUnits(p, 6), deltaUsedUsd: formatUnits(dl, 6), vegaUsedUsdPerVolPoint: formatUnits(vg, 6), revoked: rv, expired: Number(m.expiry) < Math.floor(Date.now() / 1000) };
+        return { hash: h, premiumUsed: formatUnits(p, d.settlement.decimals), symbol: d.settlement.symbol, deltaUsedUsd: formatUnits(dl, 6), vegaUsedUsdPerVolPoint: formatUnits(vg, 6), revoked: rv, expired: Number(m.expiry) < Math.floor(Date.now() / 1000) };
       },
     },
     {
       name: "build_mandate",
-      description: "An EIP-712 mandate for an owner to sign (domain 'Tourbillon AgentRouter' v1): agent, markets, families, premium caps (USDC), USD delta and vega budgets ('unlimited' allowed), expiry, close-only, nonce.",
+      description: `An EIP-712 mandate for an owner to sign (domain 'Tourbillon AgentRouter' v1): agent, markets, families, premium caps (${d.settlement.symbol}), USD delta and vega budgets ('unlimited' allowed), expiry, close-only, nonce.`,
       inputSchema: {
         type: "object",
         properties: { owner: { type: "string" }, agent: { type: "string" }, markets: { type: "array" }, families: { type: "array" }, maxPremiumPerTrade: { type: "string" }, maxPremiumTotal: { type: "string" }, deltaBudgetUsd: { type: "string" }, vegaBudgetUsd: { type: "string" }, expiry: { type: "number" }, closeOnly: { type: "boolean" }, nonce: { type: "number" } },
@@ -263,7 +266,7 @@ export function makeTools(client: PublicClient, d: M7, gateway?: string): Tool[]
           return { ...tx(d.agents, data), from: "the mandate's agent", family: familyOf(legs), quotes: quotes.length };
         }
         const data = encodeFunctionData({ abi, functionName: "buy", args: [buyArgs.market, legs, movement, units, maxCost, deadline, quotes, sigs, []] } as never);
-        return { ...tx(d.openBook, data), from: "the buyer (approve USDC to the Engine first)", family: familyOf(legs), quotes: quotes.length };
+        return { ...tx(d.openBook, data), from: `the buyer (approve ${d.settlement.symbol} to the Engine first)`, family: familyOf(legs), quotes: quotes.length };
       },
     },
     {
@@ -301,7 +304,7 @@ export type MandateMsg = {
   nonce: bigint;
 };
 
-/// A mandate from JSON (integers as decimal strings or numbers, as `build_mandate` returns them).
+/// A mandate from JSON (integers as decimal strings or numbers, as `build_mandate` gives them).
 export function mandateOf(m: Record<string, unknown>): MandateMsg {
   const big = (v: unknown) => BigInt(String(v));
   return {

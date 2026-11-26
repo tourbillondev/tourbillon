@@ -385,7 +385,7 @@ library PoolLiability {
         st.sCursor = 0;
     }
 
-    /// @notice Permissionless: marks up to `maxSeries` series. Returns true when the epoch is final.
+    /// @notice Permissionless: marks up to `maxSeries` series. True when the epoch is final.
     function markChunk(State storage st, uint256 maxSeries) public returns (bool done) {
         if (!st.marking) revert NotMarking();
         uint256 budget = maxSeries;
@@ -453,20 +453,20 @@ library PoolLiability {
 
     // ---------------------------------------------------------------- reads
 
-    /// @notice Liability at the mark: the last final epoch plus buys since it started (WAD USDC).
+    /// @notice Liability at the mark: the last final epoch plus buys since it started (WAD settlement token).
     function liveBase(State storage st, bytes32 market) public view returns (uint256) {
         Market storage mk = st.m[market];
         return mk.finalBase + mk.addBasePrev;
     }
 
-    /// @notice Stressed liability: the last final epoch plus buys since it started (WAD USDC).
+    /// @notice Stressed liability: the last final epoch plus buys since it started (WAD settlement token).
     function liveStressed(State storage st, bytes32 market) public view returns (uint256) {
         Market storage mk = st.m[market];
         return mk.finalStressed + mk.addStressedPrev;
     }
 
     /// @notice Liability at the mark for NAV: the last final epoch, plus buys' base value, minus sells' base value at
-    ///         their own S and σ (WAD USDC). Accurate rather than conservative, so a round's NAV favours neither
+    ///         their own S and σ (WAD settlement token). Accurate rather than conservative, so a round's NAV favours neither
     ///         depositors nor those staying. Never below zero.
     function navBase(State storage st, bytes32 market) public view returns (uint256) {
         Market storage mk = st.m[market];
@@ -480,7 +480,7 @@ library PoolLiability {
         }
     }
 
-    /// @notice Directional exposure of a market (WAD USDC): |liability at S × (1 + shock) − liability at S × (1 − shock)|,
+    /// @notice Directional exposure of a market (WAD settlement token): |liability at S × (1 + shock) − liability at S × (1 − shock)|,
     ///         from the last final epoch plus buys since it started (sells are not removed until the next epoch). The
     ///         on-chain stand-in for net delta, used by the directional cap on opens; the hedger hedges true delta.
     function liveDirectional(State storage st, bytes32 market) public view returns (uint256) {
@@ -493,7 +493,7 @@ library PoolLiability {
         return d >= 0 ? uint256(d) : uint256(-d);
     }
 
-    /// @notice Value of the written shapes the pool holds, at the mark (WAD USDC, signed, rounded down): the last
+    /// @notice Value of the written shapes the pool holds, at the mark (WAD settlement token, signed, rounded down): the last
     ///         final epoch plus writes and less unwrites since, each at its own S and σ.
     function writtenNavBase(State storage st, bytes32 market) public view returns (int256) {
         Written storage w = st.w[market];

@@ -19,3 +19,11 @@ test("each event becomes its rows; the AgentRouter's own Engine trades are its s
   expect(opsFor({ eventName: "Approval", args: {} }, 9n, R)).toEqual([]);
   expect(boardKeys(["BTC"], "0xee").map((k) => k.kind)).toEqual(["MARK", "VOL", "EQUITY"]);
 });
+
+test("RH7: a hedge swap becomes a hedges row (token side and USDC side by direction)", () => {
+  const STK1 = stringToHex("STK1", { size: 32 });
+  const buy = opsFor({ eventName: "HedgeSwapped", args: { market: STK1, buy: true, amountIn: 400_000_000n, amountOut: 10n ** 19n, markWad: 4n * 10n ** 19n } }, 9n, R, "0xab:3")[0]!;
+  expect(buy).toEqual({ t: "hedge", id: "0xab:3", market: "STK1", buy: true, token: 10n ** 19n, settlementAmount: 400_000_000n, markWad: 4n * 10n ** 19n, ts: 9n });
+  const sell = opsFor({ eventName: "HedgeSwapped", args: { market: STK1, buy: false, amountIn: 10n ** 19n, amountOut: 398_800_000n, markWad: 4n * 10n ** 19n } }, 9n, R, "0xab:4")[0]!;
+  expect(sell).toMatchObject({ buy: false, token: 10n ** 19n, settlementAmount: 398_800_000n });
+});

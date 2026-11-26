@@ -8,7 +8,7 @@ export type Thresholds = {
   equityRelTol: number; // EQUITY mismatch: relative to the account value
   equityAbsTolUsd: number; // … or this many USD, whichever is larger
   hedgerSilentS: number; // hedger status file older than this
-  markMismatch: number; // Hyperliquid vs router
+  markMismatch: number; // exchange vs router (crypto markets)
   auctionSettleGraceS: number; // an auction lot unsettled this long after its reveal ends
   receiptsStaleHours: number; // no receipt root posted for this long
 };
@@ -42,10 +42,10 @@ export function equityMismatch(boardPnl: number, ownPnl: number, accountValue: n
   return Math.abs(boardPnl - ownPnl) > Math.max(t.equityRelTol * Math.abs(accountValue), t.equityAbsTolUsd);
 }
 
-/// Hyperliquid's view of a market is healthy when it answered, lists the market with a mark, and (when the router is
-/// fresh) the two marks agree within `markMismatch`.
-export function hlMarketDown(hlMark: number | null, routerMark: number | null, t: Thresholds): boolean {
-  if (hlMark === null) return true;
+/// The crypto hedge exchange's view of a crypto market is healthy when it answered, lists the market with a mark, and
+/// (when the router is fresh) the two marks agree within `markMismatch`.
+export function exchangeMarketDown(exMark: number | null, routerMark: number | null, t: Thresholds): boolean {
+  if (exMark === null) return true;
   if (routerMark === null) return false; // the router is stale: a signer problem, raised separately
-  return Math.abs(hlMark - routerMark) / routerMark > t.markMismatch;
+  return Math.abs(exMark - routerMark) / routerMark > t.markMismatch;
 }

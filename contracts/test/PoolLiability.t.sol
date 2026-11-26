@@ -90,7 +90,7 @@ contract PoolLiabilityTest is Test {
     uint256 constant T0 = 1_794_182_400;
     bytes32 constant BTC = "BTC";
     bytes32 constant ETH = "ETH";
-    bytes32 constant HYPE = "HYPE";
+    bytes32 constant STK1 = "STK1";
     uint256 constant WAD = 1e18;
 
     MockMarks marks;
@@ -114,11 +114,11 @@ contract PoolLiabilityTest is Test {
         book = new PathFundingBook(predicted, address(this), marks, vols);
         h = new LiabilityHarness(book, marks, vols);
         require(address(h) == predicted, "prediction");
-        (shock[BTC], shock[ETH], shock[HYPE]) = (2000, 2500, 3500);
-        (step[BTC], step[ETH], step[HYPE]) = (100e18, 5e18, 0.1e18);
+        (shock[BTC], shock[ETH], shock[STK1]) = (2000, 2500, 3500);
+        (step[BTC], step[ETH], step[STK1]) = (100e18, 5e18, 0.1e18);
         _market(BTC, 70_000e18, 4500);
         _market(ETH, 2_000e18, 6000);
-        _market(HYPE, 70e18, 8000);
+        _market(STK1, 70e18, 8000);
     }
 
     function _market(bytes32 m, uint256 s, uint256 sigma) internal {
@@ -194,7 +194,7 @@ contract PoolLiabilityTest is Test {
     /// mark and under the whole-market stress, whatever the chunk size.
     /// forge-config: default.fuzz.runs = 48
     function testFuzz_exactAndChunkIndependent(uint256 seed) public {
-        bytes32[3] memory ms = [BTC, ETH, HYPE];
+        bytes32[3] memory ms = [BTC, ETH, STK1];
         for (uint256 i; i < 24; ++i) {
             uint256 r = uint256(keccak256(abi.encode(seed, i)));
             bytes32 m = ms[r % 3];
@@ -266,12 +266,12 @@ contract PoolLiabilityTest is Test {
     }
 
     function test_volMultiplierIsCappedAt500() public {
-        vols.set(HYPE, 40_000); // 400% × 1.5 = 600%, capped at 500%
-        book.record(HYPE, 70e18, 40_000);
+        vols.set(STK1, 40_000); // 400% × 1.5 = 600%, capped at 500%
+        book.record(STK1, 70e18, 40_000);
         _set(nowT + 5 minutes);
-        _openBuy(HYPE, true, 0, 1, 10e18);
+        _openBuy(STK1, true, 0, 1, 10e18);
         _markAll(100); // would revert in TempoMath above 500% without the cap
-        (, uint256 s) = h.finals(HYPE);
+        (, uint256 s) = h.finals(STK1);
         assertGt(s, 0);
     }
 
@@ -414,7 +414,7 @@ contract PoolLiabilityTest is Test {
     /// A full epoch: 256 series on each of the three markets (768).
     function test_fullEpochGas() public {
         vm.pauseGasMetering();
-        bytes32[3] memory ms = [BTC, ETH, HYPE];
+        bytes32[3] memory ms = [BTC, ETH, STK1];
         for (uint256 j; j < 3; ++j) {
             for (uint256 i; i < 256; ++i) {
                 _openBuy(ms[j], i % 2 == 0, int256(i % 64) - 32, i / 64, 1e17);

@@ -38,7 +38,8 @@ contract DeployM2Test is Test {
         c1.signers = new address[](3);
         (c1.signers[0], c1.signers[1], c1.signers[2]) = (S1, S2, S3);
         c1.markets = new bytes32[](3);
-        (c1.markets[0], c1.markets[1], c1.markets[2]) = (bytes32("BTC"), bytes32("ETH"), bytes32("HYPE"));
+        (c1.markets[0], c1.markets[1], c1.markets[2]) = (bytes32("BTC"), bytes32("ETH"), bytes32("STK1"));
+        c1.calendar = m1Script.loadCalendar(m1Script.CALENDAR_FILE());
         m1 = m1Script.deploy(c1, address(m1Script));
         m2Script = new DeployM2();
     }
@@ -61,7 +62,7 @@ contract DeployM2Test is Test {
         assertEq(address(d.engine.counterparty()), address(d.pool));
         assertEq(address(d.engine.marks()), address(m1.router));
         assertEq(address(d.engine.vols()), address(m1.board));
-        assertEq(address(d.engine.usdc()), address(d.usdc));
+        assertEq(address(d.engine.settlement()), address(d.settlement));
         assertEq(d.pool.engine(), address(d.engine));
         assertEq(d.pool.feeRecipient(), FEES);
         // settings
@@ -71,12 +72,12 @@ contract DeployM2Test is Test {
         assertEq(step, 100e18);
         (,, step) = d.engine.markets("ETH");
         assertEq(step, 5e18);
-        (,, step) = d.engine.markets("HYPE");
-        assertEq(step, 0.1e18);
+        (,, step) = d.engine.markets("STK1");
+        assertEq(step, 1e18); // $1 strikes for the placeholder stock
         assertEq(d.pool.cap("BTC"), 2_000_000e6);
         assertEq(d.pool.cap("ETH"), 1_000_000e6);
-        assertEq(d.pool.cap("HYPE"), 500_000e6);
-        assertEq(d.usdc.balanceOf(address(d.pool)), 10_000_000e6);
+        assertEq(d.pool.cap("STK1"), 500_000e6);
+        assertEq(d.settlement.balanceOf(address(d.pool)), 10_000_000e6);
         // roles: ADMIN holds everything, the deployer nothing
         bytes32 adminRole = d.engine.DEFAULT_ADMIN_ROLE();
         assertTrue(d.engine.hasRole(adminRole, ADMIN));
@@ -98,8 +99,8 @@ contract DeployM2Test is Test {
         c.router = IMarkRouter(address(0x1234));
         vm.expectRevert(abi.encodeWithSelector(DeployM2.BadConfig.selector, "M1 contracts"));
         m2Script.deploy(c, address(m2Script));
-        vm.chainId(99801);
-        vm.expectRevert(abi.encodeWithSelector(DeployM2.WrongChain.selector, uint256(99801)));
+        vm.chainId(46630); // local only: even the testnet is refused
+        vm.expectRevert(abi.encodeWithSelector(DeployM2.WrongChain.selector, uint256(46630)));
         m2Script.run();
     }
 
@@ -132,9 +133,9 @@ contract DeployM2Test is Test {
         assertEq(s, 74_000e18);
         assertEq(sig, 4323);
 
-        d.usdc.mint(BUYER, 100_000e6);
+        d.settlement.mint(BUYER, 100_000e6);
         vm.startPrank(BUYER);
-        d.usdc.approve(address(d.engine), type(uint256).max);
+        d.settlement.approve(address(d.engine), type(uint256).max);
         (uint256 id, uint256 cost) =
             d.engine.buy("BTC", true, 74_000e18, TempoBlend.single(1 days), 0.1e18, type(uint256).max, nowT);
         uint256 v = EnginePricing.unitValue(true, 74_000e18, 74_000e18, 4323, TempoBlend.single(1 days));
@@ -144,8 +145,8 @@ contract DeployM2Test is Test {
         vm.stopPrank();
         assertEq(paid, 0.1e18);
         assertLt(net, cost);
-        assertEq(d.usdc.balanceOf(BUYER), 100_000e6 - cost + net);
+        assertEq(d.settlement.balanceOf(BUYER), 100_000e6 - cost + net);
         (, uint256 sellFee) = EnginePricing.sellQuote(v, 0.1e18, 74_000e18, 200);
-        assertEq(d.usdc.balanceOf(FEES), fee + sellFee, "the fee recipient holds the buy fee and the sell fee");
+        assertEq(d.settlement.balanceOf(FEES), fee + sellFee, "the fee recipient holds the buy fee and the sell fee");
     }
 }

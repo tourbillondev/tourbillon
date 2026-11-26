@@ -1,10 +1,11 @@
 import { parseEther, parseGwei } from "viem";
 
-/// Gas policy (owner decision, M1): never pay more than 1 gwei; warn below 0.2 test HYPE.
+/// Gas policy (owner decision, M1; G14 kept the cap): never pay more than 1 gwei; warn below 0.2 of the gas token.
+/// On Robinhood Chain gas is paid in ETH (owner fact F1); the warning level is set after RobinhoodProbe measures fees (Q10).
 export const MAX_FEE_PER_GAS = parseGwei("1");
 export const LOW_BALANCE = parseEther("0.2");
 
-/// Receipt polling; Elysium blocks are ~221 ms.
+/// Receipt polling. The spec assumes blocks of 500 ms or less on Robinhood Chain (U, measured by RobinhoodProbe).
 export const POLL_MS = 500;
 
 /// Gas limit headroom. The estimate is made against the latest block; if another transaction lands first, this one

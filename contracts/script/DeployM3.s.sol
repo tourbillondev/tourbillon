@@ -3,9 +3,12 @@ pragma solidity 0.8.28;
 
 import {Script, console} from "forge-std/Script.sol";
 import {PathFundingBook, IMarkRouter, IVolSource} from "../src/PathFundingBook.sol";
+import {ISessionCalendar} from "../src/SessionCalendar.sol";
 import {MainspringPool, IEquityFeed} from "../src/MainspringPool.sol";
 import {Engine} from "../src/Engine.sol";
-import {MockUSDC} from "../test/mocks/MockUSDC.sol";
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {SettlementAdapter} from "../src/SettlementAdapter.sol";
+import {MockSettlementToken} from "../test/mocks/MockSettlementToken.sol";
 
 /// @title DeployM3
 /// @notice M3 deployment on top of an M1 deployment: mock USDC, MainspringPool, PathFundingBook and Engine, wired to
@@ -15,11 +18,12 @@ import {MockUSDC} from "../test/mocks/MockUSDC.sol";
 ///         real USDC address and the owner's yes.
 ///
 ///         - The book has no bootstrap recorder: samples come only through the permissionless `poke`.
-///         - Markets BTC / ETH / HYPE: stress shocks 2000 / 2500 / 3500 bps (vol × 1.5); strike steps $100 / $5 /
-///           $0.10; spread 2%. Caps (owner's starting values): notional $5M / $3M / $1M, directional $1M / $600k /
-///           $250k. Hedger delta caps $2.5M / $1.2M / $357,143, set first: the pool refuses a directional cap above
+///         - Markets BTC / ETH / STK1 (STK1: the placeholder tokenized stock, owner queue Q2 and Q13): stress shocks
+///           2000 / 2500 / 2000 bps (vol × 1.5); strike steps $100 / $5 / $1; spread 2%. Caps: notional $5M / $3M /
+///           $1M, directional $1M / $600k / $250k. Hedger delta caps $2.5M / $1.2M / $625,000, set first: the pool
+///           refuses a directional cap above
 ///           hedgerDeltaCap × 2 × shock, so a cap the hedger cannot carry stops the deploy.
-///         - No pool funding: LPs fund the pool through the deposit round.
+///         - No pool seed: LPs deposit into the pool through the deposit round.
 ///         - The EQUITY feed is listed on the QuorumBoard by its admin with ListEquityFeed.s.sol (the deployer is not
 ///           the board's admin).
 ///
@@ -38,10 +42,13 @@ contract DeployM3 is Script {
         address protocolRecipient;
         IMarkRouter router;
         IVolSource board;
+        ISessionCalendar calendar; // RH4: scales stock markets' open caps on weekends and holidays (unset: none)
+        IERC20 settlement; // RH7b (D1): the settlement token (USDG on Robinhood Chain); unset: a mock USDG (anvil)
     }
 
     struct Deployed {
-        MockUSDC usdc;
+        MockSettlementToken settlement; // the settlement token: the mock on anvil, else the configured token (used as an ERC-20 only)
+        SettlementAdapter settlementAdapter; // its form (D1): symbol and decimals read from it; approve or permit
         MainspringPool pool;
         PathFundingBook book;
         Engine engine;
@@ -61,7 +68,7 @@ contract DeployM3 is Script {
         vm.stopBroadcast();
 
         _write(c, d, deployer);
-        console.log("MockUSDC        ", address(d.usdc));
+        console.log("SettlementToken ", address(d.settlement));
         console.log("MainspringPool  ", address(d.pool));
         console.log("PathFundingBook ", address(d.book));
         console.log("Engine          ", address(d.engine));
@@ -76,6 +83,8 @@ contract DeployM3 is Script {
         if (vm.parseJsonUint(json, ".chainId") != block.chainid) revert BadConfig("M1 deployment is another chain");
         c.router = IMarkRouter(vm.parseJsonAddress(json, ".MarkRouter"));
         c.board = IVolSource(vm.parseJsonAddress(json, ".QuorumBoard"));
+        if (vm.keyExistsJson(json, ".SessionCalendar")) c.calendar = ISessionCalendar(vm.parseJsonAddress(json, ".SessionCalendar"));
+        c.settlement = IERC20(vm.envOr("SETTLEMENT_TOKEN", address(0)));
     }
 
     /// @notice Deploys and configures everything as `deployer`, then hands every role to its owner.
@@ -91,14 +100,17 @@ contract DeployM3 is Script {
         if (c.protocolRecipient == address(0)) revert BadConfig("protocol recipient");
         if (address(c.router).code.length == 0 || address(c.board).code.length == 0) revert BadConfig("M1 contracts");
 
-        d.usdc = new MockUSDC();
+        d.settlement = address(c.settlement) == address(0)
+            ? new MockSettlementToken("Mock Global Dollar", "USDG", 6)
+            : MockSettlementToken(address(c.settlement));
+        d.settlementAdapter = new SettlementAdapter(IERC20(address(d.settlement))); // refuses a token without 6 decimals
         // pool → book → engine: each needs the next one's address, so predict them
         uint256 n = vm.getNonce(deployer);
         address bookAt = vm.computeCreateAddress(deployer, n + 1);
         address engineAt = vm.computeCreateAddress(deployer, n + 2);
         d.pool = new MainspringPool(
             deployer,
-            d.usdc,
+            d.settlement,
             PathFundingBook(bookAt),
             c.router,
             c.board,
@@ -111,18 +123,19 @@ contract DeployM3 is Script {
         if (address(d.engine) != engineAt) revert PredictionFailed(engineAt, address(d.engine));
 
         d.pool.setEngine(address(d.engine));
+        if (address(c.calendar) != address(0)) d.pool.setSessionCalendar(c.calendar);
         d.pool.listMarket("BTC", 2000);
         d.pool.listMarket("ETH", 2500);
-        d.pool.listMarket("HYPE", 3500);
+        d.pool.listMarket("STK1", 2000);
         d.pool.setHedgerDeltaCap("BTC", 2_500_000e6); // × 2 × 20% = $1,000,000
         d.pool.setHedgerDeltaCap("ETH", 1_200_000e6); // × 2 × 25% = $600,000
-        d.pool.setHedgerDeltaCap("HYPE", 357_143e6); // × 2 × 35% = $250,000.10
+        d.pool.setHedgerDeltaCap("STK1", 625_000e6); // × 2 × 20% = $250,000
         d.pool.setCaps("BTC", 5_000_000e6, 1_000_000e6);
         d.pool.setCaps("ETH", 3_000_000e6, 600_000e6);
-        d.pool.setCaps("HYPE", 1_000_000e6, 250_000e6);
+        d.pool.setCaps("STK1", 1_000_000e6, 250_000e6);
         d.engine.setMarket("BTC", 100e18, SPREAD_BPS);
         d.engine.setMarket("ETH", 5e18, SPREAD_BPS);
-        d.engine.setMarket("HYPE", 0.1e18, SPREAD_BPS);
+        d.engine.setMarket("STK1", 1e18, SPREAD_BPS);
     }
 
     /// @notice Hands every role to its owner; the deployer keeps none.
@@ -145,6 +158,15 @@ contract DeployM3 is Script {
         d.pool.renounceRole(adminRole, deployer);
     }
 
+    /// @notice The settlement token in a deployment file: its address, adapter, symbol and decimals as the token gives
+    ///         them (RH7b, D1). Every service reads its symbol and decimals from here.
+    function writeSettlement(string memory k, Deployed memory d) public {
+        vm.serializeAddress(k, "SettlementToken", address(d.settlement));
+        vm.serializeAddress(k, "SettlementAdapter", address(d.settlementAdapter));
+        vm.serializeString(k, "settlementSymbol", d.settlementAdapter.symbol());
+        vm.serializeUint(k, "settlementDecimals", d.settlementAdapter.decimals());
+    }
+
     function _write(Config memory c, Deployed memory d, address deployer) internal {
         string memory k = "m3";
         vm.serializeUint(k, "chainId", block.chainid);
@@ -154,12 +176,12 @@ contract DeployM3 is Script {
         vm.serializeAddress(k, "protocolRecipient", c.protocolRecipient);
         vm.serializeAddress(k, "MarkRouter", address(c.router));
         vm.serializeAddress(k, "QuorumBoard", address(c.board));
-        vm.serializeAddress(k, "MockUSDC", address(d.usdc));
+        writeSettlement(k, d);
         vm.serializeAddress(k, "MainspringPool", address(d.pool));
         vm.serializeAddress(k, "PathFundingBook", address(d.book));
         vm.serializeBytes32(k, "equityKey", d.pool.equityKey());
         string[] memory markets = new string[](3);
-        (markets[0], markets[1], markets[2]) = ("BTC", "ETH", "HYPE");
+        (markets[0], markets[1], markets[2]) = ("BTC", "ETH", "STK1");
         vm.serializeString(k, "markets", markets);
         vm.serializeUint(k, "deployBlock", block.number); // where event scanning starts
         string memory json = vm.serializeAddress(k, "Engine", address(d.engine));

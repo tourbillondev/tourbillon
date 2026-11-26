@@ -7,6 +7,7 @@ import { foundry } from "viem/chains";
 import { revertName } from "@tourbillon/common/tx.ts";
 import { windowStart } from "../src/poke.ts";
 import { writerBookAbi } from "../src/abi.ts";
+import { TEARDOWN_MS, hookLimit, within } from "@tourbillon/common/hooks.ts";
 
 // M4 on a local anvil: DeployM1 + DeployM4, signer votes sent by the test, the real poker process. A shape series held
 // only by a write (no buyer) falls behind; the walker finds it from the WriterBook's events and walks it, so the next
@@ -15,7 +16,7 @@ const haveTools = Bun.which("anvil") !== null && Bun.which("forge") !== null;
 const CONTRACTS = resolve(import.meta.dir, "../../../contracts");
 const PORT = 23545 + Math.floor(Math.random() * 1000);
 const RPC = `http://127.0.0.1:${PORT}`;
-const MARKS: Record<string, bigint> = { BTC: parseEther("100000"), ETH: parseEther("3000"), HYPE: parseEther("40") };
+const MARKS: Record<string, bigint> = { BTC: parseEther("100000"), ETH: parseEther("3000"), STK1: parseEther("40") };
 
 const boardAbi = [
   { type: "function", name: "markKey", stateMutability: "pure", inputs: [{ type: "bytes32" }], outputs: [{ type: "bytes32" }] },
@@ -109,7 +110,7 @@ async function poker(...args: string[]): Promise<Record<string, unknown>[]> {
   return out.trim().split("\n").filter(Boolean).map((l) => JSON.parse(l));
 }
 
-beforeAll(async () => {
+beforeAll(within(import.meta.path, "setup", 180_000, async () => {
   if (!haveTools) return;
   tmp = mkdtempSync(join(tmpdir(), "poker-m4-anvil-"));
   anvil = Bun.spawn(["anvil", "--port", String(PORT), "--silent"], { stdout: "ignore", stderr: "ignore" });
@@ -134,23 +135,23 @@ beforeAll(async () => {
   m4 = await Bun.file(m4File).json();
   await rpc("evm_increaseTime", [3600]);
   await rpc("evm_mine");
-  for (const m of ["BTC", "ETH", "HYPE"]) await send(acc[5]!, m1.MarkRouter as Address, routerAbi, "applyRoute", [b32(m)]);
-}, 180_000);
+  for (const m of ["BTC", "ETH", "STK1"]) await send(acc[5]!, m1.MarkRouter as Address, routerAbi, "applyRoute", [b32(m)]);
+}), hookLimit(180_000));
 
-afterAll(() => {
+afterAll(within(import.meta.path, "teardown", TEARDOWN_MS, () => {
   anvil?.kill();
   if (tmp) rmSync(tmp, { recursive: true, force: true });
-});
+}), hookLimit(TEARDOWN_MS));
 
 test.skipIf(!haveTools)("M4: the walker walks a shape series held only by a write, so the next write is not refused", async () => {
   let w = windowStart(await now()) + 300;
   await setTime(w + 10);
-  await vote(["BTC", "ETH", "HYPE"]);
-  for (const m of ["BTC", "ETH", "HYPE"]) await send(acc[9]!, m4.PathFundingBook as Address, bookPokeAbi, "poke", [b32(m)]);
+  await vote(["BTC", "ETH", "STK1"]);
+  for (const m of ["BTC", "ETH", "STK1"]) await send(acc[9]!, m4.PathFundingBook as Address, bookPokeAbi, "poke", [b32(m)]);
   // the pool needs capital to pay a write's credit
   const LP = acc[7]!;
-  await send(LP, m4.MockUSDC as Address, usdcAbi, "mint", [LP, 1_000_000n * 10n ** 6n]);
-  await send(LP, m4.MockUSDC as Address, usdcAbi, "approve", [m4.MainspringPool as Address, 1_000_000n * 10n ** 6n]);
+  await send(LP, m4.SettlementToken as Address, usdcAbi, "mint", [LP, 1_000_000n * 10n ** 6n]);
+  await send(LP, m4.SettlementToken as Address, usdcAbi, "approve", [m4.MainspringPool as Address, 1_000_000n * 10n ** 6n]);
   await send(LP, m4.MainspringPool as Address, poolAbi, "deposit", [1_000_000n * 10n ** 6n]);
   await send(acc[9]!, m4.MainspringPool as Address, poolAbi, "startEpoch");
   await send(acc[9]!, m4.MainspringPool as Address, poolAbi, "markChunk", [100n]);
@@ -158,8 +159,8 @@ test.skipIf(!haveTools)("M4: the walker walks a shape series held only by a writ
 
   // a writer writes a BTC put spread: a shape series nobody buys
   const W = acc[8]!;
-  await send(W, m4.MockUSDC as Address, usdcAbi, "mint", [W, 10n ** 12n]);
-  await send(W, m4.MockUSDC as Address, usdcAbi, "approve", [m4.WriterBook as Address, 10n ** 12n]);
+  await send(W, m4.SettlementToken as Address, usdcAbi, "mint", [W, 10n ** 12n]);
+  await send(W, m4.SettlementToken as Address, usdcAbi, "approve", [m4.WriterBook as Address, 10n ** 12n]);
   const writeArgs = [
     b32("BTC"),
     [{ isCall: false, kWad: parseEther("98000"), qty: parseEther("1") }, { isCall: false, kWad: parseEther("100000"), qty: -parseEther("1") }],

@@ -5,6 +5,7 @@ import {Script, console} from "forge-std/Script.sol";
 import {QuorumBoard} from "../src/QuorumBoard.sol";
 import {QuorumMarkSource} from "../src/QuorumMarkSource.sol";
 import {MarkRouter} from "../src/MarkRouter.sol";
+import {SessionCalendar} from "../src/SessionCalendar.sol";
 import {IMarkSource} from "../src/IMarkSource.sol";
 import {M1Core} from "./M1Core.sol";
 
@@ -12,14 +13,17 @@ import {M1Core} from "./M1Core.sol";
 /// @notice M1 deployment: QuorumBoard (MARK and VOL feeds per market), QuorumMarkSource and MarkRouter with a
 ///         quorum-only route queued for every market. The deployer configures everything, hands every admin
 ///         role to `ADMIN` and keeps none.
-/// @dev    Testnet only (Elysium testnet 99801, or a local anvil 31337): the 1 h router delay is the testnet
+/// @dev    Testnet only (Robinhood Chain testnet 46630 (U), or a local anvil 31337): the 1 h router delay is the testnet
 ///         value; mainnet uses 48 h behind the Safe and timelock. The testnet admin is a single key, which
 ///         does not meet law 6; it is replaced by the Safe and timelock before mainnet.
 ///
 ///         Settings (environment):
 ///           ADMIN    address that receives every admin role (not the deployer, not a signer)
 ///           SIGNERS  comma-separated signer addresses (at least 3)
-///           MARKETS  comma-separated market names (default BTC,ETH,HYPE)
+///           MARKETS  comma-separated market names (default BTC,ETH,STK1; STK1 is the placeholder tokenized stock, Q2)
+///           STOCK_MARKETS  the tokenized-stock markets among them (default none): listed on the SessionCalendar, MARK
+///                    keys bound to the session rule (±10% out of session). Never guessed from a name.
+///           CALENDAR_FILE  the calendar data (default calendar/us-regular-session.json)
 ///
 ///         The deployer key is typed at a hidden prompt (--interactives 1) or comes from a keystore account;
 ///         locally, anvil's unlocked accounts are used (--unlocked). Addresses are written to
@@ -29,6 +33,8 @@ contract DeployM1 is Script, M1Core {
         address admin;
         address[] signers;
         bytes32[] markets;
+        bytes32[] stockMarkets;
+        CalendarData calendar;
     }
 
     struct Deployed {
@@ -36,13 +42,16 @@ contract DeployM1 is Script, M1Core {
         QuorumMarkSource quorumSource;
         MarkRouter router;
         uint64 routeEta;
+        SessionCalendar calendar;
     }
 
     error WrongChain(uint256 chainId);
     error BadConfig(string why);
 
+    uint256 internal constant ROBINHOOD_TESTNET_ID = 46630; // (U) until probed
+
     function run() external returns (Deployed memory d) {
-        if (block.chainid != 99801 && block.chainid != 31337) revert WrongChain(block.chainid);
+        if (block.chainid != ROBINHOOD_TESTNET_ID && block.chainid != 31337) revert WrongChain(block.chainid);
         Config memory c = configFromEnv();
 
         vm.startBroadcast();
@@ -67,20 +76,33 @@ contract DeployM1 is Script, M1Core {
             if (b.length == 0 || b.length > 32) revert BadConfig("market name");
             c.markets[i] = bytes32(b);
         }
+        c.stockMarkets = _bytes32s(vm.envOr("STOCK_MARKETS", ",", new string[](0)));
+        c.calendar = loadCalendar(vm.envOr("CALENDAR_FILE", CALENDAR_FILE));
+    }
+
+    function _bytes32s(string[] memory names) internal pure returns (bytes32[] memory out) {
+        out = new bytes32[](names.length);
+        for (uint256 i; i < names.length; ++i) {
+            bytes memory b = bytes(names[i]);
+            if (b.length == 0 || b.length > 32) revert BadConfig("market name");
+            out[i] = bytes32(b);
+        }
     }
 
     /// @notice Deploys and configures everything as `deployer` (M1Core), then hands admin to `c.admin`.
     function deploy(Config memory c, address deployer) public returns (Deployed memory d) {
         _check(c, deployer);
 
-        M1Deployed memory m = m1Core(deployer, c.signers, c.markets);
-        (d.board, d.quorumSource, d.router, d.routeEta) = (m.board, m.quorumSource, m.router, m.routeEta);
+        M1Deployed memory m = m1Core(deployer, c.signers, c.markets, c.stockMarkets, c.calendar);
+        (d.board, d.quorumSource, d.router, d.routeEta, d.calendar) = (m.board, m.quorumSource, m.router, m.routeEta, m.calendar);
 
         bytes32 adminRole = d.board.DEFAULT_ADMIN_ROLE();
         d.board.grantRole(adminRole, c.admin);
         d.board.renounceRole(adminRole, deployer);
         d.router.grantRole(adminRole, c.admin);
         d.router.renounceRole(adminRole, deployer);
+        d.calendar.grantRole(adminRole, c.admin);
+        d.calendar.renounceRole(adminRole, deployer);
     }
 
     function _check(Config memory c, address deployer) internal pure {
@@ -102,7 +124,7 @@ contract DeployM1 is Script, M1Core {
         m = new string[](3);
         m[0] = "BTC";
         m[1] = "ETH";
-        m[2] = "HYPE";
+        m[2] = "STK1";
     }
 
     function _names(bytes32[] memory m) internal pure returns (string[] memory out) {
@@ -128,6 +150,8 @@ contract DeployM1 is Script, M1Core {
         vm.serializeAddress(k, "QuorumBoard", address(d.board));
         vm.serializeAddress(k, "QuorumMarkSource", address(d.quorumSource));
         vm.serializeAddress(k, "MarkRouter", address(d.router));
+        vm.serializeAddress(k, "SessionCalendar", address(d.calendar));
+        vm.serializeString(k, "stockMarkets", _names(c.stockMarkets));
         string memory json = vm.serializeUint(k, "routeEta", d.routeEta);
         vm.createDir("deployments", true);
         vm.writeJson(json, string.concat("deployments/", vm.toString(block.chainid), ".json"));
